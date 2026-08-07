@@ -71,6 +71,7 @@ import type {
 	AgentConnectionSessionTreeFlatNode,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
+	AgentConnectionSetModelOptions,
 	AgentConnectionSideQuestionEvent,
 	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
@@ -961,12 +962,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
+	async setModel(
+		provider: string,
+		modelId: string,
+		options: AgentConnectionSetModelOptions = {},
+	): Promise<AgentConnectionModel> {
 		return this.requestData<AgentConnectionModel>({
 			type: "set_model",
 			activeSessionId: this.activeSessionId,
 			provider,
 			modelId,
+			ifIdle: options.ifIdle === true,
 		});
 	}
 

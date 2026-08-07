@@ -444,6 +444,15 @@ export class AgentConnectionPromptAdmissionError extends Error {
 	}
 }
 
+export interface AgentConnectionSetModelOptions {
+	/**
+	 * Refuse the change instead of applying it while the session is working.
+	 * A caller in another process cannot check busyness and then switch without
+	 * racing whatever begins in between, so the session tests it itself.
+	 */
+	ifIdle?: boolean;
+}
+
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
@@ -695,7 +704,7 @@ export interface AgentConnection {
 	executeBashAndWait(command: string): Promise<BashResult>;
 	abortBash(): Promise<void>;
 
-	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
+	setModel(provider: string, modelId: string, options?: AgentConnectionSetModelOptions): Promise<AgentConnectionModel>;
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;
 	setScopedModels(scopedModels: AgentConnectionScopedModel[]): Promise<void>;
 	setThinkingLevel(level: ThinkingLevel): Promise<void>;
