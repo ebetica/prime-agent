@@ -900,6 +900,12 @@ export interface ModelCycleResult {
 
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	/**
+	 * Refuse the change while the session is working. A caller in another
+	 * process cannot check busyness and then switch without racing whatever
+	 * starts in between, so the test has to happen here, next to the mutation.
+	 */
+	onlyIfIdle?: boolean;
 }
 
 interface ToolDefinitionEntry {
@@ -6594,6 +6600,11 @@ export class AgentSession {
 		}
 		if (!(await this._modelRegistry.canUseModel(model))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
+		}
+		// Immediately adjacent to the synchronous mutation below: nothing else on
+		// this worker's event loop can begin a turn between the two.
+		if (options.onlyIfIdle && (this.isStreaming || this.isCompacting || this.isRetrying || this.isBashRunning)) {
+			throw new Error("Session is busy; model unchanged");
 		}
 
 		const previousModel = this.model;
