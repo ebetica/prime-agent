@@ -536,7 +536,15 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| {
+			id?: string;
+			type: "set_model";
+			activeSessionId: string;
+			provider: string;
+			modelId: string;
+			/** Refuse rather than switch while the session is working. */
+			ifIdle?: boolean;
+	  }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
