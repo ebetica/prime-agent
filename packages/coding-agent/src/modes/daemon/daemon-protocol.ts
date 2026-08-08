@@ -59,7 +59,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 adds daemon-side atomic idle admission for resource reloads.
 // Revision 15 adds stable queued-user-action identities and atomic cancellation.
 export const DAEMON_SCHEMA_REVISION = 15;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-pending";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-6574353088ee";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

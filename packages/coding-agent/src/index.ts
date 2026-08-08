@@ -275,6 +275,7 @@ export {
 	type AgentConnectionExtensionUiResponse,
 	type AgentConnectionModel,
 	type AgentConnectionModelCycleResult,
+	type AgentConnectionQueuedUserAction,
 	type AgentConnectionQueueState,
 	type AgentConnectionResourceSnapshot,
 	type AgentConnectionRlmChildAgentSnapshot,
