@@ -74,6 +74,17 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("atomic_resource_reload");
 	});
 
+	it("capability-gates durable planned restart handoffs", () => {
+		const compatibility = { minProtocol: 7, minSchemaRevision: 17, capability: "planned_restart_handoff" };
+		expect(DAEMON_COMMAND_COMPATIBILITY.register_planned_restart_handoff).toEqual(compatibility);
+		expect(DAEMON_COMMAND_COMPATIBILITY.restore_planned_restart_handoff).toEqual(compatibility);
+		expect(
+			getDaemonCommandCompatibilities({ type: "prepare_update_restart", handoffRequestId: "restart-1" }),
+		).toContainEqual(compatibility);
+		expect(getDaemonCommandCompatibilities({ type: "prepare_update_restart" })).toEqual([{ minProtocol: 7 }]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff");
+	});
+
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
 		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
 		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);
