@@ -4932,32 +4932,52 @@ export class AgentSession {
 		});
 	}
 
+	private _plannedRestartMarker(
+		entry: SessionEntry,
+	): { actionId: string; message?: string; completed: boolean } | undefined {
+		let customType: string;
+		let rawDetails: unknown;
+		if (entry.type === "custom_message") {
+			customType = entry.customType;
+			rawDetails = entry.details;
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			customType = entry.message.customType;
+			rawDetails = entry.message.details;
+		} else {
+			return undefined;
+		}
+		if (
+			(customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE && customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) ||
+			!rawDetails ||
+			typeof rawDetails !== "object"
+		) {
+			return undefined;
+		}
+		const details = rawDetails as { actionId?: unknown; message?: unknown };
+		if (typeof details.actionId !== "string") return undefined;
+		return {
+			actionId: details.actionId,
+			...(typeof details.message === "string" ? { message: details.message } : {}),
+			completed: customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+		};
+	}
+
 	private _recoverPlannedRestartContinuationIntents(): number {
-		const entries = this.sessionManager.getEntries();
 		const completed = new Set<string>();
 		const pending = new Map<string, string>();
-		for (const entry of entries) {
-			if (
-				entry.type !== "custom_message" ||
-				!entry.details ||
-				typeof entry.details !== "object" ||
-				(entry.customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE &&
-					entry.customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE)
-			) {
+		for (const entry of this.sessionManager.getEntries()) {
+			const marker = this._plannedRestartMarker(entry);
+			if (!marker) continue;
+			if (marker.completed) {
+				completed.add(marker.actionId);
 				continue;
 			}
-			const details = entry.details as { actionId?: unknown; message?: unknown };
-			if (typeof details.actionId !== "string") continue;
-			if (entry.customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) {
-				completed.add(details.actionId);
-				continue;
+			if (marker.message === undefined) continue;
+			const prior = pending.get(marker.actionId);
+			if (prior !== undefined && prior !== marker.message) {
+				throw new Error(`Planned restart action ${marker.actionId} has conflicting durable intents`);
 			}
-			if (typeof details.message !== "string") continue;
-			const prior = pending.get(details.actionId);
-			if (prior !== undefined && prior !== details.message) {
-				throw new Error(`Planned restart action ${details.actionId} has conflicting durable intents`);
-			}
-			pending.set(details.actionId, details.message);
+			pending.set(marker.actionId, marker.message);
 		}
 		let recovered = 0;
 		for (const [actionId, text] of pending) {
@@ -4986,30 +5006,11 @@ export class AgentSession {
 	}
 
 	admitPlannedRestartContinuation(actionId: string, text: string): "admitted" | "already_admitted" {
-		const markerDetails = (entry: SessionEntry): { actionId: string; message?: string } | undefined => {
-			if (
-				entry.type !== "custom_message" ||
-				(entry.customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE &&
-					entry.customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) ||
-				!entry.details ||
-				typeof entry.details !== "object"
-			) {
-				return undefined;
-			}
-			const details = entry.details as { actionId?: unknown; message?: unknown };
-			if (typeof details.actionId !== "string") return undefined;
-			return {
-				actionId: details.actionId,
-				...(typeof details.message === "string" ? { message: details.message } : {}),
-			};
-		};
 		const entries = this.sessionManager.getEntries();
-		const completed = entries.find(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE &&
-				markerDetails(entry)?.actionId === actionId,
-		);
+		const completed = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === true && marker.actionId === actionId;
+		});
 		if (completed) return "already_admitted";
 		const existing = this._actionStore.ownedActions().find((action) => action.id === actionId);
 		if (existing) {
@@ -5018,13 +5019,11 @@ export class AgentSession {
 			}
 			return "already_admitted";
 		}
-		const intent = entries.find(
-			(entry) =>
-				entry.type === "custom_message" &&
-				entry.customType === PLANNED_RESTART_INTENT_CUSTOM_TYPE &&
-				markerDetails(entry)?.actionId === actionId,
-		);
-		const intentDetails = intent ? markerDetails(intent) : undefined;
+		const intent = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === false && marker.actionId === actionId;
+		});
+		const intentDetails = intent ? this._plannedRestartMarker(intent) : undefined;
 		if (intentDetails?.message !== undefined && intentDetails.message !== text) {
 			throw new Error(`Planned restart action ${actionId} conflicts with its durable intent`);
 		}

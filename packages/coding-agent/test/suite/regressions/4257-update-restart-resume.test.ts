@@ -211,6 +211,9 @@ describe("issue #4257 update restart resume", () => {
 				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
 			),
 		).toEqual([expect.objectContaining({ content: "continue nonce" })]);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
+			"already_admitted",
+		);
 	});
 
 	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {
