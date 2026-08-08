@@ -6701,6 +6701,9 @@ export class AgentSession {
 			availableModels.some((model) => modelsAreEqual(model, scoped.model)),
 		);
 		if (scopedModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
@@ -6745,6 +6748,9 @@ export class AgentSession {
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		if (availableModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));

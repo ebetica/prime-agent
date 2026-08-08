@@ -97,7 +97,7 @@ describe("AgentSession action commit-fence races", () => {
 	});
 
 	it("blocks native heartbeat admission after an idle-only reload claims the session", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ models: [{ id: "faux-1" }, { id: "faux-2" }] });
 		harnesses.push(harness);
 		const reloadStarted = createDeferred();
 		const finishReload = createDeferred();
@@ -122,6 +122,7 @@ describe("AgentSession action commit-fence races", () => {
 		await expect(harness.session.setModel(harness.getModel())).rejects.toThrow(
 			"Cannot change model while resources are reloading.",
 		);
+		await expect(harness.session.cycleModel()).rejects.toThrow("Cannot change model while resources are reloading.");
 		finishReload.resolve();
 		await reload;
 	});
