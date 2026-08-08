@@ -12,8 +12,17 @@ interface CommitFenceInternals {
 	_actionStore: ActionStore<SessionAction>;
 	_pendingSessionActionFenceWaiters: number;
 	_refineInFlight?: Promise<void>;
-	_resourceLoader: { reload(): Promise<void> };
+	_resourceLoader: {
+		reload(): Promise<void>;
+		prepareReload?: (options: { contextDirectories?: readonly string[] }) => Promise<{
+			resources: { contextDirectories?: readonly string[] };
+			commit(): () => void;
+			finalize(): void;
+			dispose(): void;
+		}>;
+	};
 	_scheduleSessionInputPump(): void;
+	_buildRuntime(options: unknown): void;
 	_acquireDirectTurnAdmissionFence(signal?: AbortSignal): Promise<{ release(): void }>;
 	_acquireSessionActionCommitFence(signal?: AbortSignal): Promise<{ release(): void }>;
 	_promptInjectedMessage(
@@ -94,6 +103,140 @@ describe("AgentSession action commit-fence races", () => {
 		);
 		finish.resolve();
 		await turn;
+	});
+
+	it("refuses a resident resource upgrade before preparing anything when busy", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const started = createDeferred();
+		const finish = createDeferred();
+		harness.setResponses([
+			async () => {
+				started.resolve();
+				await finish.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const prepareReload = vi.fn();
+		internals._resourceLoader.prepareReload = prepareReload;
+		const turn = harness.session.prompt("active resident turn");
+		await started.promise;
+		await expect(
+			harness.session.reload({ onlyIfIdle: true, contextDirectories: ["/tmp/new-context"] }),
+		).rejects.toThrow("Session is busy; resources not reloaded");
+		expect(prepareReload).not.toHaveBeenCalled();
+		finish.resolve();
+		await turn;
+	});
+
+	it("keeps admissions fenced until a prepared resource upgrade is committed", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const rollback = vi.fn();
+		internals._resourceLoader.prepareReload = vi.fn(async (options) => ({
+			resources: { contextDirectories: options.contextDirectories },
+			commit: () => rollback,
+			finalize: () => {},
+			dispose: () => {},
+		}));
+		const prepared = await harness.session.prepareReload({
+			onlyIfIdle: true,
+			contextDirectories: ["/tmp/new-context"],
+		});
+		await expect(harness.session.promptHeartbeat(createHeartbeat())).rejects.toThrow(
+			"Cannot admit a session action while resources are reloading.",
+		);
+		await prepared.rollback();
+		expect(rollback).toHaveBeenCalledOnce();
+		harness.setResponses([fauxAssistantMessage("after rollback")]);
+		await harness.session.prompt("admitted after rollback");
+	});
+
+	it("restores loader state and releases admission when runtime rebuild fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const rollback = vi.fn();
+		internals._resourceLoader.prepareReload = vi.fn(async () => ({
+			resources: { contextDirectories: ["/tmp/rebuild-failure"] },
+			commit: () => rollback,
+			finalize: () => {},
+			dispose: () => {},
+		}));
+		const buildRuntime = internals._buildRuntime.bind(internals);
+		let failNextBuild = true;
+		internals._buildRuntime = (options) => {
+			if (failNextBuild) {
+				failNextBuild = false;
+				throw new Error("runtime rebuild failed");
+			}
+			buildRuntime(options);
+		};
+		await expect(
+			harness.session.reload({ onlyIfIdle: true, contextDirectories: ["/tmp/rebuild-failure"] }),
+		).rejects.toThrow("runtime rebuild failed");
+		expect(rollback).toHaveBeenCalledOnce();
+		harness.setResponses([fauxAssistantMessage("after rebuild rollback")]);
+		await harness.session.prompt("admitted after rebuild rollback");
+	});
+
+	it("fails closed when both runtime rebuild and rollback rebuild fail", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		internals._resourceLoader.prepareReload = vi.fn(async () => ({
+			resources: { contextDirectories: ["/tmp/double-failure"] },
+			commit: () => () => {},
+			finalize: () => {},
+			dispose: () => {},
+		}));
+		internals._buildRuntime = () => {
+			throw new Error("runtime cannot be rebuilt");
+		};
+		await expect(
+			harness.session.reload({ onlyIfIdle: true, contextDirectories: ["/tmp/double-failure"] }),
+		).rejects.toThrow("Resource reload and rollback both failed");
+		await expect(harness.session.promptHeartbeat(createHeartbeat())).rejects.toThrow(
+			"Cannot admit a session action while resources are reloading.",
+		);
+	});
+
+	it("serializes distinct prepared resource replacements through settlement", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const firstReached = createDeferred();
+		const releaseFirst = createDeferred();
+		const preparedRoots: string[][] = [];
+		internals._resourceLoader.prepareReload = vi.fn(async (options) => {
+			const roots = [...(options.contextDirectories ?? [])];
+			preparedRoots.push(roots);
+			if (roots[0] === "/tmp/first-context") {
+				firstReached.resolve();
+				await releaseFirst.promise;
+			}
+			return {
+				resources: { contextDirectories: roots },
+				commit: () => () => {},
+				finalize: () => {},
+				dispose: () => {},
+			};
+		});
+		const firstPromise = harness.session.prepareReload({ contextDirectories: ["/tmp/first-context"] });
+		await firstReached.promise;
+		const secondPromise = harness.session.prepareReload({ contextDirectories: ["/tmp/second-context"] });
+		await yieldToEventLoop();
+		expect(preparedRoots).toEqual([["/tmp/first-context"]]);
+		releaseFirst.resolve();
+		const first = await firstPromise;
+		await yieldToEventLoop();
+		expect(preparedRoots).toEqual([["/tmp/first-context"]]);
+		first.commit();
+		const second = await secondPromise;
+		expect(preparedRoots).toEqual([["/tmp/first-context"], ["/tmp/second-context"]]);
+		second.commit();
 	});
 
 	it("blocks native heartbeat admission after an idle-only reload claims the session", async () => {

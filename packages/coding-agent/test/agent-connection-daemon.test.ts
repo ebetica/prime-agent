@@ -718,6 +718,34 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests).toEqual([{ type: "reload", activeSessionId: "active-1", ifIdle: true }]);
 	});
 
+	it("requires the resource-reload capability and forwards the exact resource set", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("atomic_reload");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const options = {
+			ifIdle: true,
+			contextDirectories: ["/tmp/context"],
+			extensions: ["extension.ts"],
+			skills: ["skills"],
+		};
+		await expect(connection.reload(options)).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(fakeClient.requests).toEqual([]);
+		fakeClient.serverCapabilities.add("atomic_resource_reload");
+		await connection.reload(options);
+		expect(fakeClient.requests).toEqual([
+			{
+				type: "reload",
+				activeSessionId: "active-1",
+				ifIdle: true,
+				resources: {
+					contextDirectories: ["/tmp/context"],
+					extensions: ["extension.ts"],
+					skills: ["skills"],
+				},
+			},
+		]);
+	});
+
 	it("forwards queueIfBusy for prompt admission", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");

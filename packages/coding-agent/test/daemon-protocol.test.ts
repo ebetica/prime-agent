@@ -53,6 +53,27 @@ describe("daemon protocol helpers", () => {
 		]);
 	});
 
+	it("separately gates transactional resource replacement", () => {
+		const resources = { contextDirectories: ["/tmp/context"], extensions: ["extension.ts"] };
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "reload",
+				activeSessionId: "active-1",
+				ifIdle: true,
+				resources,
+			}),
+		).toEqual(
+			expect.arrayContaining([
+				{ minProtocol: 7, minSchemaRevision: 14, capability: "atomic_reload" },
+				{ minProtocol: 7, minSchemaRevision: 16, capability: "atomic_resource_reload" },
+			]),
+		);
+		expect(
+			getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1", resources: {} }),
+		).toContainEqual({ minProtocol: 7, minSchemaRevision: 16, capability: "atomic_resource_reload" });
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("atomic_resource_reload");
+	});
+
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
 		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
 		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);

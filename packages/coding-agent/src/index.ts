@@ -9,6 +9,8 @@ export {
 	type AgentSessionEventListener,
 	type ModelCycleResult,
 	type PromptOptions,
+	type ReloadOptions,
+	SessionReloadBusyError,
 } from "./core/agent-session.js";
 // Auth and model registry
 export {
@@ -285,6 +287,7 @@ export {
 	DaemonAgentConnection,
 	InProcessAgentConnection,
 } from "./modes/agent-connection/index.js";
+export { AtomicResourceReloadRestartRequiredError } from "./modes/daemon/daemon-errors.js";
 // Run modes for programmatic SDK usage
 export {
 	ClientPromptStashStore,

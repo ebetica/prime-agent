@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { createEventBus } from "../src/core/event-bus.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
@@ -740,6 +741,135 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getCommand("deploy:1")?.description).toBe("explicit command");
 			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
+		});
+	});
+
+	describe("atomic resource replacement", () => {
+		it("publishes replacement context roots only on commit and preserves them on ordinary reload", async () => {
+			const first = join(tempDir, "first-context");
+			const second = join(tempDir, "second-context");
+			mkdirSync(first);
+			mkdirSync(second);
+			writeFileSync(join(first, "FIRST.md"), "first sentinel");
+			writeFileSync(join(second, "SECOND.md"), "second sentinel");
+			const loader = new DefaultResourceLoader({ cwd, agentDir, additionalContextDirectories: [first] });
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
+
+			const prepared = await loader.prepareReload({ contextDirectories: [second] });
+			await expect(loader.prepareReload({ contextDirectories: [first] })).rejects.toThrow("already active");
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
+			const rollback = prepared.commit();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("second sentinel");
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).not.toContain("first sentinel");
+			await expect(loader.reload()).rejects.toThrow("must be settled before reloading");
+			rollback();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
+		});
+
+		it("accepts missing roots, canonicalizes duplicates, and discovers later additions", async () => {
+			const missing = join(tempDir, "future-context");
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+			const prepared = await loader.prepareReload({ contextDirectories: [missing, missing] });
+			expect(prepared.resources.contextDirectories).toEqual([missing]);
+			prepared.commit();
+			prepared.finalize();
+			mkdirSync(missing);
+			writeFileSync(join(missing, "LATER.md"), "later sentinel");
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("later sentinel");
+		});
+
+		it("keeps every published resource unchanged when candidate loading fails", async () => {
+			const stable = join(tempDir, "stable-candidate-context");
+			mkdirSync(stable);
+			writeFileSync(join(stable, "STABLE.md"), "stable candidate sentinel");
+			let failCandidate = false;
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalContextDirectories: [stable],
+				extensionsOverride: (base) => {
+					if (failCandidate) throw new Error("candidate load failed");
+					return base;
+				},
+			});
+			await loader.reload();
+			const previousExtensions = loader.getExtensions();
+			const previousAgentsFiles = loader.getAgentsFiles();
+			failCandidate = true;
+			await expect(loader.prepareReload({ contextDirectories: [] })).rejects.toThrow("candidate load failed");
+			expect(loader.getExtensions()).toBe(previousExtensions);
+			expect(loader.getAgentsFiles()).toEqual(previousAgentsFiles);
+		});
+
+		it("adopts candidate event subscriptions and retires the previous scope only on finalize", async () => {
+			const eventBus = createEventBus();
+			const observed: number[] = [];
+			let generation = 0;
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				eventBus,
+				extensionFactories: [
+					(pi) => {
+						const loadedGeneration = ++generation;
+						pi.events.on("scope-probe", () => observed.push(loadedGeneration));
+					},
+				],
+			});
+			await loader.reload();
+			const prepared = await loader.prepareReload({ contextDirectories: [] });
+			prepared.commit();
+			eventBus.emit("scope-probe", undefined);
+			expect(observed).toEqual([1]);
+
+			prepared.finalize();
+			eventBus.emit("scope-probe", undefined);
+			expect(observed).toEqual([1, 2]);
+		});
+
+		it("disposes candidate load-time event subscriptions when preparation fails", async () => {
+			const eventBus = createEventBus();
+			let candidate = false;
+			let observed = 0;
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				eventBus,
+				extensionFactories: [
+					(pi) => {
+						if (candidate) pi.events.on("candidate-probe", () => observed++);
+					},
+				],
+				extensionsOverride: (base) => {
+					if (candidate) throw new Error("later candidate failure");
+					return base;
+				},
+			});
+			await loader.reload();
+			candidate = true;
+			await expect(loader.prepareReload({ contextDirectories: [] })).rejects.toThrow("later candidate failure");
+
+			eventBus.emit("candidate-probe", undefined);
+			expect(observed).toBe(0);
+		});
+
+		it("rejects malformed existing roots without changing published context", async () => {
+			const first = join(tempDir, "stable-context");
+			const notDirectory = join(tempDir, "not-a-directory");
+			mkdirSync(first);
+			writeFileSync(join(first, "STABLE.md"), "stable sentinel");
+			writeFileSync(notDirectory, "file");
+			const loader = new DefaultResourceLoader({ cwd, agentDir, additionalContextDirectories: [first] });
+			await loader.reload();
+			await expect(loader.prepareReload({ contextDirectories: [notDirectory] })).rejects.toThrow(
+				"Context root is not a directory",
+			);
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("stable sentinel");
 		});
 	});
 });

@@ -1097,7 +1097,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (options.ifIdle && !this.client.supportsServerCapability("atomic_reload")) {
 			throw new DaemonCapabilityUnavailableError("reload", "atomic_reload");
 		}
-		await this.requestOk({ type: "reload", activeSessionId: this.activeSessionId, ifIdle: options.ifIdle });
+		const { ifIdle, ...resources } = options;
+		const replacesResources = Object.keys(resources).length > 0;
+		if (replacesResources && !this.client.supportsServerCapability("atomic_resource_reload")) {
+			throw new DaemonCapabilityUnavailableError("reload", "atomic_resource_reload");
+		}
+		await this.requestOk({
+			type: "reload",
+			activeSessionId: this.activeSessionId,
+			ifIdle,
+			...(replacesResources ? { resources } : {}),
+		});
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {

@@ -21,7 +21,12 @@ import {
 	formatAgentSessionNameUnavailable,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import {
+	type AgentSessionRuntimeConfig,
+	isAgentSessionResourceConfig,
+	mergeAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "../../core/agent-session-config.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -51,7 +56,11 @@ import { createActiveSessionId, type DaemonSocketClient } from "./active-session
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	AtomicResourceReloadRestartRequiredError,
+	deserializeDaemonError,
+	serializeDaemonError,
+} from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -393,6 +402,11 @@ function responseWithId(response: DaemonResponse, id: string | undefined): Daemo
 	return { ...response, id };
 }
 
+function withoutPendingResourceReload(descriptor: DaemonWorkerDescriptor): DaemonWorkerDescriptor {
+	const { pendingResourceReload: _pending, ...committed } = descriptor;
+	return committed;
+}
+
 function isSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
 		return false;
@@ -422,6 +436,10 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		typeof descriptor.createdAt === "string" &&
 		typeof descriptor.updatedAt === "string" &&
 		Number.isInteger(descriptor.consecutiveFailures) &&
+		(descriptor.pendingResourceReload === undefined ||
+			(typeof descriptor.pendingResourceReload === "object" &&
+				typeof descriptor.pendingResourceReload.transactionId === "string" &&
+				isAgentSessionResourceConfig(descriptor.pendingResourceReload.resources))) &&
 		descriptor.createCommand !== undefined &&
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
@@ -592,6 +610,7 @@ export class DaemonSupervisor {
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
+	private readonly resourceReloadTails = new Map<string, Promise<void>>();
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
@@ -981,12 +1000,17 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private persistWorker(worker: ResidentWorker): void {
-		worker.descriptor.updatedAt = new Date().toISOString();
+	private persistWorkerDescriptor(worker: ResidentWorker, descriptor: DaemonWorkerDescriptor): void {
+		const candidate = { ...descriptor, updatedAt: new Date().toISOString() };
 		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(worker.descriptor, null, 2)}\n`, { mode: 0o600 });
+		writeFileSync(tempPath, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
+		worker.descriptor = candidate;
+	}
+
+	private persistWorker(worker: ResidentWorker): void {
+		this.persistWorkerDescriptor(worker, worker.descriptor);
 	}
 
 	private deleteWorkerDescriptor(worker: ResidentWorker): void {
@@ -1372,6 +1396,21 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private async acquireResourceReloadLock(workerId: string): Promise<() => void> {
+		const previous = this.resourceReloadTails.get(workerId) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const tail = previous.then(() => current);
+		this.resourceReloadTails.set(workerId, tail);
+		await previous;
+		return () => {
+			release();
+			if (this.resourceReloadTails.get(workerId) === tail) this.resourceReloadTails.delete(workerId);
+		};
+	}
+
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
@@ -1539,6 +1578,98 @@ export class DaemonSupervisor {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				await this.promoteOwnedWorker(client, match.worker);
 				return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
+			}
+			case "reload": {
+				if (command.resources === undefined) {
+					const match = await this.findWorkerForClient(client, command.activeSessionId);
+					return responseWithId(await this.forwardToWorker(match.worker, command), command.id);
+				}
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+				if (activeSessionId !== match.worker.descriptor.rootActiveSessionId) {
+					throw new Error("Persistent resource reloads must target the worker root session");
+				}
+				const release = await this.acquireResourceReloadLock(match.worker.descriptor.workerId);
+				try {
+					if (!match.worker.client?.supportsServerCapability("atomic_resource_reload")) {
+						throw new AtomicResourceReloadRestartRequiredError();
+					}
+					const response = await this.forwardToWorker(match.worker, command);
+					if (!response.success) return responseWithId(response, command.id);
+					const data = response.data as { transactionId?: unknown; resources?: unknown } | undefined;
+					if (typeof data?.transactionId !== "string" || !data.transactionId) {
+						match.worker.client?.close();
+						throw new Error("Session worker returned an invalid resource reload transaction");
+					}
+					if (!isAgentSessionResourceConfig(data.resources)) {
+						const rollbackResponse = await match.worker.client?.requestWorker({
+							type: "worker_rollback_resource_reload",
+							transactionId: data.transactionId,
+						});
+						if (rollbackResponse && !rollbackResponse.success) match.worker.client?.close();
+						throw new Error("Session worker returned invalid prepared resources");
+					}
+					const resources = data.resources;
+					const previousDescriptor = match.worker.descriptor;
+					const candidate: DaemonWorkerDescriptor = {
+						...previousDescriptor,
+						createCommand: {
+							...previousDescriptor.createCommand,
+							config: mergeAgentSessionResourceConfig(previousDescriptor.createCommand.config, resources),
+						},
+						pendingResourceReload: {
+							transactionId: data.transactionId,
+							resources,
+						},
+					};
+					try {
+						this.persistWorkerDescriptor(match.worker, candidate);
+					} catch (error) {
+						try {
+							const rollbackResponse = await match.worker.client?.requestWorker({
+								type: "worker_rollback_resource_reload",
+								transactionId: data.transactionId,
+							});
+							if (rollbackResponse && !rollbackResponse.success) throw deserializeDaemonError(rollbackResponse);
+						} catch (rollbackError) {
+							match.worker.client?.close();
+							this.log(`Could not roll back resource reload after descriptor failure: ${String(rollbackError)}`);
+						}
+						throw error;
+					}
+					try {
+						const commitResponse = await match.worker.client?.requestWorker({
+							type: "worker_commit_resource_reload",
+							transactionId: data.transactionId,
+						});
+						if (!commitResponse) throw new Error("Session worker disconnected during resource reload commit");
+						if (!commitResponse.success) throw deserializeDaemonError(commitResponse);
+					} catch (error) {
+						// The committed descriptor is authoritative. Keep the marker so a
+						// replacement supervisor commits the still-fenced transaction or
+						// a replacement worker starts directly from the new config. The
+						// caller must not treat a lost commit reply as a definite rollback.
+						match.worker.client?.close();
+						return failure(
+							command.id,
+							command.type,
+							`Resource reload commit result is uncertain: ${String(error)}`,
+							{
+								code: "command_result_uncertain",
+								clientId: this.protocolClientId(client),
+								commandId: command.id ?? "reload",
+							},
+						);
+					}
+					try {
+						this.persistWorkerDescriptor(match.worker, withoutPendingResourceReload(match.worker.descriptor));
+					} catch (error) {
+						this.log(`Could not clear committed resource reload marker: ${String(error)}`);
+					}
+					return success(command.id, "reload", { resources });
+				} finally {
+					release();
+				}
 			}
 			case "retry_worker": {
 				const direct = [...this.workers.values()].find(
@@ -2338,6 +2469,11 @@ export class DaemonSupervisor {
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
+				if (client.supportsServerCapability("atomic_resource_reload")) {
+					await this.reconcilePendingResourceReload(worker, client);
+				} else if (worker.descriptor.pendingResourceReload) {
+					throw new Error("Legacy worker cannot reconcile a committed resource reload");
+				}
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -2349,6 +2485,34 @@ export class DaemonSupervisor {
 			}
 		}
 		throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+	}
+
+	private async reconcilePendingResourceReload(worker: ResidentWorker, client: DaemonWorkerClient): Promise<void> {
+		const listed = await client.requestWorker({ type: "worker_list_resource_reloads" });
+		if (!listed.success) throw deserializeDaemonError(listed);
+		const transactions =
+			typeof listed.data === "object" && listed.data !== null && "transactions" in listed.data
+				? ((listed.data as { transactions?: Array<{ transactionId?: unknown }> }).transactions ?? [])
+				: [];
+		const marker = worker.descriptor.pendingResourceReload;
+		for (const transaction of transactions) {
+			if (typeof transaction.transactionId !== "string") {
+				throw new Error("Worker reported a malformed resource reload transaction");
+			}
+			const response = await client.requestWorker({
+				type:
+					marker?.transactionId === transaction.transactionId
+						? "worker_commit_resource_reload"
+						: "worker_rollback_resource_reload",
+				transactionId: transaction.transactionId,
+			});
+			if (!response.success) throw deserializeDaemonError(response);
+		}
+		if (marker) {
+			// If the transaction was absent, this is a replacement worker and it
+			// already started from the committed createCommand config.
+			this.persistWorkerDescriptor(worker, withoutPendingResourceReload(worker.descriptor));
+		}
 	}
 
 	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {

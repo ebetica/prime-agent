@@ -6,7 +6,7 @@ import type {
 	AgentSessionMessageSafetyStatus,
 } from "../../core/agent-messages.js";
 import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
-import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import type { AgentSessionResourceConfig, AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -58,8 +58,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 adds daemon-side atomic idle admission for resource reloads.
 // Revision 15 adds stable queued-user-action identities and atomic cancellation.
-export const DAEMON_SCHEMA_REVISION = 15;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-6574353088ee";
+// Revision 16 adds transactional live resource-config replacement.
+export const DAEMON_SCHEMA_REVISION = 16;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-f09b889d257d";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -99,6 +100,7 @@ export type DaemonServerCapability =
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
 	| "atomic_reload"
+	| "atomic_resource_reload"
 	| "queued_action_cancellation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
@@ -138,6 +140,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"atomic_reload",
+	"atomic_resource_reload",
 	"queued_action_cancellation",
 ];
 
@@ -576,7 +579,13 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_branch_summary"; activeSessionId: string }
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
-	| { id?: string; type: "reload"; activeSessionId: string; ifIdle?: boolean }
+	| {
+			id?: string;
+			type: "reload";
+			activeSessionId: string;
+			ifIdle?: boolean;
+			resources?: AgentSessionResourceConfig;
+	  }
 	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
@@ -637,6 +646,11 @@ const ATOMIC_RELOAD_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 14,
 	capability: "atomic_reload",
+} as const;
+const ATOMIC_RESOURCE_RELOAD_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 16,
+	capability: "atomic_resource_reload",
 } as const;
 const PROMPT_ADMISSION_CANCELLATION_COMMAND = {
 	minProtocol: 7,
@@ -765,8 +779,11 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		return [PROMPT_ADMISSION_CANCELLATION_COMMAND, compatibility];
 	}
-	if (command.type === "reload" && command.ifIdle === true) {
-		return [ATOMIC_RELOAD_COMMAND, compatibility];
+	if (command.type === "reload") {
+		const requirements: DaemonCommandCompatibility[] = [];
+		if (command.ifIdle === true) requirements.push(ATOMIC_RELOAD_COMMAND);
+		if (command.resources !== undefined) requirements.push(ATOMIC_RESOURCE_RELOAD_COMMAND);
+		return [...requirements, compatibility];
 	}
 	return [compatibility];
 }
@@ -783,6 +800,8 @@ export type DaemonResponse =
 	  };
 
 export type DaemonErrorInfo =
+	| { code: "atomic_resource_reload_restart_required" }
+	| { code: "session_reload_busy" }
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
