@@ -225,6 +225,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"abort_compaction",
 	"abort_branch_summary",
 	"abort_retry",
+	"reload",
 	"new_session",
 	"switch_session",
 	"fork",

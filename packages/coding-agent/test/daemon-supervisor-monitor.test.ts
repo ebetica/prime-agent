@@ -1831,6 +1831,54 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 	});
 
+	it("admits reload commands through the socket ingress allowlist", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-reload-ingress-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const response = success("reload-command", "reload");
+		const handleCommand = vi.fn(async () => response);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			handleCommand,
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope(
+						{ type: "reload", activeSessionId: "session-1", ifIdle: true },
+						"reload-command",
+						"client-1",
+					),
+				),
+			);
+			expect(handleCommand).toHaveBeenCalledOnce();
+			expect(writes).toEqual([`${JSON.stringify(response)}\n`]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("replays completed journaled mutations during restart preparation without taking a mutation lease", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-replay-"));
 		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
