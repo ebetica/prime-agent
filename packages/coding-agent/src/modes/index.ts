@@ -81,6 +81,11 @@ export type {
 	DaemonEventMeta,
 	DaemonEventSequence,
 	DaemonOutbound,
+	DaemonPlannedRestartBlocker,
+	DaemonPlannedRestartClaim,
+	DaemonPlannedRestartHandoff,
+	DaemonPlannedRestartHandoffState,
+	DaemonPlannedRestartTarget,
 	DaemonProtocolInfo,
 	DaemonProtocolName,
 	DaemonProtocolVersion,
@@ -99,6 +104,10 @@ export type { SessionActivity, SessionLifecycle, SessionSummary } from "./daemon
 export { resolveAttachModelFallbackMessage } from "./daemon/daemon-session-list.js";
 export { defaultDaemonSocketPath } from "./daemon/daemon-socket.js";
 export { runDaemonSupervisorMode } from "./daemon/daemon-supervisor.js";
+export {
+	type RegisterDaemonPlannedRestartHandoffOptions,
+	registerDaemonPlannedRestartHandoff,
+} from "./daemon/planned-restart-client.js";
 export {
 	type InteractiveInitialPrompt,
 	InteractiveMode,

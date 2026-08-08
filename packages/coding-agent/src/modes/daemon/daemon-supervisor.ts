@@ -1,6 +1,18 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+	writeSync,
+} from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -77,6 +89,7 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPlannedRestartHandoff,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	failure,
@@ -126,6 +139,12 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import {
+	readPlannedRestartHandoff,
+	registerPlannedRestartHandoff,
+	updatePlannedRestartHandoff,
+	validatePlannedRestartRequest,
+} from "./planned-restart-handoff.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
@@ -171,6 +190,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"follow_up",
 	"restore_next_turn",
 	"restore_actions",
+	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -246,6 +266,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
+	"register_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -1696,8 +1717,57 @@ export class DaemonSupervisor {
 			case "shutdown":
 				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
 				return success(command.id, "shutdown");
+			case "register_planned_restart_handoff": {
+				const handoff = await this.registerPlannedRestartHandoff(command);
+				return success(command.id, command.type, handoff);
+			}
+			case "restore_planned_restart_handoff": {
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const handoff = readPlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+				);
+				if (!handoff) throw new Error(`Unknown planned restart request: ${command.requestId}`);
+				if ((handoff.state !== "prepared" && handoff.state !== "delivered") || !handoff.claim) {
+					throw new Error(`Planned restart request ${command.requestId} has no strict quiescence claim`);
+				}
+				const owner = this.ownership?.record;
+				if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+				if (
+					handoff.claim.supervisorGeneration === owner.generation ||
+					handoff.claim.supervisorOwnerToken === owner.token
+				) {
+					throw new Error("Planned restart continuation is not eligible in the predecessor runtime");
+				}
+				const summary = match.summary;
+				if (
+					summary.sessionId !== handoff.target.sessionId ||
+					!summary.sessionFile ||
+					canonicalSessionPath(summary.sessionFile) !== canonicalSessionPath(handoff.target.sessionFile)
+				) {
+					throw new Error("Planned restart target session identity does not match");
+				}
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				const workerClient = match.worker.client;
+				if (!workerClient) throw new Error("Planned restart target worker is unavailable");
+				const response = await workerClient.requestWorker(
+					{
+						type: "worker_restore_planned_restart_handoff",
+						activeSessionId,
+						sessionId: summary.sessionId,
+						requestId: handoff.requestId,
+						actionId: handoff.actionId,
+						message: handoff.message,
+					},
+					WORKER_REQUEST_TIMEOUT_MS,
+				);
+				if (!response.success) throw new Error(response.error);
+				updatePlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, handoff, "delivered");
+				return success(command.id, command.type, response.data);
+			}
 			case "prepare_update_restart": {
-				const manifest = await this.prepareUpdateRestart();
+				const manifest = await this.prepareUpdateRestart(command.handoffRequestId);
 				return success(command.id, "prepare_update_restart", manifest);
 			}
 			case "agent_messages_status": {
@@ -4459,8 +4529,59 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
+	private plannedRestartAgentDir(): string {
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
+		return agentDir;
+	}
+
+	private async registerPlannedRestartHandoff(
+		command: Extract<DaemonCommand, { type: "register_planned_restart_handoff" }>,
+	): Promise<DaemonPlannedRestartHandoff> {
+		validatePlannedRestartRequest(command.requestId, command.message);
+		if (!command.workerToken) throw new Error("Planned restart worker token is required");
+		const match = await this.findWorker(
+			command.activeSessionId,
+			(worker) => worker.descriptor.authenticationToken === command.workerToken,
+		);
+		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+		if (activeSessionId !== command.activeSessionId || !match.summary.sessionFile) {
+			throw new Error(`Unknown active session: ${command.activeSessionId}`);
+		}
+		return registerPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, {
+			requestId: command.requestId,
+			target: {
+				activeSessionId,
+				sessionId: match.summary.sessionId,
+				sessionFile: canonicalSessionPath(match.summary.sessionFile),
+			},
+			message: command.message,
+			actionId: `planned-restart:${createHash("sha256").update(command.requestId).digest("hex")}`,
+		});
+	}
+
+	private async resolvePlannedRestartHandoff(requestId: string): Promise<DaemonPlannedRestartHandoff> {
+		const handoff = readPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, requestId);
+		if (!handoff) throw new Error(`Unknown planned restart request: ${requestId}`);
+		if (handoff.state === "delivered") throw new Error(`Planned restart request ${requestId} was already delivered`);
+		const match = await this.findWorker(handoff.target.activeSessionId);
+		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+		if (
+			activeSessionId !== handoff.target.activeSessionId ||
+			match.summary.sessionId !== handoff.target.sessionId ||
+			!match.summary.sessionFile ||
+			canonicalSessionPath(match.summary.sessionFile) !== canonicalSessionPath(handoff.target.sessionFile)
+		) {
+			throw new Error(
+				`Planned restart target ${handoff.target.activeSessionId} no longer has the registered identity`,
+			);
+		}
+		return handoff;
+	}
+
+	private async prepareUpdateRestart(handoffRequestId?: string): Promise<DaemonUpdateRestartManifest> {
 		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
+		let handoff: DaemonPlannedRestartHandoff | undefined;
 		this.updateRestartPhase = "draining";
 		try {
 			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
@@ -4468,16 +4589,37 @@ export class DaemonSupervisor {
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
-			const manifest = await this.prepareUpdateRestartFenced(deadline);
+			handoff = handoffRequestId ? await this.resolvePlannedRestartHandoff(handoffRequestId) : undefined;
+			const manifest = await this.prepareUpdateRestartFenced(deadline, handoff);
 			this.updateRestartPhase = "prepared";
 			return manifest;
 		} catch (error) {
-			this.updateRestartPhase = undefined;
+			const failedHandoff =
+				handoff ??
+				(handoffRequestId
+					? readPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, handoffRequestId)
+					: undefined);
+			const updatedHandoff = failedHandoff
+				? updatePlannedRestartHandoff(
+						this.plannedRestartAgentDir(),
+						this.socketPath,
+						failedHandoff,
+						"failed",
+						error instanceof Error ? error.message : String(error),
+					)
+				: undefined;
+			// A published strict claim is monotonic. Its workers have closed all
+			// sessions and remain publication-fenced, so an after-commit failure
+			// must not reopen ingress or make the continuation ineligible.
+			this.updateRestartPhase = updatedHandoff?.state === "prepared" ? "prepared" : undefined;
 			throw error;
 		}
 	}
 
-	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
+	private async prepareUpdateRestartFenced(
+		deadline: number,
+		handoff?: DaemonPlannedRestartHandoff,
+	): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) => worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
@@ -4492,8 +4634,13 @@ export class DaemonSupervisor {
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const client = worker.client;
+				const ownsHandoff = handoff ? worker.summaries.has(handoff.target.activeSessionId) : false;
 				const response = await client.requestWorker(
-					{ type: "worker_prepare_update" },
+					{
+						type: "worker_prepare_update",
+						...(handoff ? { strict: true } : {}),
+						...(ownsHandoff ? { handoff } : {}),
+					},
 					Math.max(1, Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now())),
 				);
 				if (!response.success) throw new Error(response.error);
@@ -4560,7 +4707,20 @@ export class DaemonSupervisor {
 			createdAt: new Date().toISOString(),
 			sessions: responses.flatMap((manifest) => manifest.sessions),
 			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
+			...(handoff ? { handoff } : {}),
 		};
+		if (handoff) {
+			const capturedTargets = manifest.sessions.filter(
+				(session) =>
+					session.activeSessionId === handoff.target.activeSessionId &&
+					session.sessionId === handoff.target.sessionId &&
+					canonicalSessionPath(session.sessionFile) === canonicalSessionPath(handoff.target.sessionFile),
+			);
+			if (capturedTargets.length !== 1) {
+				await cancelAcknowledged();
+				throw new Error("Planned restart target was not captured exactly once under the quiescence fence");
+			}
+		}
 		// A worker that disconnected after preparing cancelled its checkpoint with
 		// the old client; a recovered replacement may have admitted inputs past the
 		// captured manifest. Abort before the manifest is persisted so the caller's
@@ -4583,6 +4743,30 @@ export class DaemonSupervisor {
 		// worker that no longer holds the checkpoint.
 		const commitClients = new Map(prepared.map((worker) => [worker, worker.updateRestartPrepareClient]));
 		for (const worker of prepared) worker.updateRestartPrepareClient = undefined;
+		let handoffClaimed = false;
+		const publishHandoffClaim = async () => {
+			if (!handoff || handoffClaimed) return;
+			await this.assertCurrentOwnership();
+			const owner = this.ownership?.record;
+			if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+			manifest.handoff = updatePlannedRestartHandoff(
+				this.plannedRestartAgentDir(),
+				this.socketPath,
+				handoff,
+				"prepared",
+				undefined,
+				{
+					claimedAt: new Date().toISOString(),
+					supervisorGeneration: owner.generation,
+					supervisorOwnerToken: owner.token,
+					supervisorPid: owner.pid,
+					...(owner.processStartId ? { supervisorProcessStartId: owner.processStartId } : {}),
+					supervisorSocketPath: owner.socketPath,
+				},
+			);
+			this.validateAndPersistUpdateManifest(manifest);
+			handoffClaimed = true;
+		};
 		const commitResults = await Promise.allSettled(
 			prepared.map(async (worker) => {
 				const client = commitClients.get(worker);
@@ -4597,16 +4781,34 @@ export class DaemonSupervisor {
 		const commitFailure = commitResults.find(
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
+		// A commit response is the durable quiescence boundary: the worker has closed
+		// every session and remains publication-fenced until the supervisor stops it.
+		// Publish before process teardown so a supervisor crash cannot strand the
+		// continuation between the last worker exit and the strict-claim write.
+		if (!commitFailure) await publishHandoffClaim();
+		let forcedStopResults: PromiseSettledResult<void>[] = [];
 		if (commitFailure) {
 			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
-			return manifest;
+			forcedStopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		} else {
+			const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
+			if (stopResults.some((result) => result.status === "rejected")) {
+				this.log("A committed update worker did not stop gracefully; forcing restart completion");
+				forcedStopResults = await Promise.allSettled(
+					prepared.map((worker) => this.stopWorker(worker, false, true)),
+				);
+			}
 		}
-		const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
-		if (stopResults.some((result) => result.status === "rejected")) {
-			this.log("A committed update worker did not stop gracefully; forcing restart completion");
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		if (!handoff) return manifest;
+		const failedStop = forcedStopResults.find(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (failedStop || this.workers.size > 0) {
+			throw new Error(
+				`Strict planned restart could not stop every worker: ${String(failedStop?.reason ?? "resident worker remains")}`,
+			);
 		}
+		await publishHandoffClaim();
 		return manifest;
 	}
 
@@ -4643,13 +4845,25 @@ export class DaemonSupervisor {
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 		const tempPath = `${path}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+		const descriptor = openSync(tempPath, "w", 0o600);
+		try {
+			writeSync(descriptor, `${JSON.stringify(manifest)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
 		chmodSync(tempPath, 0o600);
 		const validated = JSON.parse(readFileSync(tempPath, "utf8")) as DaemonUpdateRestartManifest;
 		if (!Array.isArray(validated.sessions) || validated.sessions.length !== manifest.sessions.length) {
 			throw new Error("Could not validate aggregate update manifest");
 		}
 		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	}
 
 	private async stopWorker(

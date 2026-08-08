@@ -312,6 +312,11 @@ export {
 	type DaemonEventSequence,
 	type DaemonModeOptions,
 	type DaemonOutbound,
+	type DaemonPlannedRestartBlocker,
+	type DaemonPlannedRestartClaim,
+	type DaemonPlannedRestartHandoff,
+	type DaemonPlannedRestartHandoffState,
+	type DaemonPlannedRestartTarget,
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,
 	type DaemonProtocolVersion,
@@ -330,12 +335,14 @@ export {
 	type PrintModeOptions,
 	type PromptStash,
 	type PromptStashState,
+	type RegisterDaemonPlannedRestartHandoffOptions,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
 	type RpcEventListener,
 	type RpcResponse,
 	type RpcSessionState,
+	registerDaemonPlannedRestartHandoff,
 	runPrintMode,
 	runRpcMode,
 	type SessionActivity,
@@ -394,6 +401,10 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.js";
+export {
+	prepareDaemonUpdateRestart,
+	runDaemonUpdateRestartCoordinator,
+} from "./package-manager-cli.js";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.js";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";
