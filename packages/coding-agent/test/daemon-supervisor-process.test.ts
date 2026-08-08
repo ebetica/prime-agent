@@ -286,6 +286,69 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 }
 
 describe("daemon supervisor resident workers", () => {
+	it("atomically upgrades and persists resources for an already-resident legacy session", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const contextDir = join(root, "operator-context");
+		const socketPath = join(tmpdir(), `prime-supervisor-resource-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		mkdirSync(contextDir, { recursive: true });
+		writeFileSync(join(contextDir, "OPERATOR.md"), "resident resource sentinel");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(created.success).toBe(true);
+		const summary = requireSummary(created.success ? created.data : undefined);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		if (summary.workerPid) workerPids.add(summary.workerPid);
+		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
+			closeClientOnDispose: false,
+			recoverDaemon: async () => {},
+			supportsExtensionUi: false,
+		});
+		expect(await connection.getSystemPrompt()).not.toContain("resident resource sentinel");
+		await connection.reload({ ifIdle: true, contextDirectories: [contextDir] });
+		expect(await connection.getSystemPrompt()).toContain("resident resource sentinel");
+		const upgraded = readWorkerDescriptor(agentDir);
+		expect(upgraded.createCommand.config?.contextDirectories).toEqual([contextDir]);
+		expect(upgraded.pendingResourceReload).toBeUndefined();
+
+		const readyPath = join(root, "busy-reload.ready");
+		await startBlockingBash(client, activeSessionId, readyPath);
+		await expect(connection.reload({ ifIdle: true, contextDirectories: [] })).rejects.toThrow(
+			"Session is busy; resources not reloaded",
+		);
+		expect(readWorkerDescriptor(agentDir).createCommand.config?.contextDirectories).toEqual([contextDir]);
+		await client.request({ type: "abort_bash", activeSessionId });
+		await connection.waitForIdle();
+
+		const oldPid = readWorkerDescriptor(agentDir).pid;
+		process.kill(oldPid, "SIGKILL");
+		await waitForCondition(
+			() => {
+				try {
+					const descriptor = readWorkerDescriptor(agentDir);
+					return descriptor.pid !== oldPid && descriptor.lifecycle === "ready";
+				} catch {
+					return false;
+				}
+			},
+			"Resource-upgraded worker did not recover",
+			20_000,
+		);
+		workerPids.delete(oldPid);
+		workerPids.add(readWorkerDescriptor(agentDir).pid);
+		expect(await connection.getSystemPrompt()).toContain("resident resource sentinel");
+		await connection.dispose();
+		await client.request({ type: "shutdown" });
+		client.close();
+	}, 40_000);
 	it("lists, creates, and attaches passive children through their owning worker", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

@@ -11,6 +11,7 @@ import type { DaemonSocketClient } from "../src/modes/daemon/active-session-stat
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+import { AtomicResourceReloadRestartRequiredError } from "../src/modes/daemon/daemon-errors.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
@@ -3247,6 +3248,54 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 	});
 
+	it("admits reload commands through the socket ingress allowlist", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-reload-ingress-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const response = success("reload-command", "reload");
+		const handleCommand = vi.fn(async () => response);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			handleCommand,
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope(
+						{ type: "reload", activeSessionId: "session-1", ifIdle: true },
+						"reload-command",
+						"client-1",
+					),
+				),
+			);
+			expect(handleCommand).toHaveBeenCalledOnce();
+			expect(writes).toEqual([`${JSON.stringify(response)}\n`]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("replays completed journaled mutations during restart preparation without taking a mutation lease", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-replay-"));
 		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
@@ -3418,5 +3467,276 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
 		expect(requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("commits a resident resource reload durably before releasing its worker", async () => {
+		const requestWorker = vi.fn(async () => ({
+			success: true as const,
+			type: "response" as const,
+			command: "worker",
+		}));
+		const worker = {
+			descriptor: {
+				version: 1,
+				workerId: "resident-resource",
+				rootActiveSessionId: "root-active",
+				createCommand: { type: "create" as const, config: { cwd: "/repo", skills: ["old-skills"] } },
+			},
+			client: { supportsServerCapability: () => true, requestWorker, close: vi.fn() },
+		};
+		const persisted: Array<Record<string, unknown>> = [];
+		const persistWorkerDescriptor = vi.fn(
+			(_worker: typeof worker, descriptor: typeof worker.descriptor & Record<string, unknown>) => {
+				worker.descriptor = descriptor;
+				persisted.push(descriptor);
+			},
+		);
+		const forwardToWorker = vi.fn(async () =>
+			success(undefined, "reload", {
+				transactionId: "reload-1",
+				resources: { contextDirectories: ["/operator"], extensions: ["current-extension"] },
+			}),
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			resourceReloadTails: new Map(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary: { id: "root-active" } })),
+			forwardToWorker,
+			persistWorkerDescriptor,
+			log: vi.fn(),
+		}) as unknown as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: {
+					type: "reload";
+					activeSessionId: string;
+					ifIdle: true;
+					resources: { contextDirectories: string[]; extensions: string[] };
+				},
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.handleCommand({} as DaemonSocketClient, {
+				type: "reload",
+				activeSessionId: "root-active",
+				ifIdle: true,
+				resources: { contextDirectories: ["/operator"], extensions: ["current-extension"] },
+			}),
+		).resolves.toMatchObject({ success: true });
+		expect(persisted[0]).toMatchObject({
+			createCommand: {
+				config: {
+					cwd: "/repo",
+					skills: ["old-skills"],
+					contextDirectories: ["/operator"],
+					extensions: ["current-extension"],
+				},
+			},
+			pendingResourceReload: { transactionId: "reload-1" },
+		});
+		expect(requestWorker).toHaveBeenCalledWith({
+			type: "worker_commit_resource_reload",
+			transactionId: "reload-1",
+		});
+		expect(persisted[1]).not.toHaveProperty("pendingResourceReload");
+	});
+
+	it("reports an uncertain result when a durable resource commit reply is lost", async () => {
+		const close = vi.fn();
+		const requestWorker = vi.fn(async () => ({
+			success: false as const,
+			type: "response" as const,
+			command: "worker_commit_resource_reload",
+			error: "worker disconnected",
+		}));
+		const worker = {
+			descriptor: {
+				version: 1,
+				workerId: "resident-resource-uncertain",
+				rootActiveSessionId: "root-active",
+				createCommand: { type: "create" as const, config: { cwd: "/repo" } },
+			},
+			client: { supportsServerCapability: () => true, requestWorker, close },
+		};
+		const persistWorkerDescriptor = vi.fn(
+			(_worker: typeof worker, descriptor: typeof worker.descriptor & Record<string, unknown>) => {
+				worker.descriptor = descriptor;
+			},
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			resourceReloadTails: new Map(),
+			protocolClientIds: new WeakMap(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary: { id: "root-active" } })),
+			forwardToWorker: vi.fn(async () =>
+				success(undefined, "reload", {
+					transactionId: "reload-uncertain",
+					resources: { contextDirectories: ["/operator"] },
+				}),
+			),
+			persistWorkerDescriptor,
+			log: vi.fn(),
+		}) as unknown as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: {
+					type: "reload";
+					id: string;
+					activeSessionId: string;
+					resources: { contextDirectories: string[] };
+				},
+			): Promise<{ success: boolean; errorInfo?: { code?: string } }>;
+		};
+		const client = { id: "client-socket" } as DaemonSocketClient;
+
+		const response = await supervisor.handleCommand(client, {
+			type: "reload",
+			id: "reload-command",
+			activeSessionId: "root-active",
+			resources: { contextDirectories: ["/operator"] },
+		});
+		expect(response).toMatchObject({
+			success: false,
+			errorInfo: {
+				code: "command_result_uncertain",
+				clientId: "client-socket",
+				commandId: "reload-command",
+			},
+		});
+		expect(worker.descriptor).toHaveProperty("pendingResourceReload.transactionId", "reload-uncertain");
+		expect(persistWorkerDescriptor).toHaveBeenCalledOnce();
+		expect(close).toHaveBeenCalledOnce();
+	});
+
+	it("rolls back the fenced worker when durable resource persistence fails", async () => {
+		const requestWorker = vi.fn(async () => ({
+			success: true as const,
+			type: "response" as const,
+			command: "worker",
+		}));
+		const originalDescriptor = {
+			version: 1,
+			workerId: "resident-resource",
+			rootActiveSessionId: "root-active",
+			createCommand: { type: "create" as const, config: { contextDirectories: ["/old"] } },
+		};
+		const worker = {
+			descriptor: originalDescriptor,
+			client: { supportsServerCapability: () => true, requestWorker, close: vi.fn() },
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			resourceReloadTails: new Map(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary: { id: "root-active" } })),
+			forwardToWorker: vi.fn(async () =>
+				success(undefined, "reload", {
+					transactionId: "reload-2",
+					resources: { contextDirectories: ["/new"] },
+				}),
+			),
+			persistWorkerDescriptor: vi.fn(() => {
+				throw new Error("descriptor write failed");
+			}),
+			log: vi.fn(),
+		}) as unknown as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: {
+					type: "reload";
+					activeSessionId: string;
+					resources: { contextDirectories: string[] };
+				},
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.handleCommand({} as DaemonSocketClient, {
+				type: "reload",
+				activeSessionId: "root-active",
+				resources: { contextDirectories: ["/new"] },
+			}),
+		).rejects.toThrow("descriptor write failed");
+		expect(worker.descriptor).toBe(originalDescriptor);
+		expect(requestWorker).toHaveBeenCalledWith({
+			type: "worker_rollback_resource_reload",
+			transactionId: "reload-2",
+		});
+	});
+
+	it("rejects legacy resident workers before forwarding a resource replacement", async () => {
+		const worker = {
+			descriptor: { workerId: "legacy", rootActiveSessionId: "root-active" },
+			client: { supportsServerCapability: () => false },
+		};
+		const forwardToWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			resourceReloadTails: new Map(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary: { id: "root-active" } })),
+			forwardToWorker,
+		}) as unknown as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: {
+					type: "reload";
+					activeSessionId: string;
+					resources: { contextDirectories: string[] };
+				},
+			): Promise<unknown>;
+		};
+		await expect(
+			supervisor.handleCommand({} as DaemonSocketClient, {
+				type: "reload",
+				activeSessionId: "root-active",
+				resources: { contextDirectories: ["/new"] },
+			}),
+		).rejects.toBeInstanceOf(AtomicResourceReloadRestartRequiredError);
+		expect(forwardToWorker).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ marker: true, expected: "worker_commit_resource_reload" },
+		{ marker: false, expected: "worker_rollback_resource_reload" },
+	])("reconciles a $expected transaction before worker publication", async ({ marker, expected }) => {
+		const requestWorker = vi.fn(async (command: { type: string }) => {
+			if (command.type === "worker_list_resource_reloads") {
+				return {
+					type: "response" as const,
+					command: command.type,
+					success: true as const,
+					data: { transactions: [{ transactionId: "reload-recovery" }] },
+				};
+			}
+			return { type: "response" as const, command: command.type, success: true as const };
+		});
+		const worker: { descriptor: Record<string, unknown> } = {
+			descriptor: {
+				workerId: "recovering-resource",
+				...(marker
+					? {
+							pendingResourceReload: {
+								transactionId: "reload-recovery",
+								resources: { contextDirectories: ["/new"] },
+							},
+						}
+					: {}),
+			},
+		};
+		const persistWorkerDescriptor = vi.fn((_worker: unknown, descriptor: Record<string, unknown>) => {
+			worker.descriptor = descriptor;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorkerDescriptor,
+		}) as unknown as {
+			reconcilePendingResourceReload(
+				worker: unknown,
+				client: { requestWorker: typeof requestWorker },
+			): Promise<void>;
+		};
+		await supervisor.reconcilePendingResourceReload(worker, { requestWorker });
+		expect(requestWorker).toHaveBeenCalledWith({ type: expected, transactionId: "reload-recovery" });
+		if (marker) {
+			expect(persistWorkerDescriptor).toHaveBeenCalledOnce();
+			expect(worker.descriptor).not.toHaveProperty("pendingResourceReload");
+		} else {
+			expect(persistWorkerDescriptor).not.toHaveBeenCalled();
+		}
 	});
 });

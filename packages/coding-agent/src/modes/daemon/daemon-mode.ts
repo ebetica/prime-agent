@@ -76,8 +76,18 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import {
+	type AgentSession,
+	type PreparedSessionReload,
+	type PromptOptions,
+	rlmChildLabel,
+} from "../../core/agent-session.js";
+import {
+	type AgentSessionResourceConfig,
+	type AgentSessionRuntimeConfig,
+	isAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
 	type AgentSessionRuntimeMetadata,
@@ -445,6 +455,14 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly pendingResourceReloads = new Map<
+		string,
+		{
+			activeSessionId: string;
+			prepared: PreparedSessionReload;
+			rollbackRuntimeConfig: () => void;
+		}
+	>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -3384,6 +3402,38 @@ export class AgentDaemon {
 					this.writeWorkerSuccess(client, command, receipt);
 					return;
 				}
+				case "worker_list_resource_reloads":
+					this.writeWorkerSuccess(client, command, {
+						transactions: [...this.pendingResourceReloads.entries()].map(([transactionId, pending]) => ({
+							transactionId,
+							activeSessionId: pending.activeSessionId,
+							resources: pending.prepared.resources,
+						})),
+					});
+					return;
+				case "worker_commit_resource_reload": {
+					const pending = this.pendingResourceReloads.get(command.transactionId);
+					if (!pending) throw new Error("Unknown resource reload transaction");
+					pending.prepared.commit();
+					this.pendingResourceReloads.delete(command.transactionId);
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
+				case "worker_rollback_resource_reload": {
+					const pending = this.pendingResourceReloads.get(command.transactionId);
+					if (!pending) {
+						this.writeWorkerSuccess(client, command);
+						return;
+					}
+					pending.rollbackRuntimeConfig();
+					try {
+						await pending.prepared.rollback();
+					} finally {
+						this.pendingResourceReloads.delete(command.transactionId);
+					}
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
 				case "worker_prepare_update": {
 					const transaction = this.beginUpdateRestartTransaction(client);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
@@ -4404,8 +4454,39 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				// Reload re-evaluates extension modules, which capture client env
 				// (e.g. herdr pane identity) synchronously at load.
-				await withClientEnv(state.clientEnv, () => state.runtime.session.reload({ onlyIfIdle: command.ifIdle }));
-				return success(command.id, "reload");
+				if (command.resources === undefined) {
+					await withClientEnv(state.clientEnv, () => state.runtime.session.reload({ onlyIfIdle: command.ifIdle }));
+					return success(command.id, "reload");
+				}
+				if (!isAgentSessionResourceConfig(command.resources)) {
+					throw new Error("Invalid resource reload configuration");
+				}
+				const prepared = await withClientEnv(state.clientEnv, () =>
+					state.runtime.session.prepareReload({ onlyIfIdle: command.ifIdle, ...command.resources }),
+				);
+				const rollbackRuntimeConfig = state.runtime.replaceRuntimeResources(
+					prepared.resources as AgentSessionResourceConfig,
+				);
+				if (this.options.worker) {
+					const transactionId = randomUUID();
+					this.pendingResourceReloads.set(transactionId, {
+						activeSessionId: state.activeSessionId,
+						prepared,
+						rollbackRuntimeConfig,
+					});
+					return success(command.id, "reload", {
+						transactionId,
+						resources: prepared.resources,
+					});
+				}
+				try {
+					prepared.commit();
+					return success(command.id, "reload", { resources: prepared.resources });
+				} catch (error) {
+					rollbackRuntimeConfig();
+					await prepared.rollback();
+					throw error;
+				}
 			}
 
 			case "new_session": {
