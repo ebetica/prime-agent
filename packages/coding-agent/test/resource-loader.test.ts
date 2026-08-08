@@ -757,6 +757,7 @@ export default function(pi: ExtensionAPI) {
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
 
 			const prepared = await loader.prepareReload({ contextDirectories: [second] });
+			await expect(loader.prepareReload({ contextDirectories: [first] })).rejects.toThrow("already active");
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
 			const rollback = prepared.commit();
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("second sentinel");

@@ -452,6 +452,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async prepareReload(options: ResourceReloadOptions): Promise<PreparedResourceReload> {
+		if (this.preparedReloadActive) throw new Error("A prepared resource reload is already active");
 		const appendSystemPrompt =
 			options.appendSystemPrompt !== undefined
 				? validateResourceStrings("appendSystemPrompt", options.appendSystemPrompt)
