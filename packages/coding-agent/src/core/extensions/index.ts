@@ -88,6 +88,8 @@ export type {
 	InputSource,
 	IpythonToolCallEvent,
 	IpythonToolResultEvent,
+	KernelHostRequestContext,
+	KernelHostRequestRegistration,
 	KeybindingsManager,
 	LoadExtensionsResult,
 	// Events - Message

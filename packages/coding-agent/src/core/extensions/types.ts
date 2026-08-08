@@ -1025,6 +1025,28 @@ export interface ResolvedCommand extends RegisteredCommand {
 // biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
+/** Trusted context supplied by the host for a kernel request. */
+export interface KernelHostRequestContext {
+	/** Absolute path of the durable transcript owning the current session. */
+	readonly sessionFile: string;
+	readonly sessionId: string;
+	/** Aborted when the owning session or extension runtime is replaced. */
+	readonly signal: AbortSignal;
+}
+
+export interface KernelHostRequestRegistration {
+	/** Exact caller payload keys accepted for this capability. All others fail closed. */
+	allowedPayloadKeys: readonly string[];
+	/**
+	 * Trusted host implementation. It must honor ``ctx.signal`` and recheck it
+	 * immediately before irreversible side effects.
+	 */
+	handler: (
+		payload: Readonly<Record<string, unknown>>,
+		ctx: KernelHostRequestContext,
+	) => Promise<Record<string, unknown>>;
+}
+
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1081,6 +1103,13 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+
+	/**
+	 * Register a capability-gated request callable through ``rlm.host_request``.
+	 * The kernel supplies only the declared payload keys; durable session identity
+	 * comes from the host context and cannot be selected by the caller.
+	 */
+	registerKernelHostRequest(type: string, registration: KernelHostRequestRegistration): void;
 
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
@@ -1497,6 +1526,7 @@ export interface Extension {
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
+	kernelHostRequests: Map<string, KernelHostRequestRegistration>;
 	messageRenderers: Map<string, MessageRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
