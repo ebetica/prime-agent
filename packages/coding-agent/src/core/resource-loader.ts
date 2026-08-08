@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import chalk from "chalk";
@@ -76,6 +76,7 @@ function loadContextFileFromDir(dir: string): { path: string; content: string } 
 export function loadProjectContextFiles(options: {
 	cwd: string;
 	agentDir: string;
+	additionalContextDirectories?: string[];
 }): Array<{ path: string; content: string }> {
 	const resolvedCwd = options.cwd;
 	const resolvedAgentDir = options.agentDir;
@@ -86,28 +87,50 @@ export function loadProjectContextFiles(options: {
 	const globalContext = loadContextFileFromDir(resolvedAgentDir);
 	if (globalContext) {
 		contextFiles.push(globalContext);
-		seenPaths.add(globalContext.path);
+		seenPaths.add(canonicalizePath(globalContext.path));
+	}
+
+	// Explicit context roots are user-global context, so they precede project
+	// context just like agentDir/AGENTS.md. Only direct Markdown files are read;
+	// symlinked entries are excluded so a directory cannot unexpectedly widen.
+	for (const directory of options.additionalContextDirectories ?? []) {
+		let entries: Dirent[];
+		try {
+			entries = readdirSync(directory, { withFileTypes: true });
+		} catch {
+			// Optional context roots may not exist yet or may disappear between reloads.
+			continue;
+		}
+		for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+			if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md")) continue;
+			const path = join(directory, entry.name);
+			const canonicalPath = canonicalizePath(path);
+			if (seenPaths.has(canonicalPath)) continue;
+			try {
+				contextFiles.push({ path, content: readFileSync(path, "utf-8") });
+				seenPaths.add(canonicalPath);
+			} catch (error) {
+				console.error(chalk.yellow(`Warning: Could not read ${path}: ${error}`));
+			}
+		}
 	}
 
 	const ancestorContextFiles: Array<{ path: string; content: string }> = [];
-
 	let currentDir = resolvedCwd;
 	const root = resolve("/");
-
 	while (true) {
 		const contextFile = loadContextFileFromDir(currentDir);
-		if (contextFile && !seenPaths.has(contextFile.path)) {
+		const canonicalPath = contextFile ? canonicalizePath(contextFile.path) : undefined;
+		if (contextFile && canonicalPath && !seenPaths.has(canonicalPath)) {
 			ancestorContextFiles.unshift(contextFile);
-			seenPaths.add(contextFile.path);
+			seenPaths.add(canonicalPath);
 		}
 
 		if (currentDir === root) break;
-
 		const parentDir = resolve(currentDir, "..");
 		if (parentDir === currentDir) break;
 		currentDir = parentDir;
 	}
-
 	contextFiles.push(...ancestorContextFiles);
 
 	return contextFiles;
@@ -120,6 +143,7 @@ export interface DefaultResourceLoaderOptions {
 	eventBus?: EventBus;
 	additionalExtensionPaths?: string[];
 	additionalSkillPaths?: string[];
+	additionalContextDirectories?: string[];
 	additionalPromptTemplatePaths?: string[];
 	additionalThemePaths?: string[];
 	extensionFactories?: ExtensionFactory[];
@@ -163,6 +187,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private bundledSkillsDir: string | null;
 	private additionalExtensionPaths: string[];
 	private additionalSkillPaths: string[];
+	private additionalContextDirectories: string[];
 	private additionalPromptTemplatePaths: string[];
 	private additionalThemePaths: string[];
 	private extensionFactories: ExtensionFactory[];
@@ -225,6 +250,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
+		this.additionalContextDirectories = (options.additionalContextDirectories ?? []).map((path) =>
+			resolve(this.cwd, path),
+		);
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
 		this.extensionFactories = options.extensionFactories ?? [];
@@ -473,7 +501,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		const agentsFiles = {
-			agentsFiles: this.noContextFiles ? [] : loadProjectContextFiles({ cwd: this.cwd, agentDir: this.agentDir }),
+			agentsFiles: this.noContextFiles
+				? []
+				: loadProjectContextFiles({
+						cwd: this.cwd,
+						agentDir: this.agentDir,
+						additionalContextDirectories: this.additionalContextDirectories,
+					}),
 		};
 		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
 		this.agentsFiles = resolvedAgentsFiles.agentsFiles;

@@ -735,6 +735,7 @@ async function prepareRuntimeServices(options: {
 		resourceLoaderOptions: {
 			additionalExtensionPaths: config.extensions,
 			additionalSkillPaths: config.skills,
+			additionalContextDirectories: config.contextDirectories,
 			additionalPromptTemplatePaths: config.promptTemplates,
 			additionalThemePaths: config.themes,
 			noExtensions: config.noExtensions,

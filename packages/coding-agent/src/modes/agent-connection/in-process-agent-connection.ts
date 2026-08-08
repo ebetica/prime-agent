@@ -45,6 +45,7 @@ import type {
 	AgentConnectionPromptOptions,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
+	AgentConnectionReloadOptions,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSavedSessionScope,
@@ -472,8 +473,8 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.abortRetry();
 	}
 
-	async reload(): Promise<void> {
-		await this.session.reload();
+	async reload(options: AgentConnectionReloadOptions = {}): Promise<void> {
+		await this.session.reload({ onlyIfIdle: options.ifIdle });
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {
