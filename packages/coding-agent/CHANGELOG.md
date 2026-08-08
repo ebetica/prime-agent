@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added capability-gated extension host requests for Python skills, bound to the current durable session outside the kernel.
+
 ## [0.7.0] - 2026-08-05
 
 ### Breaking Changes

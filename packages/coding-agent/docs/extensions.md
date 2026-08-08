@@ -1266,6 +1266,37 @@ pi.registerTool({
 });
 ```
 
+### pi.registerKernelHostRequest(type, registration)
+
+Register a narrow host capability for a Python skill to call with
+`await rlm.host_request(type, payload)`. Register it during extension loading.
+The capability exists only in sessions that load the extension, and request
+payloads may contain only the exact `allowedPayloadKeys`; undeclared keys are
+rejected before the handler runs.
+
+The handler receives the durable transcript path and session id from Prime's
+current host-side `SessionManager`, never from the kernel request. Host-owned
+configuration should be captured by the extension closure. Honor `ctx.signal`
+and check it immediately before committing a side effect: it aborts when the
+session is disposed or the extension runtime is replaced.
+
+```typescript
+export default function (pi: ExtensionAPI) {
+  const configuredStore = loadHostConfiguration();
+  pi.registerKernelHostRequest("example.document_create", {
+    allowedPayloadKeys: ["title", "format"],
+    async handler(payload, ctx) {
+      if (ctx.signal.aborted) throw new Error("Session replaced");
+      return createDocument(configuredStore, ctx.sessionFile, payload, ctx.signal);
+    },
+  });
+}
+```
+
+Requests and responses use the ordinary inspectable IPython comm transcript.
+Do not accept session identities, credentials, storage roots, or filesystem
+paths as payload fields.
+
 ### pi.sendMessage(message, options?)
 
 Inject a custom message into the session.

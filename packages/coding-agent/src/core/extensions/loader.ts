@@ -189,6 +189,21 @@ function createExtensionAPI(
 			runtime.refreshTools();
 		},
 
+		registerKernelHostRequest(type, registration): void {
+			runtime.assertActive();
+			if (!/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/.test(type)) {
+				throw new Error(`Kernel host request type must be a namespaced lowercase name: ${type}`);
+			}
+			if (extension.kernelHostRequests.has(type)) {
+				throw new Error(`Kernel host request type already registered by this extension: ${type}`);
+			}
+			const keys = [...registration.allowedPayloadKeys];
+			if (new Set(keys).size !== keys.length || keys.some((key) => !/^[a-z][a-zA-Z0-9_]*$/.test(key))) {
+				throw new Error(`Kernel host request type ${type} has invalid allowed payload keys`);
+			}
+			extension.kernelHostRequests.set(type, { ...registration, allowedPayloadKeys: keys });
+		},
+
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
 			runtime.assertActive();
 			extension.commands.set(name, {
@@ -367,6 +382,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
 		tools: new Map(),
+		kernelHostRequests: new Map(),
 		messageRenderers: new Map(),
 		commands: new Map(),
 		flags: new Map(),
