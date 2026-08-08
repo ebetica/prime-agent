@@ -87,30 +87,12 @@ export function loadProjectContextFiles(options: {
 	const globalContext = loadContextFileFromDir(resolvedAgentDir);
 	if (globalContext) {
 		contextFiles.push(globalContext);
-		seenPaths.add(globalContext.path);
+		seenPaths.add(canonicalizePath(globalContext.path));
 	}
 
-	const ancestorContextFiles: Array<{ path: string; content: string }> = [];
-
-	let currentDir = resolvedCwd;
-	const root = resolve("/");
-
-	while (true) {
-		const contextFile = loadContextFileFromDir(currentDir);
-		if (contextFile && !seenPaths.has(contextFile.path)) {
-			ancestorContextFiles.unshift(contextFile);
-			seenPaths.add(contextFile.path);
-		}
-
-		if (currentDir === root) break;
-
-		const parentDir = resolve(currentDir, "..");
-		if (parentDir === currentDir) break;
-		currentDir = parentDir;
-	}
-
-	contextFiles.push(...ancestorContextFiles);
-
+	// Explicit context roots are user-global context, so they precede project
+	// context just like agentDir/AGENTS.md. Only direct Markdown files are read;
+	// symlinked entries are excluded so a directory cannot unexpectedly widen.
 	for (const directory of options.additionalContextDirectories ?? []) {
 		let entries: Dirent[];
 		try {
@@ -122,15 +104,34 @@ export function loadProjectContextFiles(options: {
 		for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
 			if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md")) continue;
 			const path = join(directory, entry.name);
-			if (seenPaths.has(path)) continue;
+			const canonicalPath = canonicalizePath(path);
+			if (seenPaths.has(canonicalPath)) continue;
 			try {
 				contextFiles.push({ path, content: readFileSync(path, "utf-8") });
-				seenPaths.add(path);
+				seenPaths.add(canonicalPath);
 			} catch (error) {
 				console.error(chalk.yellow(`Warning: Could not read ${path}: ${error}`));
 			}
 		}
 	}
+
+	const ancestorContextFiles: Array<{ path: string; content: string }> = [];
+	let currentDir = resolvedCwd;
+	const root = resolve("/");
+	while (true) {
+		const contextFile = loadContextFileFromDir(currentDir);
+		const canonicalPath = contextFile ? canonicalizePath(contextFile.path) : undefined;
+		if (contextFile && canonicalPath && !seenPaths.has(canonicalPath)) {
+			ancestorContextFiles.unshift(contextFile);
+			seenPaths.add(canonicalPath);
+		}
+
+		if (currentDir === root) break;
+		const parentDir = resolve(currentDir, "..");
+		if (parentDir === currentDir) break;
+		currentDir = parentDir;
+	}
+	contextFiles.push(...ancestorContextFiles);
 
 	return contextFiles;
 }
@@ -249,7 +250,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
-		this.additionalContextDirectories = options.additionalContextDirectories ?? [];
+		this.additionalContextDirectories = (options.additionalContextDirectories ?? []).map((path) =>
+			resolve(this.cwd, path),
+		);
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
 		this.extensionFactories = options.extensionFactories ?? [];

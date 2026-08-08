@@ -16,6 +16,7 @@ import {
 	DAEMON_SCHEMA_REVISION,
 	type DaemonCommand,
 	type DaemonOutbound,
+	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
@@ -41,6 +42,15 @@ describe("daemon protocol helpers", () => {
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("requires atomic reload compatibility only when idle admission is requested", () => {
+		expect(
+			getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1", ifIdle: true }),
+		).toContainEqual({ minProtocol: 7, minSchemaRevision: 14, capability: "atomic_reload" });
+		expect(getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1" })).toEqual([
+			{ minProtocol: 7 },
+		]);
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {

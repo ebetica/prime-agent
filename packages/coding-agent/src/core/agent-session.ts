@@ -1205,6 +1205,7 @@ export class AgentSession {
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
 	private _resourceReloadInProgress = false;
+	private _resourceMutationAdmissions = 0;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
@@ -5269,6 +5270,21 @@ export class AgentSession {
 			);
 	}
 
+	private _claimResourceMutationAdmission(operation: string): { release(): void } {
+		if (this._resourceReloadInProgress) {
+			throw new Error(`Cannot ${operation} while resources are reloading.`);
+		}
+		this._resourceMutationAdmissions++;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				this._resourceMutationAdmissions--;
+			},
+		};
+	}
+
 	private _assertSessionActionAdmissionAvailable(): void {
 		if (this._resourceReloadInProgress) {
 			throw new Error("Cannot admit a session action while resources are reloading.");
@@ -5366,6 +5382,7 @@ export class AgentSession {
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
 			resourceReload: this._resourceReloadInProgress,
+			resourceMutationAdmission: this._resourceMutationAdmissions > 0,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 		};
@@ -6610,7 +6627,10 @@ export class AgentSession {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
 		}
 		// Immediately adjacent to the synchronous mutation below: nothing else on
-		// this worker's event loop can begin a turn between the two.
+		// this worker's event loop can claim a reload between the two.
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 		if (options.onlyIfIdle && (this.isStreaming || this.isCompacting || this.isRetrying || this.isBashRunning)) {
 			throw new Error("Session is busy; model unchanged");
 		}
@@ -7002,15 +7022,21 @@ export class AgentSession {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
-		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		const resourceAdmission = this._claimResourceMutationAdmission("compact");
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		let compactionOperation: Promise<void> | undefined;
 		let resolveCompactionOperation: () => void = () => {};
-		const compactionOperation = new Promise<void>((resolve) => {
-			resolveCompactionOperation = resolve;
-		});
-		this._compactionOperation = compactionOperation;
+		try {
+			this._disconnectFromAgent();
+			if (!options.skipAbort) await this.abort();
+			this._compactionAbortController = new AbortController();
+			compactionOperation = new Promise<void>((resolve) => {
+				resolveCompactionOperation = resolve;
+			});
+			this._compactionOperation = compactionOperation;
+		} finally {
+			resourceAdmission.release();
+		}
 		this._emit({
 			type: "compaction_start",
 			reason: "manual",
@@ -7630,16 +7656,23 @@ export class AgentSession {
 			}
 		}
 
+		const resourceAdmission = this._claimResourceMutationAdmission("refine");
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		// Background planning phase — does NOT block turn entry points
-		const planRun = this._planRefine(options, refineAbort.signal);
-		const planSettled = planRun.then(
-			() => undefined,
-			() => undefined,
-		);
-		this._refinePlanInFlight = planSettled;
+		// Background planning phase — does NOT block turn entry points.
+		let planRun: Promise<RefinementPlan>;
+		let planSettled: Promise<void>;
+		try {
+			planRun = this._planRefine(options, refineAbort.signal);
+			planSettled = planRun.then(
+				() => undefined,
+				() => undefined,
+			);
+			this._refinePlanInFlight = planSettled;
+		} finally {
+			resourceAdmission.release();
+		}
 		let plan: RefinementPlan;
 		try {
 			plan = await planRun;
@@ -8786,7 +8819,13 @@ export class AgentSession {
 		if (options.onlyIfIdle) {
 			const fence = await this._acquireSessionActionCommitFence();
 			try {
-				if (!canSelectSessionAction(this._runtimeActivity()) || this.unfinishedActionCount > 0) {
+				if (
+					!canSelectSessionAction(this._runtimeActivity()) ||
+					this.unfinishedActionCount > 0 ||
+					this._refinePlanInFlight !== undefined ||
+					this._serializedPlanInFlight !== undefined ||
+					!this._modelSelectEmitQueueIdle
+				) {
 					throw new Error("Session is busy; resources not reloaded");
 				}
 				this._resourceReloadInProgress = true;

@@ -319,18 +319,20 @@ Content`,
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				additionalContextDirectories: [contextDir, join(tempDir, "missing")],
+				additionalContextDirectories: ["../operator-context", "../missing"],
 			});
 
 			await loader.reload();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
 
 			mkdirSync(contextDir);
+			writeFileSync(join(cwd, "AGENTS.md"), "project");
 			writeFileSync(join(contextDir, "AGENTS.md"), "first");
 			writeFileSync(join(contextDir, "notes.txt"), "not context");
 			await loader.reload();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
 				{ path: join(contextDir, "AGENTS.md"), content: "first" },
+				{ path: join(cwd, "AGENTS.md"), content: "project" },
 			]);
 
 			rmSync(join(contextDir, "AGENTS.md"));
@@ -338,11 +340,12 @@ Content`,
 			await loader.reload();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
 				{ path: join(contextDir, "RTK.md"), content: "replacement" },
+				{ path: join(cwd, "AGENTS.md"), content: "project" },
 			]);
 
 			rmSync(contextDir, { recursive: true });
 			await loader.reload();
-			expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([{ path: join(cwd, "AGENTS.md"), content: "project" }]);
 		});
 
 		it("should skip AGENTS.md and CLAUDE.md discovery when noContextFiles is true", async () => {

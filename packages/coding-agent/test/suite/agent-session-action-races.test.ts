@@ -114,6 +114,11 @@ describe("AgentSession action commit-fence races", () => {
 		await expect(harness.session.promptHeartbeat(createHeartbeat())).rejects.toThrow(
 			"Cannot admit a session action while resources are reloading.",
 		);
+		await expect(harness.session.compact()).rejects.toThrow("Cannot compact while resources are reloading.");
+		await expect(harness.session.refine()).rejects.toThrow("Cannot refine while resources are reloading.");
+		await expect(harness.session.setModel(harness.getModel())).rejects.toThrow(
+			"Cannot change model while resources are reloading.",
+		);
 		finishReload.resolve();
 		await reload;
 	});

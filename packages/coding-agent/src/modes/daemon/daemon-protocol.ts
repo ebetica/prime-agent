@@ -628,6 +628,11 @@ const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
 	capability: "session_input_admission",
 } as const;
+const ATOMIC_RELOAD_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 14,
+	capability: "atomic_reload",
+} as const;
 const PROMPT_ADMISSION_CANCELLATION_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 8,
@@ -747,6 +752,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	const compatibility = DAEMON_COMMAND_COMPATIBILITY[command.type];
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		return [PROMPT_ADMISSION_CANCELLATION_COMMAND, compatibility];
+	}
+	if (command.type === "reload" && command.ifIdle === true) {
+		return [ATOMIC_RELOAD_COMMAND, compatibility];
 	}
 	return [compatibility];
 }
