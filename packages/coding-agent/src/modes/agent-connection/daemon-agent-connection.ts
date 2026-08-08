@@ -59,6 +59,7 @@ import type {
 	AgentConnectionNavigateTreeResult,
 	AgentConnectionNewSessionOptions,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReloadOptions,
@@ -524,6 +525,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.requestData<AgentConnectionQueueState>({
 			type: "get_queue",
 			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		if (!this.client.supportsServerCapability("queued_action_cancellation")) {
+			throw new DaemonCapabilityUnavailableError("get_queued_user_actions", "queued_action_cancellation");
+		}
+		return this.requestData<AgentConnectionQueuedUserAction[]>({
+			type: "get_queued_user_actions",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async cancelQueuedAction(id: string): Promise<boolean> {
+		if (!this.client.supportsServerCapability("queued_action_cancellation")) {
+			throw new DaemonCapabilityUnavailableError("cancel_queued_action", "queued_action_cancellation");
+		}
+		return this.requestData<boolean>({
+			type: "cancel_queued_action",
+			activeSessionId: this.activeSessionId,
+			actionId: id,
 		});
 	}
 

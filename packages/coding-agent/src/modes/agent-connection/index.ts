@@ -28,6 +28,7 @@ export type {
 	AgentConnectionNewSessionOptions,
 	AgentConnectionParentMetadata,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReplayInfo,
