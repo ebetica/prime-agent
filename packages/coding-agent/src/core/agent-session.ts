@@ -10419,6 +10419,7 @@ export class AgentSession {
 			runId?: string;
 		},
 	): Promise<void> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}
