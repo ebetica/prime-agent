@@ -17,7 +17,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	Agent,
 	type AgentContext,
@@ -133,6 +133,7 @@ import {
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
+	type KernelHostRequestContext,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -1208,6 +1209,7 @@ export class AgentSession {
 	private _resourceMutationAdmissions = 0;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	private _kernelHostRequestAbortController?: AbortController;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
@@ -3986,6 +3988,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._kernelHostRequestAbortController?.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
@@ -8741,7 +8744,9 @@ export class AgentSession {
 			// kernel so the session never holds two live kernels. Gate the new kernel's
 			// startup on the old one's dispose (which flushes a final snapshot), so a
 			// reload can't restore from a snapshot the old kernel is still writing.
+			this._kernelHostRequestAbortController?.abort();
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
+			this._kernelHostRequestAbortController = new AbortController();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
 			// Only surface the "revived from your previous session" notice on the first
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
@@ -8750,7 +8755,7 @@ export class AgentSession {
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				sessionId: this.sessionId,
-				hostHandlers: this._createKernelHostHandlers(),
+				hostHandlers: this._createKernelHostHandlers(this._kernelHostRequestAbortController.signal),
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
@@ -8850,7 +8855,9 @@ export class AgentSession {
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
-	private _createKernelHostHandlers(): HostRequestHandlers {
+	private _createKernelHostHandlers(
+		lifecycleSignal: AbortSignal = this._kernelHostRequestAbortController?.signal ?? new AbortController().signal,
+	): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
@@ -8951,6 +8958,48 @@ export class AgentSession {
 		if (this._mcpManager) {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
+		for (const extension of this._resourceLoader.getExtensions().extensions) {
+			for (const [type, registration] of extension.kernelHostRequests) {
+				if (handlers[type]) {
+					throw new Error(`Kernel host request type already registered: ${type}`);
+				}
+				const allowedKeys = new Set(registration.allowedPayloadKeys);
+				handlers[type] = async (payload) => {
+					if (lifecycleSignal.aborted || this._disposed || this._disposing) {
+						throw new Error(`Kernel host request type "${type}" is no longer available`);
+					}
+					const sessionFile = this.sessionManager.getSessionFile();
+					if (!sessionFile || !isAbsolute(sessionFile)) {
+						throw new Error(`Kernel host request type "${type}" requires a durable session`);
+					}
+					const sessionId = this.sessionManager.getSessionId();
+					const untrustedEntries = Object.entries(payload).filter(
+						([key]) => key !== "type" && key !== "cellSourceCode",
+					);
+					const unexpectedKey = untrustedEntries.find(([key]) => !allowedKeys.has(key))?.[0];
+					if (unexpectedKey) {
+						throw new Error(`Kernel host request type "${type}" does not accept payload key "${unexpectedKey}"`);
+					}
+					const requestPayload = Object.fromEntries(untrustedEntries);
+					const context: KernelHostRequestContext = {
+						sessionFile: resolve(sessionFile),
+						sessionId,
+						signal: lifecycleSignal,
+					};
+					const result = await registration.handler(requestPayload, context);
+					if (
+						lifecycleSignal.aborted ||
+						this._disposed ||
+						this._disposing ||
+						this.sessionManager.getSessionFile() !== sessionFile ||
+						this.sessionManager.getSessionId() !== sessionId
+					) {
+						throw new Error(`Kernel host request type "${type}" outlived its owning session`);
+					}
+					return result;
+				};
+			}
+		}
 		return handlers;
 	}
 
@@ -8987,6 +9036,7 @@ export class AgentSession {
 			claimedReload = true;
 		}
 
+		this._kernelHostRequestAbortController?.abort();
 		try {
 			const previousFlagValues = this._extensionRunner.getFlagValues();
 			await emitSessionShutdownEvent(this._extensionRunner, {
