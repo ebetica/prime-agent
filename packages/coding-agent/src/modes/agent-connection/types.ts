@@ -536,6 +536,12 @@ export type AgentConnectionQueuedMessageLane = QueuedMessageLane;
 export type AgentConnectionQueuedMessageMutation = QueuedMessageMutation;
 /** "unsupported" is returned only by remote connections whose daemon predates queued-message mutation. */
 export type AgentConnectionQueuedMessageMutationStatus = QueuedMessageMutationStatus | "unsupported";
+export interface AgentConnectionQueuedUserAction {
+	id: string;
+	text: string;
+	delivery: "steering" | "followUp";
+}
+
 
 export interface AgentConnectionHeartbeat {
 	job: AgentCronJob;
@@ -673,6 +679,9 @@ export interface AgentConnection {
 		expectedText: string,
 		mutation: AgentConnectionQueuedMessageMutation,
 	): Promise<AgentConnectionQueuedMessageMutationStatus>;
+	getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]>;
+	cancelQueuedAction(id: string): Promise<boolean>;
+
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;

@@ -6220,6 +6220,28 @@ export class AgentSession {
 		this.resumeQueuedWork();
 		this._emitQueueUpdate();
 		return "applied";
+	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
+		return visibleSessionActionProjection(this._actionStore.queuedActions())
+			.filter((action) => action.payload.kind === "turn")
+			.map((action) => ({
+				id: action.id,
+				text: queuedAgentMessagePreview(action),
+				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+			}));
+	}
+
+	cancelQueuedAction(id: string): boolean {
+		const action = visibleSessionActionProjection(this._actionStore.queuedActions()).find(
+			(candidate) => candidate.id === id && candidate.payload.kind === "turn",
+		);
+		if (!action) return false;
+		const error = new Error("Queued message was cancelled before delivery.");
+		this._rejectAgentMessage(action.agentMessageId, error);
+		const removed = this._cancelSessionActions((candidate) => candidate === action, error, [action]);
+		if (removed.length === 0) return false;
+		this._emitQueueUpdate();
+		return true;
+
 	}
 
 	get queuedActionCount(): number {

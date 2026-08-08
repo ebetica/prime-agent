@@ -145,6 +145,19 @@ describe("daemon protocol helpers", () => {
 		// ignore unknown values, so no capability gate is needed; the revision
 		// lets version probes distinguish daemons with the old semantics.
 		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(16);
+	it("capability-gates queued action identity and cancellation", () => {
+		for (const command of ["get_queued_user_actions", "cancel_queued_action"] as const) {
+			expect(DAEMON_COMMAND_COMPATIBILITY[command]).toEqual({
+				minProtocol: 7,
+				minSchemaRevision: 15,
+				capability: "queued_action_cancellation",
+			});
+		}
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queued_action_cancellation");
+		// A new daemon keeps the old queue snapshot command available to clients
+		// that do not negotiate the optional identity surface.
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_queue).toEqual({ minProtocol: 7 });
+
 	});
 
 	it("keeps refine failure events backward-compatible on the existing session event channel", () => {

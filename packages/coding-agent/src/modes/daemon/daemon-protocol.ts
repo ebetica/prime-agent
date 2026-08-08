@@ -63,6 +63,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 17 adds daemon-side atomic idle admission for resource reloads.
 export const DAEMON_SCHEMA_REVISION = 17;
 export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-atomic-reload";
+// Revision 14 adds daemon-side atomic idle admission for resource reloads.
+// Revision 15 adds stable queued-user-action identities and atomic cancellation.
+export const DAEMON_SCHEMA_REVISION = 15;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-6574353088ee";
+
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -103,6 +108,9 @@ export type DaemonServerCapability =
 	| "prompt_admission_cancellation"
 	| "queue_message_mutation"
 	| "atomic_reload";
+	| "atomic_reload"
+	| "queued_action_cancellation";
+
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -142,6 +150,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"prompt_admission_cancellation",
 	"queue_message_mutation",
 	"atomic_reload",
+	"queued_action_cancellation",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -525,6 +534,9 @@ export type DaemonCommand =
 			expectedText: string;
 			mutation: QueuedMessageMutation;
 	  }
+	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
+	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
+
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -655,6 +667,11 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
 } as const;
+const QUEUED_ACTION_CANCELLATION_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 15,
+	capability: "queued_action_cancellation",
+} as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
 
@@ -705,6 +722,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
+	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
+	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
+
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
@@ -1058,6 +1078,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
+	"get_queued_user_actions",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",

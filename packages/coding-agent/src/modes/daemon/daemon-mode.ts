@@ -4191,6 +4191,19 @@ export class AgentDaemon {
 					command.mutation,
 				);
 				return success(command.id, "mutate_queued_message", { status });
+			case "get_queued_user_actions": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_queued_user_actions", state.runtime.session.getQueuedUserActions());
+			}
+
+			case "cancel_queued_action": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"cancel_queued_action",
+					state.runtime.session.cancelQueuedAction(command.actionId),
+				);
+
 			}
 
 			case "clear_queue": {

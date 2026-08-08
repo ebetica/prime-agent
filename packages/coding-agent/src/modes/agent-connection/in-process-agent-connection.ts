@@ -46,6 +46,8 @@ import type {
 	AgentConnectionQueuedMessageLane,
 	AgentConnectionQueuedMessageMutation,
 	AgentConnectionQueuedMessageMutationStatus,
+	AgentConnectionQueuedUserAction,
+
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReloadOptions,
@@ -199,6 +201,13 @@ export class InProcessAgentConnection implements AgentConnection {
 		mutation: AgentConnectionQueuedMessageMutation,
 	): Promise<AgentConnectionQueuedMessageMutationStatus> {
 		return this.session.mutateQueuedMessage(lane, index, expectedText, mutation);
+	async getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		return this.session.getQueuedUserActions();
+	}
+
+	async cancelQueuedAction(id: string): Promise<boolean> {
+		return this.session.cancelQueuedAction(id);
+
 	}
 
 	async clearQueue(): Promise<AgentConnectionQueueState> {
