@@ -10,6 +10,7 @@ export interface AgentSessionRuntimeConfig {
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
+	contextDirectories?: string[];
 	thinking?: ThinkingLevel;
 	models?: string[];
 	tools?: string[];
@@ -57,6 +58,7 @@ export function mergeAgentSessionRuntimeConfig(
 		apiKey: override.apiKey ?? base.apiKey,
 		systemPrompt: override.systemPrompt ?? base.systemPrompt,
 		appendSystemPrompt: cloneArray(override.appendSystemPrompt ?? base.appendSystemPrompt),
+		contextDirectories: cloneArray(override.contextDirectories ?? base.contextDirectories),
 		thinking: override.thinking ?? base.thinking,
 		models: cloneArray(override.models ?? base.models),
 		tools: cloneArray(override.tools ?? base.tools),
@@ -85,6 +87,7 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 	return {
 		...config,
 		appendSystemPrompt: cloneArray(config.appendSystemPrompt),
+		contextDirectories: cloneArray(config.contextDirectories),
 		models: cloneArray(config.models),
 		tools: cloneArray(config.tools),
 		extensions: cloneArray(config.extensions),

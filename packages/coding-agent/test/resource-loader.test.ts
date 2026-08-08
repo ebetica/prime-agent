@@ -314,6 +314,37 @@ Content`,
 			expect(agentsFiles.some((f) => f.path.includes("AGENTS.md"))).toBe(true);
 		});
 
+		it("rescans additional context directories on every reload", async () => {
+			const contextDir = join(tempDir, "operator-context");
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalContextDirectories: [contextDir, join(tempDir, "missing")],
+			});
+
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
+
+			mkdirSync(contextDir);
+			writeFileSync(join(contextDir, "AGENTS.md"), "first");
+			writeFileSync(join(contextDir, "notes.txt"), "not context");
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([
+				{ path: join(contextDir, "AGENTS.md"), content: "first" },
+			]);
+
+			rmSync(join(contextDir, "AGENTS.md"));
+			writeFileSync(join(contextDir, "RTK.md"), "replacement");
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([
+				{ path: join(contextDir, "RTK.md"), content: "replacement" },
+			]);
+
+			rmSync(contextDir, { recursive: true });
+			await loader.reload();
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
+		});
+
 		it("should skip AGENTS.md and CLAUDE.md discovery when noContextFiles is true", async () => {
 			writeFileSync(join(cwd, "AGENTS.md"), "# Project Guidelines\n\nBe helpful.");
 			writeFileSync(join(cwd, "CLAUDE.md"), "# Claude Guidelines\n\nBe helpful.");

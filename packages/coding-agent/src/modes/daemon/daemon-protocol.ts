@@ -56,8 +56,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
-export const DAEMON_SCHEMA_REVISION = 13;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-13-816309b1cd50";
+// Revision 14 adds daemon-side atomic idle admission for resource reloads.
+export const DAEMON_SCHEMA_REVISION = 14;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-c5e04a561104";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -95,7 +96,8 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation";
+	| "prompt_admission_cancellation"
+	| "atomic_reload";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -133,6 +135,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
+	"atomic_reload",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -568,7 +571,7 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_branch_summary"; activeSessionId: string }
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
-	| { id?: string; type: "reload"; activeSessionId: string }
+	| { id?: string; type: "reload"; activeSessionId: string; ifIdle?: boolean }
 	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }

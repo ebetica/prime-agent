@@ -898,6 +898,11 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
+export interface ReloadOptions {
+	/** Claim the idle session before rebuilding resources, or fail without changing them. */
+	onlyIfIdle?: boolean;
+}
+
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
 	/**
@@ -1199,6 +1204,7 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _resourceReloadInProgress = false;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
@@ -5264,6 +5270,9 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot admit a session action while resources are reloading.");
+		}
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
@@ -5285,9 +5294,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
-			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
-		}
+		this._assertSessionActionAdmissionAvailable();
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5358,6 +5365,7 @@ export class AgentSession {
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
+			resourceReload: this._resourceReloadInProgress,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 		};
@@ -8773,37 +8781,59 @@ export class AgentSession {
 		return handlers;
 	}
 
-	async reload(): Promise<void> {
-		const previousFlagValues = this._extensionRunner.getFlagValues();
-		await emitSessionShutdownEvent(this._extensionRunner, {
-			type: "session_shutdown",
-			reason: "reload",
-		});
-		await this.settingsManager.reload();
-		// Re-read auth.json: a login saved by the client process (daemon mode) must be
-		// visible here so MCP skill gating sees the new credentials.
-		this._modelRegistry.authStorage.reload();
-		resetApiProviders();
-		// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
-		this._mcpManager?.refresh();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+	async reload(options: ReloadOptions = {}): Promise<void> {
+		let claimedIdle = false;
+		if (options.onlyIfIdle) {
+			const fence = await this._acquireSessionActionCommitFence();
+			try {
+				if (!canSelectSessionAction(this._runtimeActivity()) || this.unfinishedActionCount > 0) {
+					throw new Error("Session is busy; resources not reloaded");
+				}
+				this._resourceReloadInProgress = true;
+				claimedIdle = true;
+			} finally {
+				fence.release();
+			}
+		}
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await this._extensionRunner.emit({
-				type: "session_start",
+		try {
+			const previousFlagValues = this._extensionRunner.getFlagValues();
+			await emitSessionShutdownEvent(this._extensionRunner, {
+				type: "session_shutdown",
 				reason: "reload",
 			});
-			await this.extendResourcesFromExtensions("reload");
+			await this.settingsManager.reload();
+			// Re-read auth.json: a login saved by the client process (daemon mode) must be
+			// visible here so MCP skill gating sees the new credentials.
+			this._modelRegistry.authStorage.reload();
+			resetApiProviders();
+			// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
+			this._mcpManager?.refresh();
+			await this._resourceLoader.reload();
+			this._buildRuntime({
+				activeToolNames: this.getActiveToolNames(),
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
+
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener;
+			if (hasBindings) {
+				await this._extensionRunner.emit({
+					type: "session_start",
+					reason: "reload",
+				});
+				await this.extendResourcesFromExtensions("reload");
+			}
+		} finally {
+			if (claimedIdle) {
+				this._resourceReloadInProgress = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+			}
 		}
 	}
 
@@ -10305,6 +10335,7 @@ export class AgentSession {
 			transient?: boolean;
 		},
 	): Promise<BashResult> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		this._bashAbortController = new AbortController();
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)

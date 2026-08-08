@@ -305,6 +305,7 @@ export interface RuntimeActivity {
 	bash: boolean;
 	refinementApply: boolean;
 	branchMutation: boolean;
+	resourceReload?: boolean;
 	schedulerPauseCount: number;
 	disposing: boolean;
 }
@@ -393,6 +394,7 @@ export function canSelectSessionAction(activity: RuntimeActivity): boolean {
 		!activity.bash &&
 		!activity.refinementApply &&
 		!activity.branchMutation &&
+		!activity.resourceReload &&
 		activity.schedulerPauseCount === 0 &&
 		!activity.disposing
 	);

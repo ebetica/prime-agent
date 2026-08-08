@@ -1,5 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentCronJob } from "../../src/core/cron-jobs.js";
 import type { CustomMessage } from "../../src/core/messages.js";
 import type { ActionStore, SessionAction } from "../../src/core/session-action-store.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.js";
@@ -11,6 +12,7 @@ interface CommitFenceInternals {
 	_actionStore: ActionStore<SessionAction>;
 	_pendingSessionActionFenceWaiters: number;
 	_refineInFlight?: Promise<void>;
+	_resourceLoader: { reload(): Promise<void> };
 	_scheduleSessionInputPump(): void;
 	_acquireDirectTurnAdmissionFence(signal?: AbortSignal): Promise<{ release(): void }>;
 	_acquireSessionActionCommitFence(signal?: AbortSignal): Promise<{ release(): void }>;
@@ -37,6 +39,24 @@ function yieldToEventLoop(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
 
+function createHeartbeat(): AgentCronJob {
+	return {
+		id: "heartbeat-1",
+		status: "active",
+		source: "heartbeat",
+		activeSessionId: "active-1",
+		sessionId: "session-1",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp/project",
+		prompt: "scheduled check",
+		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		nextRunAt: "2026-01-01T00:05:00.000Z",
+		runCount: 0,
+	};
+}
+
 function createContextMessage(content: string): CustomMessage {
 	return {
 		role: "custom",
@@ -52,6 +72,50 @@ describe("AgentSession action commit-fence races", () => {
 
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	});
+
+	it("refuses an idle-only reload while a turn is active", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const started = createDeferred();
+		const finish = createDeferred();
+		harness.setResponses([
+			async () => {
+				started.resolve();
+				await finish.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		const turn = harness.session.prompt("active turn");
+		await started.promise;
+		await expect(harness.session.reload({ onlyIfIdle: true })).rejects.toThrow(
+			"Session is busy; resources not reloaded",
+		);
+		finish.resolve();
+		await turn;
+	});
+
+	it("blocks native heartbeat admission after an idle-only reload claims the session", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const reloadStarted = createDeferred();
+		const finishReload = createDeferred();
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const originalReload = internals._resourceLoader.reload.bind(internals._resourceLoader);
+		internals._resourceLoader.reload = async () => {
+			reloadStarted.resolve();
+			await finishReload.promise;
+			await originalReload();
+		};
+
+		const reload = harness.session.reload({ onlyIfIdle: true });
+		await reloadStarted.promise;
+		await expect(harness.session.promptHeartbeat(createHeartbeat())).rejects.toThrow(
+			"Cannot admit a session action while resources are reloading.",
+		);
+		finishReload.resolve();
+		await reload;
 	});
 
 	it.each([
