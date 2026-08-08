@@ -213,6 +213,28 @@ describe("issue #4257 update restart resume", () => {
 		).toEqual([expect.objectContaining({ content: "continue nonce" })]);
 	});
 
+	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered continuation")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.planned_restart_intent",
+					"Planned restart continuation pending",
+					false,
+					{ actionId: "restart-action-recovered", message: "recover nonce" },
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
+			),
+		).toEqual([expect.objectContaining({ content: "recover nonce" })]);
+	});
+
 	it.each([
 		[undefined, "shutdown"],
 		["preparing", "shutdown"],

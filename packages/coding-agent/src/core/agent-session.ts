@@ -1400,6 +1400,13 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		if (this._recoverPlannedRestartContinuationIntents() > 0) {
+			// A prior successor may have acknowledged resume and crashed before the
+			// queued continuation reached the transcript. The durable intent is
+			// successor-claim proof, so a later session load may safely finish it.
+			this._sessionInputPumpSuspended = false;
+			this._scheduleSessionInputPump();
+		}
 	}
 
 	/**
@@ -4923,6 +4930,59 @@ export class AgentSession {
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
 		});
+	}
+
+	private _recoverPlannedRestartContinuationIntents(): number {
+		const entries = this.sessionManager.getEntries();
+		const completed = new Set<string>();
+		const pending = new Map<string, string>();
+		for (const entry of entries) {
+			if (
+				entry.type !== "custom_message" ||
+				!entry.details ||
+				typeof entry.details !== "object" ||
+				(entry.customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE &&
+					entry.customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE)
+			) {
+				continue;
+			}
+			const details = entry.details as { actionId?: unknown; message?: unknown };
+			if (typeof details.actionId !== "string") continue;
+			if (entry.customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) {
+				completed.add(details.actionId);
+				continue;
+			}
+			if (typeof details.message !== "string") continue;
+			const prior = pending.get(details.actionId);
+			if (prior !== undefined && prior !== details.message) {
+				throw new Error(`Planned restart action ${details.actionId} has conflicting durable intents`);
+			}
+			pending.set(details.actionId, details.message);
+		}
+		let recovered = 0;
+		for (const [actionId, text] of pending) {
+			if (completed.has(actionId) || this._actionStore.ownedActions().some((action) => action.id === actionId)) {
+				continue;
+			}
+			const message: CustomMessage = {
+				role: "custom",
+				customType: PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+				content: text,
+				display: true,
+				timestamp: Date.now(),
+				details: { actionId, message: text },
+			};
+			const action = this._createPreparedTurnAction("followUp", text, undefined, {
+				actionId,
+				agentMessageId: actionId,
+				message,
+				source: "internal",
+				queueVisible: false,
+			});
+			this._admitSessionInput(action, { restore: true });
+			recovered++;
+		}
+		return recovered;
 	}
 
 	admitPlannedRestartContinuation(actionId: string, text: string): "admitted" | "already_admitted" {

@@ -63,6 +63,7 @@ export interface HarnessOptions {
 	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
+	responses?: FauxResponseStep[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
 	tools?: AgentTool[];
@@ -73,6 +74,7 @@ export interface HarnessOptions {
 	agentMessageController?: AgentSessionMessageController;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	persistSession?: boolean;
+	beforeSessionCreate?: (sessionManager: SessionManager) => void;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	autonomous?: AgentAutonomousConfig;
@@ -112,7 +114,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		provider: options.provider,
 		models: options.models,
 	});
-	fauxProvider.setResponses([]);
+	fauxProvider.setResponses(options.responses ?? []);
 	const model = fauxProvider.getModel();
 	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
@@ -122,6 +124,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		? SessionManager.create(tempDir, join(tempDir, "sessions"))
 		: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
+	options.beforeSessionCreate?.(sessionManager);
 
 	const authStorage = AuthStorage.inMemory();
 	if (withConfiguredAuth) {
