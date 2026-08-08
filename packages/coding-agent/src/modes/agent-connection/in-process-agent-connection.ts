@@ -483,7 +483,8 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async reload(options: AgentConnectionReloadOptions = {}): Promise<void> {
-		await this.session.reload({ onlyIfIdle: options.ifIdle });
+		const { ifIdle, ...resources } = options;
+		await this.session.reload({ onlyIfIdle: ifIdle, ...resources });
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {

@@ -416,6 +416,53 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.deleteRlmSubagentRuntime("parent-agent-child", childRuntime.session);
 	});
 
+	it("passes atomically replaced resource config to subsequently spawned RLM children", async () => {
+		const createdConfigs: Array<AgentSessionRuntimeConfig | undefined> = [];
+		const { runtime } = await createRuntimeForTest(() => {}, {
+			sessionConfig: {
+				extensions: ["legacy-extension.ts"],
+				skills: ["legacy-skills"],
+				contextDirectories: ["legacy-context"],
+			},
+			onCreateRuntime: (options) => createdConfigs.push(options.sessionConfig),
+		});
+		const rollback = runtime.replaceRuntimeResources({
+			extensions: ["current-extension.ts"],
+			skills: ["current-skills"],
+			contextDirectories: ["current-context"],
+		});
+		const childRuntime = await runtime.createRlmSubagentRuntime({
+			parentSession: runtime.session,
+			id: "updated-resource-child",
+			prompt: "verify inherited resources",
+			sessionName: "updated-resource-child",
+			sessionDir: join(runtime.cwd, "updated-resource-child"),
+			model: runtime.session.model!,
+			thinkingLevel: "off",
+			serviceTier: null,
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 2,
+			rlmParentNodeId: "updated-resource-child",
+		});
+		expect(createdConfigs.at(-1)).toMatchObject({
+			extensions: ["current-extension.ts"],
+			skills: ["current-skills"],
+			contextDirectories: ["current-context"],
+		});
+		rollback();
+		expect(runtime.runtimeConfig).toMatchObject({
+			extensions: ["legacy-extension.ts"],
+			skills: ["legacy-skills"],
+			contextDirectories: ["legacy-context"],
+		});
+		await runtime.deleteRlmSubagentRuntime("updated-resource-child", childRuntime.session);
+	});
+
 	it("disposes hosted RLM children during session replacement", async () => {
 		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
 		const host: SubagentRuntimeHost = {

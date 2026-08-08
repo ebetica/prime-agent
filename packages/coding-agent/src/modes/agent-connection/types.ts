@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
+import type { AgentSessionResourceConfig } from "../../core/agent-session-config.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -444,7 +445,7 @@ export class AgentConnectionPromptAdmissionError extends Error {
 	}
 }
 
-export interface AgentConnectionReloadOptions {
+export interface AgentConnectionReloadOptions extends AgentSessionResourceConfig {
 	/** Atomically refuse the reload if the session has active or admitted work. */
 	ifIdle?: boolean;
 }

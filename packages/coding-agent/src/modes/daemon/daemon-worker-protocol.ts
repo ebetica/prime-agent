@@ -4,6 +4,7 @@ import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageSender,
 } from "../../core/agent-messages.js";
+import type { AgentSessionResourceConfig } from "../../core/agent-session-config.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
@@ -75,7 +76,10 @@ export type DaemonWorkerCommand =
 	  }
 	| { id?: string; type: "worker_prepare_update" }
 	| { id?: string; type: "worker_commit_update" }
-	| { id?: string; type: "worker_cancel_update" };
+	| { id?: string; type: "worker_cancel_update" }
+	| { id?: string; type: "worker_commit_resource_reload"; transactionId: string }
+	| { id?: string; type: "worker_rollback_resource_reload"; transactionId: string }
+	| { id?: string; type: "worker_list_resource_reloads" };
 
 export type DaemonWorkerCommandBody = DaemonWorkerCommand extends infer TCommand
 	? TCommand extends { id?: string }
@@ -103,6 +107,11 @@ export interface DaemonWorkerDescriptor {
 	lifecycle: DaemonWorkerLifecycle;
 	createCommand: DaemonCreateCommand;
 	consecutiveFailures: number;
+	/** A live worker has prepared these roots and stays admission-fenced until reconciled. */
+	pendingResourceReload?: {
+		transactionId: string;
+		resources: AgentSessionResourceConfig;
+	};
 	/** Durable intent written before root termination so replacement supervisors never recover it. */
 	stopRequestedAt?: string;
 	/** Complete the root's archived lifecycle state after its process has stopped. */

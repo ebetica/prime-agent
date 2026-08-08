@@ -31,3 +31,64 @@ export function createEventBus(): EventBusController {
 		},
 	};
 }
+
+export interface StagedEventBus {
+	readonly bus: EventBus;
+	/** Route future events and subscriptions through the live bus. */
+	commit(): void;
+	/** Remove every staged or adopted subscription. */
+	dispose(): void;
+}
+
+/**
+ * Isolates load-time extension subscriptions until their resource transaction commits.
+ * The wrapper remains the extension-facing bus after commit, so later subscriptions
+ * and emissions transparently use the live session bus.
+ */
+export function createStagedEventBus(live: EventBus): StagedEventBus {
+	const staged = createEventBus();
+	const subscriptions = new Set<{
+		channel: string;
+		handler: (data: unknown) => void;
+		unsubscribe: () => void;
+	}>();
+	let committed = false;
+	let disposed = false;
+	const bus: EventBus = {
+		emit(channel, data) {
+			if (disposed) return;
+			(committed ? live : staged).emit(channel, data);
+		},
+		on(channel, handler) {
+			if (disposed) return () => {};
+			const subscription = {
+				channel,
+				handler,
+				unsubscribe: (committed ? live : staged).on(channel, handler),
+			};
+			subscriptions.add(subscription);
+			return () => {
+				if (!subscriptions.delete(subscription)) return;
+				subscription.unsubscribe();
+			};
+		},
+	};
+	return {
+		bus,
+		commit() {
+			if (disposed || committed) return;
+			committed = true;
+			for (const subscription of subscriptions) {
+				subscription.unsubscribe();
+				subscription.unsubscribe = live.on(subscription.channel, subscription.handler);
+			}
+		},
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			for (const subscription of subscriptions) subscription.unsubscribe();
+			subscriptions.clear();
+			staged.clear();
+		},
+	};
+}

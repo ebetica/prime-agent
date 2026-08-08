@@ -214,7 +214,12 @@ import {
 	saveHarnessState,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
-import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import type {
+	PreparedResourceReload,
+	ResourceExtensionPaths,
+	ResourceLoader,
+	ResourceReloadOptions,
+} from "./resource-loader.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -899,9 +904,22 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
-export interface ReloadOptions {
+export interface ReloadOptions extends ResourceReloadOptions {
 	/** Claim the idle session before rebuilding resources, or fail without changing them. */
 	onlyIfIdle?: boolean;
+}
+
+export class SessionReloadBusyError extends Error {
+	constructor() {
+		super("Session is busy; resources not reloaded");
+		this.name = "SessionReloadBusyError";
+	}
+}
+
+export interface PreparedSessionReload {
+	readonly resources: ResourceReloadOptions;
+	commit(): void;
+	rollback(): Promise<void>;
 }
 
 interface ModelSelectOptions {
@@ -8911,55 +8929,136 @@ export class AgentSession {
 	}
 
 	async reload(options: ReloadOptions = {}): Promise<void> {
-		const reloadFence = await this._acquireResourceReloadFence();
-		try {
-			await this._reloadResources(options);
-		} finally {
-			reloadFence.release();
-		}
+		const prepared = await this.prepareReload(options);
+		prepared.commit();
 	}
 
-	private async _reloadResources(options: ReloadOptions): Promise<void> {
+	/**
+	 * Apply a resource reload while retaining every admission fence. Daemon mode
+	 * uses the returned transaction to make its worker descriptor durable before
+	 * releasing the session; local callers commit immediately via reload().
+	 */
+	async prepareReload(options: ReloadOptions = {}): Promise<PreparedSessionReload> {
+		const reloadFence = await this._acquireResourceReloadFence();
 		let claimedReload = false;
-		if (options.onlyIfIdle) {
+		let preparedResources: PreparedResourceReload | undefined;
+		let rollbackLoader: (() => void) | undefined;
+		let oldRunnerShutdownBegan = false;
+		let settled = false;
+		const previousExtensionRunner = this._extensionRunner;
+		const previousFlagValues = previousExtensionRunner.getFlagValues();
+		const previousActiveToolNames = this.getActiveToolNames();
+		const requestedResources: ResourceReloadOptions = {
+			...(options.appendSystemPrompt !== undefined ? { appendSystemPrompt: options.appendSystemPrompt } : {}),
+			...(options.contextDirectories !== undefined ? { contextDirectories: options.contextDirectories } : {}),
+			...(options.extensions !== undefined ? { extensions: options.extensions } : {}),
+			...(options.skills !== undefined ? { skills: options.skills } : {}),
+			...(options.promptTemplates !== undefined ? { promptTemplates: options.promptTemplates } : {}),
+			...(options.themes !== undefined ? { themes: options.themes } : {}),
+		};
+		const hasResourceReplacement = Object.keys(requestedResources).length > 0;
+
+		const releaseClaim = (): void => {
+			if (claimedReload) {
+				this._resourceReloadInProgress = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+				claimedReload = false;
+			}
+			reloadFence.release();
+		};
+
+		const rollback = async (): Promise<void> => {
+			if (settled) return;
+			settled = true;
+			let rollbackError: unknown;
+			try {
+				if (oldRunnerShutdownBegan) {
+					let candidateShutdownError: unknown;
+					if (this._extensionRunner !== previousExtensionRunner) {
+						try {
+							await emitSessionShutdownEvent(this._extensionRunner, {
+								type: "session_shutdown",
+								reason: "reload",
+							});
+						} catch (error) {
+							candidateShutdownError = error;
+						} finally {
+							this._extensionRunner.invalidate("Resource reload was rolled back");
+						}
+					}
+					rollbackLoader?.();
+					preparedResources?.dispose();
+					this._buildRuntime({
+						activeToolNames: previousActiveToolNames,
+						flagValues: previousFlagValues,
+						includeAllExtensionTools: true,
+					});
+					const hasBindings =
+						this._extensionUIContext ||
+						this._extensionCommandContextActions ||
+						this._extensionShutdownHandler ||
+						this._extensionErrorListener;
+					if (hasBindings) {
+						await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+						await this.extendResourcesFromExtensions("reload");
+					}
+					if (candidateShutdownError) throw candidateShutdownError;
+				} else {
+					preparedResources?.dispose();
+				}
+			} catch (error) {
+				rollbackError = error;
+			}
+			if (rollbackError) {
+				// Fail closed. The daemon supervisor will replace this worker; admitting
+				// work after an incomplete rollback would expose half-restored resources.
+				throw rollbackError;
+			}
+			releaseClaim();
+		};
+
+		try {
 			const fence = await this._acquireSessionActionCommitFence();
 			try {
 				if (
-					!canSelectSessionAction(this._runtimeActivity()) ||
-					this.unfinishedActionCount > 0 ||
-					this._refinePlanInFlight !== undefined ||
-					this._serializedPlanInFlight !== undefined ||
-					!this._modelSelectEmitQueueIdle
+					options.onlyIfIdle &&
+					(!canSelectSessionAction(this._runtimeActivity()) ||
+						this.unfinishedActionCount > 0 ||
+						this._refinePlanInFlight !== undefined ||
+						this._serializedPlanInFlight !== undefined ||
+						!this._modelSelectEmitQueueIdle)
 				) {
-					throw new Error("Session is busy; resources not reloaded");
+					throw new SessionReloadBusyError();
 				}
 				this._resourceReloadInProgress = true;
 				claimedReload = true;
 			} finally {
 				fence.release();
 			}
-		} else {
-			this._resourceReloadInProgress = true;
-			claimedReload = true;
-		}
 
-		this._kernelHostRequestAbortController?.abort();
-		try {
-			const previousFlagValues = this._extensionRunner.getFlagValues();
+			if (this._resourceLoader.prepareReload) {
+				preparedResources = await this._resourceLoader.prepareReload(requestedResources);
+			} else {
+				if (hasResourceReplacement) {
+					throw new Error("This resource loader cannot replace live resource configuration");
+				}
+				await this._resourceLoader.reload();
+			}
+
+			this._kernelHostRequestAbortController?.abort();
+			oldRunnerShutdownBegan = true;
 			await emitSessionShutdownEvent(this._extensionRunner, {
 				type: "session_shutdown",
 				reason: "reload",
 			});
 			await this.settingsManager.reload();
-			// Re-read auth.json: a login saved by the client process (daemon mode) must be
-			// visible here so MCP skill gating sees the new credentials.
 			this._modelRegistry.authStorage.reload();
 			resetApiProviders();
-			// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
 			this._mcpManager?.refresh();
-			await this._resourceLoader.reload();
+			if (preparedResources) rollbackLoader = preparedResources.commit();
 			this._buildRuntime({
-				activeToolNames: this.getActiveToolNames(),
+				activeToolNames: previousActiveToolNames,
 				flagValues: previousFlagValues,
 				includeAllExtensionTools: true,
 			});
@@ -8970,18 +9069,33 @@ export class AgentSession {
 				this._extensionShutdownHandler ||
 				this._extensionErrorListener;
 			if (hasBindings) {
-				await this._extensionRunner.emit({
-					type: "session_start",
-					reason: "reload",
-				});
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 				await this.extendResourcesFromExtensions("reload");
 			}
-		} finally {
-			if (claimedReload) {
-				this._resourceReloadInProgress = false;
-				this._notifySessionInputCheckpointChange();
-				this._scheduleSessionInputPump();
+
+			const resources = preparedResources?.resources ?? requestedResources;
+			return {
+				resources,
+				commit: () => {
+					if (settled) return;
+					preparedResources?.finalize();
+					settled = true;
+					if (this._extensionRunner !== previousExtensionRunner) {
+						previousExtensionRunner.invalidate(
+							"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+						);
+					}
+					releaseClaim();
+				},
+				rollback,
+			};
+		} catch (error) {
+			try {
+				await rollback();
+			} catch (rollbackError) {
+				throw new AggregateError([error, rollbackError], "Resource reload and rollback both failed");
 			}
+			throw error;
 		}
 	}
 

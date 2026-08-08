@@ -1,7 +1,12 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
-import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
+import {
+	type AgentSessionResourceConfig,
+	type AgentSessionRuntimeConfig,
+	mergeAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "./agent-session-config.js";
 import type {
 	AgentSessionCreationOptions,
 	AgentSessionRuntimeDiagnostic,
@@ -98,7 +103,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		private readonly createRuntime: CreateAgentSessionRuntimeFactory,
 		private _diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		private _modelFallbackMessage?: string,
-		private readonly sessionConfig?: AgentSessionRuntimeConfig,
+		private sessionConfig?: AgentSessionRuntimeConfig,
 		private readonly _metadata: AgentSessionRuntimeMetadata = {
 			kind: "top-level",
 			createdAt: Date.now(),
@@ -139,7 +144,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	get runtimeConfig(): AgentSessionRuntimeConfig | undefined {
-		return this.sessionConfig ? { ...this.sessionConfig } : undefined;
+		return this.sessionConfig ? mergeAgentSessionRuntimeConfig(this.sessionConfig) : undefined;
+	}
+
+	/** Publish resource roots inherited by future child runtimes; returns rollback. */
+	replaceRuntimeResources(resources: AgentSessionResourceConfig): () => void {
+		const previous = this.sessionConfig;
+		this.sessionConfig = mergeAgentSessionResourceConfig(previous, resources);
+		let rolledBack = false;
+		return () => {
+			if (rolledBack) return;
+			rolledBack = true;
+			this.sessionConfig = previous;
+		};
 	}
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
