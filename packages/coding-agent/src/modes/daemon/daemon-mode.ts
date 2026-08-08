@@ -4391,7 +4391,7 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				// Reload re-evaluates extension modules, which capture client env
 				// (e.g. herdr pane identity) synchronously at load.
-				await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
+				await withClientEnv(state.clientEnv, () => state.runtime.session.reload({ onlyIfIdle: command.ifIdle }));
 				return success(command.id, "reload");
 			}
 

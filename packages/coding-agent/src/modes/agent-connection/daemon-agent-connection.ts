@@ -64,6 +64,7 @@ import type {
 	AgentConnectionQueuedMessageMutationStatus,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
+	AgentConnectionReloadOptions,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSavedSessionScope,
@@ -1088,8 +1089,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "abort_retry", activeSessionId: this.activeSessionId });
 	}
 
-	async reload(): Promise<void> {
-		await this.requestOk({ type: "reload", activeSessionId: this.activeSessionId });
+	async reload(options: AgentConnectionReloadOptions = {}): Promise<void> {
+		if (options.ifIdle && !this.client.supportsServerCapability("atomic_reload")) {
+			throw new DaemonCapabilityUnavailableError("reload", "atomic_reload");
+		}
+		await this.requestOk({ type: "reload", activeSessionId: this.activeSessionId, ifIdle: options.ifIdle });
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {

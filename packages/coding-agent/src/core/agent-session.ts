@@ -902,6 +902,11 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
+export interface ReloadOptions {
+	/** Claim the idle session before rebuilding resources, or fail without changing them. */
+	onlyIfIdle?: boolean;
+}
+
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
 }
@@ -1198,6 +1203,9 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _resourceReloadInProgress = false;
+	private _resourceReloadTail: Promise<void> = Promise.resolve();
+	private _resourceMutationAdmissions = 0;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
@@ -5281,7 +5289,42 @@ export class AgentSession {
 			);
 	}
 
+	private async _acquireResourceReloadFence(): Promise<{ release(): void }> {
+		const previous = this._resourceReloadTail;
+		let resolve = () => {};
+		this._resourceReloadTail = new Promise<void>((release) => {
+			resolve = release;
+		});
+		await previous;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				resolve();
+			},
+		};
+	}
+
+	private _claimResourceMutationAdmission(operation: string): { release(): void } {
+		if (this._resourceReloadInProgress) {
+			throw new Error(`Cannot ${operation} while resources are reloading.`);
+		}
+		this._resourceMutationAdmissions++;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				this._resourceMutationAdmissions--;
+			},
+		};
+	}
+
 	private _assertSessionActionAdmissionAvailable(): void {
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot admit a session action while resources are reloading.");
+		}
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
@@ -5303,9 +5346,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
-			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
-		}
+		this._assertSessionActionAdmissionAvailable();
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5376,6 +5417,8 @@ export class AgentSession {
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
+			resourceReload: this._resourceReloadInProgress,
+			resourceMutationAdmission: this._resourceMutationAdmissions > 0,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 		};
@@ -6695,6 +6738,14 @@ export class AgentSession {
 		if (!(await this._modelRegistry.canUseModel(model))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
 		}
+		// Immediately adjacent to the synchronous mutation below: nothing else on
+		// this worker's event loop can claim a reload between the two.
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
+		if (options.onlyIfIdle && (this.isStreaming || this.isCompacting || this.isRetrying || this.isBashRunning)) {
+			throw new Error("Session is busy; model unchanged");
+		}
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
@@ -6762,6 +6813,9 @@ export class AgentSession {
 			availableModels.some((model) => modelsAreEqual(model, scoped.model)),
 		);
 		if (scopedModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
@@ -6806,6 +6860,9 @@ export class AgentSession {
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		if (availableModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
@@ -7083,15 +7140,21 @@ export class AgentSession {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
-		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		const resourceAdmission = this._claimResourceMutationAdmission("compact");
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		let compactionOperation: Promise<void> | undefined;
 		let resolveCompactionOperation: () => void = () => {};
-		const compactionOperation = new Promise<void>((resolve) => {
-			resolveCompactionOperation = resolve;
-		});
-		this._compactionOperation = compactionOperation;
+		try {
+			this._disconnectFromAgent();
+			if (!options.skipAbort) await this.abort();
+			this._compactionAbortController = new AbortController();
+			compactionOperation = new Promise<void>((resolve) => {
+				resolveCompactionOperation = resolve;
+			});
+			this._compactionOperation = compactionOperation;
+		} finally {
+			resourceAdmission.release();
+		}
 		this._emit({
 			type: "compaction_start",
 			reason: "manual",
@@ -7711,16 +7774,23 @@ export class AgentSession {
 			}
 		}
 
+		const resourceAdmission = this._claimResourceMutationAdmission("refine");
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		// Background planning phase — does NOT block turn entry points
-		const planRun = this._planRefine(options, refineAbort.signal);
-		const planSettled = planRun.then(
-			() => undefined,
-			() => undefined,
-		);
-		this._refinePlanInFlight = planSettled;
+		// Background planning phase — does NOT block turn entry points.
+		let planRun: Promise<RefinementPlan>;
+		let planSettled: Promise<void>;
+		try {
+			planRun = this._planRefine(options, refineAbort.signal);
+			planSettled = planRun.then(
+				() => undefined,
+				() => undefined,
+			);
+			this._refinePlanInFlight = planSettled;
+		} finally {
+			resourceAdmission.release();
+		}
 		let plan: RefinementPlan;
 		try {
 			plan = await planRun;
@@ -8862,37 +8932,77 @@ export class AgentSession {
 		return handlers;
 	}
 
-	async reload(): Promise<void> {
-		const previousFlagValues = this._extensionRunner.getFlagValues();
-		await emitSessionShutdownEvent(this._extensionRunner, {
-			type: "session_shutdown",
-			reason: "reload",
-		});
-		await this.settingsManager.reload();
-		// Re-read auth.json: a login saved by the client process (daemon mode) must be
-		// visible here so MCP skill gating sees the new credentials.
-		this._modelRegistry.authStorage.reload();
-		resetApiProviders();
-		// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
-		this._mcpManager?.refresh();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+	async reload(options: ReloadOptions = {}): Promise<void> {
+		const reloadFence = await this._acquireResourceReloadFence();
+		try {
+			await this._reloadResources(options);
+		} finally {
+			reloadFence.release();
+		}
+	}
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await this._extensionRunner.emit({
-				type: "session_start",
+	private async _reloadResources(options: ReloadOptions): Promise<void> {
+		let claimedReload = false;
+		if (options.onlyIfIdle) {
+			const fence = await this._acquireSessionActionCommitFence();
+			try {
+				if (
+					!canSelectSessionAction(this._runtimeActivity()) ||
+					this.unfinishedActionCount > 0 ||
+					this._refinePlanInFlight !== undefined ||
+					this._serializedPlanInFlight !== undefined ||
+					!this._modelSelectEmitQueueIdle
+				) {
+					throw new Error("Session is busy; resources not reloaded");
+				}
+				this._resourceReloadInProgress = true;
+				claimedReload = true;
+			} finally {
+				fence.release();
+			}
+		} else {
+			this._resourceReloadInProgress = true;
+			claimedReload = true;
+		}
+
+		try {
+			const previousFlagValues = this._extensionRunner.getFlagValues();
+			await emitSessionShutdownEvent(this._extensionRunner, {
+				type: "session_shutdown",
 				reason: "reload",
 			});
-			await this.extendResourcesFromExtensions("reload");
+			await this.settingsManager.reload();
+			// Re-read auth.json: a login saved by the client process (daemon mode) must be
+			// visible here so MCP skill gating sees the new credentials.
+			this._modelRegistry.authStorage.reload();
+			resetApiProviders();
+			// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
+			this._mcpManager?.refresh();
+			await this._resourceLoader.reload();
+			this._buildRuntime({
+				activeToolNames: this.getActiveToolNames(),
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
+
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener;
+			if (hasBindings) {
+				await this._extensionRunner.emit({
+					type: "session_start",
+					reason: "reload",
+				});
+				await this.extendResourcesFromExtensions("reload");
+			}
+		} finally {
+			if (claimedReload) {
+				this._resourceReloadInProgress = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+			}
 		}
 	}
 
@@ -10394,6 +10504,7 @@ export class AgentSession {
 			transient?: boolean;
 		},
 	): Promise<BashResult> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		this._bashAbortController = new AbortController();
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
@@ -10438,6 +10549,7 @@ export class AgentSession {
 			runId?: string;
 		},
 	): Promise<void> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}

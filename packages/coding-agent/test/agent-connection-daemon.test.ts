@@ -350,6 +350,7 @@ class FakeDaemonClient {
 			}
 			case "wait_for_idle":
 			case "set_scoped_models":
+			case "reload":
 			case "rename_saved_session":
 			case "extension_ui_response":
 			case "detach":
@@ -709,6 +710,16 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			telemetryDisabled: true,
 		});
+	it("requires daemon capability before sending an idle-only reload", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.reload({ ifIdle: true })).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(fakeClient.requests).toEqual([]);
+
+		fakeClient.serverCapabilities.add("atomic_reload");
+		await connection.reload({ ifIdle: true });
+		expect(fakeClient.requests).toEqual([{ type: "reload", activeSessionId: "active-1", ifIdle: true }]);
 	});
 
 	it("forwards queueIfBusy for prompt admission", async () => {

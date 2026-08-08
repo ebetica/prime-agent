@@ -449,6 +449,20 @@ export class AgentConnectionPromptAdmissionError extends Error {
 	}
 }
 
+export interface AgentConnectionReloadOptions {
+	/** Atomically refuse the reload if the session has active or admitted work. */
+	ifIdle?: boolean;
+}
+
+export interface AgentConnectionSetModelOptions {
+	/**
+	 * Refuse the change instead of applying it while the session is working.
+	 * A caller in another process cannot check busyness and then switch without
+	 * racing whatever begins in between, so the session tests it itself.
+	 */
+	ifIdle?: boolean;
+}
+
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
@@ -729,7 +743,7 @@ export interface AgentConnection {
 	abortBranchSummary(): Promise<void>;
 	abortRetry(): Promise<void>;
 
-	reload(): Promise<void>;
+	reload(options?: AgentConnectionReloadOptions): Promise<void>;
 	newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }>;
 	switchSession(sessionPath: string, options?: AgentConnectionSwitchSessionOptions): Promise<{ cancelled: boolean }>;
 	fork(entryId: string, options?: AgentConnectionForkOptions): Promise<{ cancelled: boolean; selectedText?: string }>;
