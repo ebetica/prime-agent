@@ -103,7 +103,9 @@ describe("AgentSession action commit-fence races", () => {
 		const finishReload = createDeferred();
 		const internals = harness.session as unknown as CommitFenceInternals;
 		const originalReload = internals._resourceLoader.reload.bind(internals._resourceLoader);
+		let resourceReloadCount = 0;
 		internals._resourceLoader.reload = async () => {
+			resourceReloadCount++;
 			reloadStarted.resolve();
 			await finishReload.promise;
 			await originalReload();
@@ -111,6 +113,9 @@ describe("AgentSession action commit-fence races", () => {
 
 		const reload = harness.session.reload({ onlyIfIdle: true });
 		await reloadStarted.promise;
+		const queuedLegacyReload = harness.session.reload();
+		await yieldToEventLoop();
+		expect(resourceReloadCount).toBe(1);
 		await expect(harness.session.promptHeartbeat(createHeartbeat())).rejects.toThrow(
 			"Cannot admit a session action while resources are reloading.",
 		);
@@ -125,6 +130,8 @@ describe("AgentSession action commit-fence races", () => {
 		await expect(harness.session.cycleModel()).rejects.toThrow("Cannot change model while resources are reloading.");
 		finishReload.resolve();
 		await reload;
+		await queuedLegacyReload;
+		expect(resourceReloadCount).toBe(2);
 	});
 
 	it.each([

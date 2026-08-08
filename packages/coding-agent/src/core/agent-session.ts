@@ -1205,6 +1205,7 @@ export class AgentSession {
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
 	private _resourceReloadInProgress = false;
+	private _resourceReloadTail: Promise<void> = Promise.resolve();
 	private _resourceMutationAdmissions = 0;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
@@ -5270,6 +5271,23 @@ export class AgentSession {
 			);
 	}
 
+	private async _acquireResourceReloadFence(): Promise<{ release(): void }> {
+		const previous = this._resourceReloadTail;
+		let resolve = () => {};
+		this._resourceReloadTail = new Promise<void>((release) => {
+			resolve = release;
+		});
+		await previous;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				resolve();
+			},
+		};
+	}
+
 	private _claimResourceMutationAdmission(operation: string): { release(): void } {
 		if (this._resourceReloadInProgress) {
 			throw new Error(`Cannot ${operation} while resources are reloading.`);
@@ -8821,7 +8839,16 @@ export class AgentSession {
 	}
 
 	async reload(options: ReloadOptions = {}): Promise<void> {
-		let claimedIdle = false;
+		const reloadFence = await this._acquireResourceReloadFence();
+		try {
+			await this._reloadResources(options);
+		} finally {
+			reloadFence.release();
+		}
+	}
+
+	private async _reloadResources(options: ReloadOptions): Promise<void> {
+		let claimedReload = false;
 		if (options.onlyIfIdle) {
 			const fence = await this._acquireSessionActionCommitFence();
 			try {
@@ -8835,10 +8862,13 @@ export class AgentSession {
 					throw new Error("Session is busy; resources not reloaded");
 				}
 				this._resourceReloadInProgress = true;
-				claimedIdle = true;
+				claimedReload = true;
 			} finally {
 				fence.release();
 			}
+		} else {
+			this._resourceReloadInProgress = true;
+			claimedReload = true;
 		}
 
 		try {
@@ -8874,7 +8904,7 @@ export class AgentSession {
 				await this.extendResourcesFromExtensions("reload");
 			}
 		} finally {
-			if (claimedIdle) {
+			if (claimedReload) {
 				this._resourceReloadInProgress = false;
 				this._notifySessionInputCheckpointChange();
 				this._scheduleSessionInputPump();
