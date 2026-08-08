@@ -264,6 +264,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private settingsManager: SettingsManager;
 	private eventBus: EventBus;
 	private extensionEventBusScope?: StagedEventBus;
+	private preparedReloadActive = false;
 	private packageManager: DefaultPackageManager;
 	private bundledSkillsDir: string | null;
 	private extraBuiltinSkillOverrides?: () => string[];
@@ -500,9 +501,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 			systemPromptOverride: this.systemPromptOverride,
 			appendSystemPromptOverride: this.appendSystemPromptOverride,
 		});
+		this.preparedReloadActive = true;
 		try {
 			await candidate.reload();
 		} catch (error) {
+			this.preparedReloadActive = false;
 			stagedEventBus.dispose();
 			throw error;
 		}
@@ -520,6 +523,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				return () => {
 					if (settled) return;
 					settled = true;
+					this.preparedReloadActive = false;
 					candidateState.extensionEventBusScope?.dispose();
 					this.applyMutableState(previous!);
 					stagedEventBus.dispose();
@@ -529,12 +533,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 				if (settled) return;
 				if (!committed) throw new Error("Prepared resource reload was not committed");
 				settled = true;
+				this.preparedReloadActive = false;
 				stagedEventBus.commit();
 				previous?.extensionEventBusScope?.dispose();
 			},
 			dispose: () => {
 				if (settled) return;
 				settled = true;
+				this.preparedReloadActive = false;
 				candidateState.extensionEventBusScope?.dispose();
 				stagedEventBus.dispose();
 			},
@@ -598,6 +604,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async reload(): Promise<void> {
+		if (this.preparedReloadActive) throw new Error("A prepared resource reload must be settled before reloading");
 		const nextEventScope = createStagedEventBus(this.eventBus);
 		try {
 			await this.settingsManager.reload();

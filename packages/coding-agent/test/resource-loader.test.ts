@@ -761,9 +761,10 @@ export default function(pi: ExtensionAPI) {
 			const rollback = prepared.commit();
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("second sentinel");
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).not.toContain("first sentinel");
-			await loader.reload();
-			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("second sentinel");
+			await expect(loader.reload()).rejects.toThrow("must be settled before reloading");
 			rollback();
+			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
+			await loader.reload();
 			expect(loader.getAgentsFiles().agentsFiles.map((entry) => entry.content)).toContain("first sentinel");
 		});
 
@@ -774,6 +775,7 @@ export default function(pi: ExtensionAPI) {
 			const prepared = await loader.prepareReload({ contextDirectories: [missing, missing] });
 			expect(prepared.resources.contextDirectories).toEqual([missing]);
 			prepared.commit();
+			prepared.finalize();
 			mkdirSync(missing);
 			writeFileSync(join(missing, "LATER.md"), "later sentinel");
 			await loader.reload();

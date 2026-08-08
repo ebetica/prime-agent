@@ -2124,6 +2124,72 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(persisted[1]).not.toHaveProperty("pendingResourceReload");
 	});
 
+	it("reports an uncertain result when a durable resource commit reply is lost", async () => {
+		const close = vi.fn();
+		const requestWorker = vi.fn(async () => ({
+			success: false as const,
+			type: "response" as const,
+			command: "worker_commit_resource_reload",
+			error: "worker disconnected",
+		}));
+		const worker = {
+			descriptor: {
+				version: 1,
+				workerId: "resident-resource-uncertain",
+				rootActiveSessionId: "root-active",
+				createCommand: { type: "create" as const, config: { cwd: "/repo" } },
+			},
+			client: { supportsServerCapability: () => true, requestWorker, close },
+		};
+		const persistWorkerDescriptor = vi.fn(
+			(_worker: typeof worker, descriptor: typeof worker.descriptor & Record<string, unknown>) => {
+				worker.descriptor = descriptor;
+			},
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			resourceReloadTails: new Map(),
+			protocolClientIds: new WeakMap(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary: { id: "root-active" } })),
+			forwardToWorker: vi.fn(async () =>
+				success(undefined, "reload", {
+					transactionId: "reload-uncertain",
+					resources: { contextDirectories: ["/operator"] },
+				}),
+			),
+			persistWorkerDescriptor,
+			log: vi.fn(),
+		}) as unknown as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: {
+					type: "reload";
+					id: string;
+					activeSessionId: string;
+					resources: { contextDirectories: string[] };
+				},
+			): Promise<{ success: boolean; errorInfo?: { code?: string } }>;
+		};
+		const client = { id: "client-socket" } as DaemonSocketClient;
+
+		const response = await supervisor.handleCommand(client, {
+			type: "reload",
+			id: "reload-command",
+			activeSessionId: "root-active",
+			resources: { contextDirectories: ["/operator"] },
+		});
+		expect(response).toMatchObject({
+			success: false,
+			errorInfo: {
+				code: "command_result_uncertain",
+				clientId: "client-socket",
+				commandId: "reload-command",
+			},
+		});
+		expect(worker.descriptor).toHaveProperty("pendingResourceReload.transactionId", "reload-uncertain");
+		expect(persistWorkerDescriptor).toHaveBeenCalledOnce();
+		expect(close).toHaveBeenCalledOnce();
+	});
+
 	it("rolls back the fenced worker when durable resource persistence fails", async () => {
 		const requestWorker = vi.fn(async () => ({
 			success: true as const,

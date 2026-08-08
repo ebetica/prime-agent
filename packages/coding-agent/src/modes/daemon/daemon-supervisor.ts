@@ -1647,9 +1647,19 @@ export class DaemonSupervisor {
 					} catch (error) {
 						// The committed descriptor is authoritative. Keep the marker so a
 						// replacement supervisor commits the still-fenced transaction or
-						// a replacement worker starts directly from the new config.
+						// a replacement worker starts directly from the new config. The
+						// caller must not treat a lost commit reply as a definite rollback.
 						match.worker.client?.close();
-						throw error;
+						return failure(
+							command.id,
+							command.type,
+							`Resource reload commit result is uncertain: ${String(error)}`,
+							{
+								code: "command_result_uncertain",
+								clientId: this.protocolClientId(client),
+								commandId: command.id ?? "reload",
+							},
+						);
 					}
 					try {
 						this.persistWorkerDescriptor(match.worker, withoutPendingResourceReload(match.worker.descriptor));
