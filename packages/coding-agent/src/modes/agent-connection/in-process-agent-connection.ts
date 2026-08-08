@@ -43,6 +43,7 @@ import type {
 	AgentConnectionNavigateTreeResult,
 	AgentConnectionNewSessionOptions,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReloadOptions,
@@ -187,6 +188,14 @@ export class InProcessAgentConnection implements AgentConnection {
 			steering: [...this.session.getSteeringMessagePreviews()],
 			followUp: [...this.session.getFollowUpMessagePreviews()],
 		};
+	}
+
+	async getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		return this.session.getQueuedUserActions();
+	}
+
+	async cancelQueuedAction(id: string): Promise<boolean> {
+		return this.session.cancelQueuedAction(id);
 	}
 
 	async clearQueue(): Promise<AgentConnectionQueueState> {

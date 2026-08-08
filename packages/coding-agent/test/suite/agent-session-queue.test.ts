@@ -1652,6 +1652,47 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toEqual(["delivered"]);
 	});
 
+	it("cancels exactly one queued action by stable identity", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("survivors delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("same", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("same", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("last", undefined, { resumeIfIdle: true });
+
+		const actions = harness.session.getQueuedUserActions();
+		expect(actions.map((action) => action.text)).toEqual(["same", "same", "last"]);
+		expect(new Set(actions.map((action) => action.id)).size).toBe(3);
+		expect(harness.session.cancelQueuedAction(actions[1]!.id)).toBe(true);
+		expect(harness.session.cancelQueuedAction(actions[1]!.id)).toBe(false);
+		expect(harness.session.getQueuedUserActions()).toEqual([actions[0], actions[2]]);
+
+		pause.release();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["same", "last"]);
+	});
+
+	it("refuses cancellation after the exact action leaves the queue", async () => {
+		const hook = gatedHook({ prompt: "claimed" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("claimed", undefined, { resumeIfIdle: true });
+		const [action] = harness.session.getQueuedUserActions();
+		expect(action).toBeDefined();
+
+		pause.release();
+		await hook.reached;
+		expect(harness.session.cancelQueuedAction(action!.id)).toBe(false);
+		hook.release();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["claimed"]);
+		expect(getAssistantTexts(harness)).toEqual(["delivered"]);
+	});
+
 	it("does not cancel one action from a handed-off batch", async () => {
 		const firstPrompt = agentPromptText("agentmsg_batch_first", "first");
 		const secondPrompt = agentPromptText("agentmsg_batch_second", "second");

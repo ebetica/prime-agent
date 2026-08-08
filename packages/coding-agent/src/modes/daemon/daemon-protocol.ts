@@ -57,8 +57,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 adds daemon-side atomic idle admission for resource reloads.
-export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-c5e04a561104";
+// Revision 15 adds stable queued-user-action identities and atomic cancellation.
+export const DAEMON_SCHEMA_REVISION = 15;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-pending";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -97,7 +98,8 @@ export type DaemonServerCapability =
 	| "transient_bash"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
-	| "atomic_reload";
+	| "atomic_reload"
+	| "queued_action_cancellation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -136,6 +138,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"atomic_reload",
+	"queued_action_cancellation",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -508,6 +511,8 @@ export type DaemonCommand =
 	| { id?: string; type: "get_model_catalog"; activeSessionId: string }
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
+	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
+	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -646,6 +651,11 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
 } as const;
+const QUEUED_ACTION_CANCELLATION_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 15,
+	capability: "queued_action_cancellation",
+} as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
@@ -694,6 +704,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_model_catalog: { minProtocol: 7, capability: "model_catalog" },
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
+	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
+	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
@@ -1041,6 +1053,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
+	"get_queued_user_actions",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",

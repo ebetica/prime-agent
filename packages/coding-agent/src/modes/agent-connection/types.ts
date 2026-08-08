@@ -527,6 +527,12 @@ export interface AgentConnectionQueueState {
 	followUp: string[];
 }
 
+export interface AgentConnectionQueuedUserAction {
+	id: string;
+	text: string;
+	delivery: "steering" | "followUp";
+}
+
 export interface AgentConnectionHeartbeat {
 	job: AgentCronJob;
 	sessionName?: string;
@@ -657,6 +663,8 @@ export interface AgentConnection {
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
+	getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]>;
+	cancelQueuedAction(id: string): Promise<boolean>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
