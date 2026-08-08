@@ -19,7 +19,11 @@ import {
 	VERSION,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	type DaemonPlannedRestartHandoff,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
 import {
 	handlePackageCommand,
@@ -83,6 +87,7 @@ interface MockUpdateRestartManifest {
 	formatVersion: 1;
 	createdAt: string;
 	sessions: MockUpdateRestartSession[];
+	handoff?: DaemonPlannedRestartHandoff;
 }
 
 function createMockTurnExecutionPolicy(): Record<string, unknown> {
@@ -1092,6 +1097,79 @@ describe("self-update daemon restart", () => {
 			expect(mockState.requestPayloads.filter((request) => request.type === "restore_actions")).toHaveLength(1);
 			expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(false);
 			expect(mockState.requestPayloads.filter((request) => request.type === "resume_queue")).toHaveLength(1);
+		} finally {
+			errorSpy.mockRestore();
+			logSpy.mockRestore();
+		}
+	});
+
+	it("admits a claimed planned restart handoff once after the successor session is ready", async () => {
+		const sessionFile = join(projectDir, "session.jsonl");
+		mockState.prepareManifest = {
+			formatVersion: 1,
+			createdAt: "2026-07-07T00:00:00.000Z",
+			sessions: [
+				{
+					activeSessionId: "old-active",
+					sessionId: "session-1",
+					sessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					queue: { actions: { formatVersion: 1, actions: [] }, nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+			],
+			handoff: {
+				requestId: "restart-1",
+				target: { activeSessionId: "old-active", sessionId: "session-1", sessionFile },
+				message: "Restart complete; continue nonce",
+				actionId: "planned-restart:1",
+				state: "prepared",
+				createdAt: "2026-07-07T00:00:00.000Z",
+				updatedAt: "2026-07-07T00:00:01.000Z",
+				claim: {
+					claimedAt: "2026-07-07T00:00:01.000Z",
+					supervisorGeneration: "predecessor-generation",
+					supervisorOwnerToken: "predecessor-owner",
+					supervisorPid: 101,
+					supervisorSocketPath: mockState.socketPath,
+				},
+			},
+		};
+		mockState.requestThrowTypes = ["resume_queue"];
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			await expect(performUpdateAndRunCoordinator()).resolves.toBeUndefined();
+			expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(1);
+			expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+
+			// A lost resume reply leaves the successor resident. The next coordinator
+			// must finish that pending manifest in place instead of restarting it or
+			// trying to resolve the predecessor's obsolete active id.
+			mockState.requestThrowTypes = [];
+			const retryStatus = await runDaemonUpdateRestartCoordinator({
+				socketPath: mockState.socketPath,
+				agentDir,
+				statusPath: join(agentDir, "update-restarts", "retry-status.json"),
+				handoffRequestId: "restart-1",
+			});
+			expect(retryStatus).toMatchObject({ phase: "complete", counts: { failed: 0, resumed: 1 } });
+			expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+			expect(
+				mockState.requestPayloads.filter((request) => request.type === "restore_planned_restart_handoff"),
+			).toEqual([
+				{ type: "restore_planned_restart_handoff", activeSessionId: "restored-active", requestId: "restart-1" },
+				{ type: "restore_planned_restart_handoff", activeSessionId: "restored-active", requestId: "restart-1" },
+			]);
+			expect(mockState.requestPayloads.filter((request) => request.type === "resume_queue")).toHaveLength(2);
+			expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(false);
 		} finally {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();

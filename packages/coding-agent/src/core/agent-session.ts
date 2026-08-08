@@ -188,6 +188,8 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+	PLANNED_RESTART_INTENT_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -256,7 +258,13 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionEntry,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -1391,6 +1399,13 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		if (this._recoverPlannedRestartContinuationIntents() > 0) {
+			// A prior successor may have acknowledged resume and crashed before the
+			// queued continuation reached the transcript. The durable intent is
+			// successor-claim proof, so a later session load may safely finish it.
+			this._sessionInputPumpSuspended = false;
+			this._scheduleSessionInputPump();
+		}
 	}
 
 	/**
@@ -4935,6 +4950,128 @@ export class AgentSession {
 		});
 	}
 
+	private _plannedRestartMarker(
+		entry: SessionEntry,
+	): { actionId: string; message?: string; completed: boolean } | undefined {
+		let customType: string;
+		let rawDetails: unknown;
+		if (entry.type === "custom_message") {
+			customType = entry.customType;
+			rawDetails = entry.details;
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			customType = entry.message.customType;
+			rawDetails = entry.message.details;
+		} else {
+			return undefined;
+		}
+		if (
+			(customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE && customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) ||
+			!rawDetails ||
+			typeof rawDetails !== "object"
+		) {
+			return undefined;
+		}
+		const details = rawDetails as { actionId?: unknown; message?: unknown };
+		if (typeof details.actionId !== "string") return undefined;
+		return {
+			actionId: details.actionId,
+			...(typeof details.message === "string" ? { message: details.message } : {}),
+			completed: customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+		};
+	}
+
+	private _recoverPlannedRestartContinuationIntents(): number {
+		const completed = new Set<string>();
+		const pending = new Map<string, string>();
+		for (const entry of this.sessionManager.getEntries()) {
+			const marker = this._plannedRestartMarker(entry);
+			if (!marker) continue;
+			if (marker.completed) {
+				completed.add(marker.actionId);
+				continue;
+			}
+			if (marker.message === undefined) continue;
+			const prior = pending.get(marker.actionId);
+			if (prior !== undefined && prior !== marker.message) {
+				throw new Error(`Planned restart action ${marker.actionId} has conflicting durable intents`);
+			}
+			pending.set(marker.actionId, marker.message);
+		}
+		let recovered = 0;
+		for (const [actionId, text] of pending) {
+			if (completed.has(actionId) || this._actionStore.ownedActions().some((action) => action.id === actionId)) {
+				continue;
+			}
+			const message: CustomMessage = {
+				role: "custom",
+				customType: PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+				content: text,
+				display: true,
+				timestamp: Date.now(),
+				details: { actionId, message: text },
+			};
+			const action = this._createPreparedTurnAction("followUp", text, undefined, {
+				actionId,
+				agentMessageId: actionId,
+				message,
+				source: "internal",
+				queueVisible: false,
+			});
+			this._admitSessionInput(action, { restore: true });
+			recovered++;
+		}
+		return recovered;
+	}
+
+	admitPlannedRestartContinuation(actionId: string, text: string): "admitted" | "already_admitted" {
+		const entries = this.sessionManager.getEntries();
+		const completed = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === true && marker.actionId === actionId;
+		});
+		if (completed) return "already_admitted";
+		const existing = this._actionStore.ownedActions().find((action) => action.id === actionId);
+		if (existing) {
+			if (existing.payload.kind !== "turn" || existing.payload.text !== text) {
+				throw new Error(`Planned restart action ${actionId} conflicts with an existing action`);
+			}
+			return "already_admitted";
+		}
+		const intent = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === false && marker.actionId === actionId;
+		});
+		const intentDetails = intent ? this._plannedRestartMarker(intent) : undefined;
+		if (intentDetails?.message !== undefined && intentDetails.message !== text) {
+			throw new Error(`Planned restart action ${actionId} conflicts with its durable intent`);
+		}
+		if (!intent) {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				PLANNED_RESTART_INTENT_CUSTOM_TYPE,
+				"Planned restart continuation pending",
+				false,
+				{ actionId, message: text },
+			);
+		}
+		const message: CustomMessage = {
+			role: "custom",
+			customType: PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			timestamp: Date.now(),
+			details: { actionId, message: text },
+		};
+		const action = this._createPreparedTurnAction("followUp", text, undefined, {
+			actionId,
+			agentMessageId: actionId,
+			message,
+			source: "internal",
+			queueVisible: false,
+		});
+		this._admitSessionInput(action, { restore: true });
+		return "admitted";
+	}
+
 	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<number> {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
@@ -5216,6 +5353,7 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		options: {
+			actionId?: string;
 			agentMessageId?: string;
 			queueKey?: string;
 			content?: (TextContent | ImageContent)[];
@@ -5231,7 +5369,7 @@ export class AgentSession {
 			acceptedBeforeCompletion?: boolean;
 		},
 	): QueuedSessionAction {
-		const id = randomUUID();
+		const id = options.actionId ?? randomUUID();
 		const content = options.content ?? this._buildPromptContent(text, images);
 		const message =
 			options.message ??

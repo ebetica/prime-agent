@@ -165,6 +165,8 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPlannedRestartBlocker,
+	type DaemonPlannedRestartHandoff,
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
@@ -262,6 +264,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"follow_up",
 	"restore_next_turn",
 	"restore_actions",
+	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -338,6 +341,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
+	"register_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -445,6 +449,8 @@ export class AgentDaemon {
 		deadline?: ReturnType<typeof setTimeout>;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		strict: boolean;
+		handoff?: DaemonPlannedRestartHandoff;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
 			state: ActiveSessionState;
@@ -3435,7 +3441,7 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_prepare_update": {
-					const transaction = this.beginUpdateRestartTransaction(client);
+					const transaction = this.beginUpdateRestartTransaction(client, command.strict === true, command.handoff);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
 					this.writeWorkerSuccess(client, command, manifest);
 					return;
@@ -3465,6 +3471,15 @@ export class AgentDaemon {
 					if (!this.supervisorClaims.has(client)) {
 						setImmediate(() => void this.shutdown(0));
 					}
+					return;
+				}
+				case "worker_restore_planned_restart_handoff": {
+					const state = this.getSessionState(command.activeSessionId);
+					if (state.runtime.session.sessionId !== command.sessionId) {
+						throw new Error("Planned restart target session identity does not match");
+					}
+					const status = state.runtime.session.admitPlannedRestartContinuation(command.actionId, command.message);
+					this.writeWorkerSuccess(client, command, { status });
 					return;
 				}
 				case "worker_cancel_update": {
@@ -4627,7 +4642,14 @@ export class AgentDaemon {
 				return success(command.id, "extension_ui_response");
 			}
 
+			case "register_planned_restart_handoff":
+			case "restore_planned_restart_handoff":
+				throw new Error("Planned restart handoffs require the daemon supervisor");
+
 			case "prepare_update_restart":
+				if (command.handoffRequestId) {
+					throw new Error("Planned restart handoffs require the daemon supervisor");
+				}
 				this.log(
 					`prepare_update_restart command received over socket; ${this.sessions.size} active session(s) will be closed`,
 				);
@@ -5815,13 +5837,19 @@ export class AgentDaemon {
 		}
 	}
 
-	private beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemon["updateRestart"]> {
+	private beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		strict = false,
+		handoff?: DaemonPlannedRestartHandoff,
+	): NonNullable<AgentDaemon["updateRestart"]> {
 		if (this.updateRestart) throw new Error("Daemon is already preparing an update restart");
 		const transaction: NonNullable<AgentDaemon["updateRestart"]> = {
 			id: Symbol("update-restart"),
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			strict,
+			...(handoff ? { handoff } : {}),
 			deferredClientEnv: [],
 		};
 		this.updateRestart = transaction;
@@ -5854,6 +5882,43 @@ export class AgentDaemon {
 		}
 	}
 
+	private plannedRestartBlockers(states: readonly ActiveSessionState[]): DaemonPlannedRestartBlocker[] {
+		const blockers: DaemonPlannedRestartBlocker[] = [];
+		for (const state of states) {
+			const session = state.runtime.session;
+			const summary = summaryForActiveSession(state);
+			const base = {
+				activeSessionId: state.activeSessionId,
+				sessionId: session.sessionId,
+				...(summary.sessionName ? { sessionName: summary.sessionName } : {}),
+			};
+			if (session.isBashRunning) blockers.push({ ...base, operation: "bash" });
+			if (session.isCompacting) blockers.push({ ...base, operation: "compaction" });
+			if (session.isRetrying) blockers.push({ ...base, operation: "retry" });
+			if (session.hasRunningRlmChildren()) blockers.push({ ...base, operation: "rlm_child" });
+			if (session.isSessionActive || session.isStreaming || session.hasAcceptedPromptInFlight) {
+				blockers.push({ ...base, operation: "turn" });
+			}
+			const queue = session.getSessionActionRecoverySnapshot();
+			if (queue.actions.length > 0 || session.getPendingNextTurnMessageSnapshots().length > 0) {
+				blockers.push({ ...base, operation: "queued_action" });
+			}
+			if (this.hasScheduledJobsForSession(state.activeSessionId)) {
+				blockers.push({ ...base, operation: "scheduled_job" });
+			}
+		}
+		return blockers;
+	}
+
+	private formatPlannedRestartBlockers(blockers: readonly DaemonPlannedRestartBlocker[]): string {
+		return blockers
+			.map(
+				(blocker) =>
+					`${blocker.sessionName ?? blocker.sessionId} (${blocker.activeSessionId}): ${blocker.operation}`,
+			)
+			.join(", ");
+	}
+
 	private async prepareUpdateRestartCheckpoint(
 		transaction: NonNullable<AgentDaemon["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest> {
@@ -5869,6 +5934,14 @@ export class AgentDaemon {
 			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
 			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));
 			if (addedSession) throw new Error(`Session ${addedSession} became resident during update preparation`);
+			if (transaction.strict) {
+				const blockers = this.plannedRestartBlockers(states);
+				if (blockers.length > 0) {
+					throw new Error(
+						`Planned restart refused; active blockers: ${this.formatPlannedRestartBlockers(blockers)}`,
+					);
+				}
+			}
 
 			const restartSessions = states
 				.filter((state) => this.sessions.get(state.activeSessionId) === state)
@@ -5883,6 +5956,16 @@ export class AgentDaemon {
 					);
 				});
 			this.assertUpdateRestartNotCancelled(transaction);
+			if (transaction.handoff) {
+				const target = restartSessions.find(
+					(session) =>
+						session.activeSessionId === transaction.handoff?.target.activeSessionId &&
+						session.sessionId === transaction.handoff.target.sessionId &&
+						canonicalSessionPath(session.sessionFile) ===
+							canonicalSessionPath(transaction.handoff.target.sessionFile),
+				);
+				if (!target) throw new Error("Planned restart target was deleted or changed during quiescence claim");
+			}
 			const includedActiveSessionIds = new Set(restartSessions.map((session) => session.activeSessionId));
 			const discardedActiveSessionIds = states
 				.filter(

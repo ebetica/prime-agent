@@ -9,7 +9,12 @@ import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
-import type { DaemonClientCapability, DaemonCommand, DaemonOutbound } from "./daemon-protocol.js";
+import type {
+	DaemonClientCapability,
+	DaemonCommand,
+	DaemonOutbound,
+	DaemonPlannedRestartHandoff,
+} from "./daemon-protocol.js";
 
 export const DAEMON_WORKER_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER";
 export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
@@ -74,9 +79,23 @@ export type DaemonWorkerCommand =
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
-	| { id?: string; type: "worker_prepare_update" }
+	| {
+			id?: string;
+			type: "worker_prepare_update";
+			strict?: boolean;
+			handoff?: DaemonPlannedRestartHandoff;
+	  }
 	| { id?: string; type: "worker_commit_update" }
 	| { id?: string; type: "worker_cancel_update" }
+	| {
+			id?: string;
+			type: "worker_restore_planned_restart_handoff";
+			activeSessionId: string;
+			sessionId: string;
+			requestId: string;
+			actionId: string;
+			message: string;
+	  }
 	| { id?: string; type: "worker_commit_resource_reload"; transactionId: string }
 	| { id?: string; type: "worker_rollback_resource_reload"; transactionId: string }
 	| { id?: string; type: "worker_list_resource_reloads" };

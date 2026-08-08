@@ -23,7 +23,10 @@ type AgentDaemonUpdateInternals = {
 	cronScheduler: AgentCronScheduler;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
-	beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
+	beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		strict?: boolean,
+	): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
 	runUpdateRestartPreparation(
 		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest>;
@@ -38,6 +41,7 @@ type AgentDaemonUpdateInternals = {
 		abort: AbortController;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		strict?: boolean;
 		owner?: DaemonSocketClient;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
@@ -149,6 +153,89 @@ describe("issue #4257 update restart resume", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("refuses strict restart claims with named queued and scheduled blockers", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		await harness.session.restoreFollowUpMessage("queued before restart");
+		const internals = createDaemonInternals(harness);
+		const state = createState(harness, "active-blocked", { kind: "top-level", createdAt: Date.now() });
+		internals.sessions.set(state.activeSessionId, state);
+		internals.cronStore.create({
+			activeSessionId: state.activeSessionId,
+			sessionId: harness.session.sessionId,
+			sessionFile: harness.session.sessionFile ?? "",
+			cwd: harness.tempDir,
+			scheduleText: "in 1h",
+			prompt: "scheduled after restart",
+			now: new Date("2026-01-01T00:00:00.000Z"),
+		});
+		const transaction = internals.beginUpdateRestartTransaction(undefined, true);
+		await expect(internals.runUpdateRestartPreparation(transaction)).rejects.toThrow(
+			/active-blocked.*queued_action.*active-blocked.*scheduled_job/,
+		);
+		expect(internals.updateRestart).toBeUndefined();
+	});
+
+	it("names active child turns as strict restart blockers", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		vi.spyOn(harness.session, "hasRunningRlmChildren").mockReturnValue(true);
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-parent",
+			createState(harness, "active-parent", { kind: "top-level", createdAt: Date.now() }),
+		);
+		const transaction = internals.beginUpdateRestartTransaction(undefined, true);
+		await expect(internals.runUpdateRestartPreparation(transaction)).rejects.toThrow(/active-parent.*rlm_child/);
+	});
+
+	it("admits a deterministic restart continuation exactly once and only runs it when resumed", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("continued after restart")]);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe("admitted");
+		// Simulate losing the in-memory queue after the durable intent was written.
+		harness.session.clearQueuedUserMessagesMatching(() => true);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe("admitted");
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
+			"already_admitted",
+		);
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
+			),
+		).toEqual([expect.objectContaining({ content: "continue nonce" })]);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
+			"already_admitted",
+		);
+	});
+
+	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered continuation")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.planned_restart_intent",
+					"Planned restart continuation pending",
+					false,
+					{ actionId: "restart-action-recovered", message: "recover nonce" },
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
+			),
+		).toEqual([expect.objectContaining({ content: "recover nonce" })]);
 	});
 
 	it.each([

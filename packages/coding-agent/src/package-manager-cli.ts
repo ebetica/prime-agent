@@ -53,6 +53,7 @@ import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+	type DaemonPlannedRestartHandoff,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
 	isUnknownDaemonCommandError,
@@ -67,6 +68,7 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 } from "./modes/daemon/daemon-worker-protocol.js";
+import { isDaemonPlannedRestartHandoff } from "./modes/daemon/planned-restart-handoff.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 import { getLatestPiRelease, isNewerPackageVersion } from "./utils/version-check.js";
 
@@ -755,10 +757,22 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	if (!Array.isArray(sessions)) {
 		throw new Error("Daemon update restart response is missing sessions");
 	}
+	const discardedActiveSessionIds = value.discardedActiveSessionIds;
+	if (
+		discardedActiveSessionIds !== undefined &&
+		(!Array.isArray(discardedActiveSessionIds) || discardedActiveSessionIds.some((id) => typeof id !== "string"))
+	) {
+		throw new Error("Daemon update restart response has invalid discarded sessions");
+	}
+	if (value.handoff !== undefined && !isDaemonPlannedRestartHandoff(value.handoff)) {
+		throw new Error("Daemon update restart response has an invalid planned restart handoff");
+	}
 	return {
 		formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 		createdAt: readString(value.createdAt, "createdAt"),
 		sessions: sessions.map(parseDaemonUpdateRestartSession),
+		...(discardedActiveSessionIds ? { discardedActiveSessionIds } : {}),
+		...(value.handoff ? { handoff: value.handoff } : {}),
 	};
 }
 
@@ -811,8 +825,17 @@ function tryReadPreparedDaemonUpdateRestartManifest(
 	}
 }
 
+function isPreparedDaemonRestartManifest(manifest: DaemonUpdateRestartManifest, handoffRequestId?: string): boolean {
+	if (!manifest.handoff) return handoffRequestId === undefined;
+	return (
+		manifest.handoff.state === "prepared" &&
+		manifest.handoff.claim !== undefined &&
+		(handoffRequestId === undefined || manifest.handoff.requestId === handoffRequestId)
+	);
+}
+
 function hasRestorableDaemonUpdateRestart(manifest: DaemonUpdateRestartManifest | undefined): boolean {
-	return manifest !== undefined && manifest.sessions.length > 0;
+	return manifest !== undefined && manifest.sessions.length > 0 && isPreparedDaemonRestartManifest(manifest);
 }
 
 function responseHasActiveDaemonSessions(data: unknown): boolean {
@@ -849,6 +872,7 @@ async function prepareConnectedDaemonUpdateRestart(
 	socketPath: string,
 	agentDir: string,
 	hello: DaemonHello | undefined,
+	handoffRequestId?: string,
 ): Promise<DaemonUpdateRestartManifest> {
 	const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 	let startedAt: number | undefined;
@@ -869,7 +893,11 @@ async function prepareConnectedDaemonUpdateRestart(
 		if (hasFixedDaemonSupervisorOwnerIdentity(hello)) {
 			fixedOwnerIdentity = hello;
 		}
-		if (pendingManifest && pendingManifest.sessions.length > 0) {
+		if (
+			pendingManifest &&
+			pendingManifest.sessions.length > 0 &&
+			isPreparedDaemonRestartManifest(pendingManifest, handoffRequestId)
+		) {
 			const listResponse = await client.request({ type: "list" }, 30000);
 			if (listResponse.success && !responseHasActiveDaemonSessions(listResponse.data)) {
 				await persistPreparedRestartFence();
@@ -878,7 +906,10 @@ async function prepareConnectedDaemonUpdateRestart(
 		}
 		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 		startedAt = Date.now();
-		const response = await client.request({ type: "prepare_update_restart" }, 120000);
+		const response = await client.request(
+			{ type: "prepare_update_restart", ...(handoffRequestId ? { handoffRequestId } : {}) },
+			120000,
+		);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -891,7 +922,7 @@ async function prepareConnectedDaemonUpdateRestart(
 		}
 		if (startedAt !== undefined) {
 			const fallback = readPreparedDaemonUpdateRestartManifest(socketPath, agentDir, startedAt);
-			if (fallback) {
+			if (fallback && isPreparedDaemonRestartManifest(fallback, handoffRequestId)) {
 				await persistPreparedRestartFence();
 				return fallback;
 			}
@@ -903,6 +934,7 @@ async function prepareConnectedDaemonUpdateRestart(
 export async function prepareDaemonUpdateRestart(
 	socketPath: string,
 	agentDir: string,
+	handoffRequestId?: string,
 ): Promise<DaemonUpdateRestartManifest> {
 	const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 	const client = new DaemonClient(socketPath);
@@ -911,9 +943,14 @@ export async function prepareDaemonUpdateRestart(
 		await client.connect(1000);
 		connected = true;
 		const hello = await client.waitForHello(2000).catch(() => undefined);
-		return await prepareConnectedDaemonUpdateRestart(client, socketPath, agentDir, hello);
+		return await prepareConnectedDaemonUpdateRestart(client, socketPath, agentDir, hello, handoffRequestId);
 	} catch (error) {
-		if (!connected && pendingManifest && pendingManifest.sessions.length > 0) {
+		if (
+			!connected &&
+			pendingManifest &&
+			pendingManifest.sessions.length > 0 &&
+			isPreparedDaemonRestartManifest(pendingManifest, handoffRequestId)
+		) {
 			return pendingManifest;
 		}
 		throw error;
@@ -985,6 +1022,7 @@ async function restoreDaemonUpdateRestartSession(
 	session: DaemonUpdateRestartSession,
 	restoredActiveSessionIds: Map<string, string>,
 	restartOriginActiveSessionId?: string,
+	plannedHandoff?: DaemonPlannedRestartHandoff,
 ): Promise<RestoreDaemonUpdateRestartSessionResult> {
 	const runtimeMetadata = remapDaemonUpdateRestartRuntimeMetadata(session, restoredActiveSessionIds);
 	const createResponse = await client.request(
@@ -1034,6 +1072,30 @@ async function restoreDaemonUpdateRestartSession(
 		}
 	}
 	await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn);
+	if (
+		plannedHandoff?.state === "prepared" &&
+		plannedHandoff.claim &&
+		plannedHandoff.target.activeSessionId === session.activeSessionId &&
+		plannedHandoff.target.sessionId === session.sessionId &&
+		resolve(plannedHandoff.target.sessionFile) === resolve(session.sessionFile)
+	) {
+		const handoffResponse = await client.request(
+			{
+				type: "restore_planned_restart_handoff",
+				activeSessionId,
+				requestId: plannedHandoff.requestId,
+			},
+			30000,
+		);
+		if (!handoffResponse.success) {
+			return { restored: false, resumed: false, failureMessage: handoffResponse.error };
+		}
+		const resumeResponse = await client.request({ type: "resume_queue", activeSessionId }, 30000);
+		if (!resumeResponse.success) {
+			return { restored: false, resumed: false, failureMessage: resumeResponse.error };
+		}
+		return { restored: true, resumed: true };
+	}
 	if (!session.shouldResume) return { restored: true, resumed: false };
 
 	const needsContinuationPrompt =
@@ -1116,6 +1178,7 @@ async function restoreDaemonUpdateRestart(
 					session,
 					restoredActiveSessionIds,
 					restartOriginActiveSessionId,
+					manifest.handoff,
 				);
 				if (result.restored) {
 					restored++;
@@ -1225,6 +1288,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	agentDir: string;
 	statusPath: string;
 	originActiveSessionId?: string;
+	handoffRequestId?: string;
 }): Promise<DaemonUpdateRestartStatus> {
 	const statusWriter = new DaemonUpdateRestartStatusWriter(
 		options.statusPath,
@@ -1269,6 +1333,64 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			connectedClient = new DaemonClient(options.socketPath);
 			await connectedClient.connect(1000);
 			const hello = await connectedClient.waitForHello(2000);
+			const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			const pendingClaim = pendingManifest?.handoff?.claim;
+			if (
+				pendingManifest?.handoff?.state === "prepared" &&
+				pendingClaim &&
+				(!options.handoffRequestId || pendingManifest.handoff.requestId === options.handoffRequestId)
+			) {
+				const claimedPredecessor: DaemonUpdateRestartProcessIdentity = {
+					pid: pendingClaim.supervisorPid,
+					...(pendingClaim.supervisorProcessStartId
+						? { processStartId: pendingClaim.supervisorProcessStartId }
+						: {}),
+					supervisorGeneration: pendingClaim.supervisorGeneration,
+					supervisorOwnerToken: pendingClaim.supervisorOwnerToken,
+				};
+				let runningSuccessor: DaemonUpdateRestartProcessIdentity | undefined;
+				try {
+					runningSuccessor = validateReplacementDaemon(options.socketPath, hello, claimedPredecessor);
+				} catch {
+					// The claimed predecessor is still serving. Continue through its
+					// ordinary prepared-shutdown path below.
+				}
+				if (runningSuccessor) {
+					connectedClient.close();
+					connectedClient = undefined;
+					statusWriter.update({
+						phase: "restoring",
+						predecessor: claimedPredecessor,
+						successor: runningSuccessor,
+						counts: {
+							total: pendingManifest.sessions.length,
+							restored: 0,
+							resumed: 0,
+							failed: 0,
+						},
+					});
+					const restoreResult = await restoreDaemonUpdateRestart(
+						options.socketPath,
+						pendingManifest,
+						options.originActiveSessionId,
+						reportRestoreProgress,
+					);
+					const { failures, ...counts } = restoreResult;
+					if (failures.length === 0) {
+						clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+					}
+					statusWriter.update({
+						phase: "complete",
+						counts,
+						...(failures.length > 0 ? { failures } : {}),
+						message:
+							failures.length > 0
+								? "Planned restart handoff remains pending after a restore failure"
+								: "Completed the pending planned restart handoff",
+					});
+					return statusWriter.current();
+				}
+			}
 			predecessor = processIdentityFromDaemonHello(hello);
 			statusWriter.update({ phase: "preparing", ...(predecessor ? { predecessor } : {}) });
 			try {
@@ -1277,6 +1399,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 					options.socketPath,
 					options.agentDir,
 					hello,
+					options.handoffRequestId,
 				);
 			} catch (error: unknown) {
 				const daemonLacksPrepareCommand = isUnknownDaemonCommandError(error, "prepare_update_restart");
@@ -1310,7 +1433,9 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 								reportRestoreProgress,
 							);
 							const { failures: restoreFailures, ...counts } = restoreResult;
-							clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+							if (!manifest.handoff || restoreFailures.length === 0) {
+								clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+							}
 							statusWriter.update({
 								counts,
 								...(restoreFailures.length > 0 ? { failures: restoreFailures } : {}),
@@ -1363,7 +1488,9 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (!manifest.handoff || failures.length === 0) {
+				clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			}
 		}
 		statusWriter.update({
 			phase: "complete",
