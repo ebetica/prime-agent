@@ -364,6 +364,55 @@ describe("daemon supervisor resident workers", () => {
 		await client.request({ type: "shutdown" });
 		client.close();
 	}, 40_000);
+
+	it("gets and cancels queued actions through the supervisor socket", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-queue-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		expect(client.supportsServerCapability("queued_action_cancellation")).toBe(true);
+		const created = await client.request({
+			type: "create",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		if (!summary.workerPid) throw new Error("Resident worker did not expose its pid");
+		expect(summary.workerPid).not.toBe(supervisor.pid);
+		workerPids.add(summary.workerPid);
+		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
+			closeClientOnDispose: false,
+			recoverDaemon: async () => {},
+			supportsExtensionUi: false,
+		});
+
+		await startBlockingBash(client, activeSessionId, join(root, "queue-blocker.ready"));
+		await connection.followUp("same");
+		await connection.followUp("same");
+		await connection.followUp("last");
+
+		const initial = await connection.getQueuedUserActions();
+		expect(initial.map((action) => action.text)).toEqual(["same", "same", "last"]);
+		expect(new Set(initial.map((action) => action.id)).size).toBe(3);
+		expect(await connection.getQueuedUserActions()).toEqual(initial);
+		expect(await connection.cancelQueuedAction(initial[1]!.id)).toBe(true);
+		expect(await connection.cancelQueuedAction(initial[1]!.id)).toBe(false);
+		expect(await connection.cancelQueuedAction("missing-action")).toBe(false);
+		expect(await connection.getQueuedUserActions()).toEqual([initial[0], initial[2]]);
+
+		await client.request({ type: "abort_bash", activeSessionId });
+		await connection.dispose();
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+	}, 30_000);
+
 	it("lists, creates, and attaches passive children through their owning worker", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

@@ -96,6 +96,7 @@ import {
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -232,6 +233,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",
 	"get_queue",
 	"mutate_queued_message",
+	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
+
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",

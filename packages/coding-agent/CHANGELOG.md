@@ -28,6 +28,7 @@
 - Added crash-safe planned restart completion proofs plus authenticated acknowledgement and cancellation, with bounded terminal handoff reclamation.
 
 - Added capability-gated extension host requests for Python skills, bound to the current durable session outside the kernel.
+- Fixed resident daemons rejecting queued-action inspection and cancellation commands after advertising support for them.
 
 
 ## [0.7.0] - 2026-08-05
