@@ -1,10 +1,19 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
+import { ENV_AGENT_DIR, getCronJobsPath, getDaemonUpdateRestartManifestPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
@@ -15,6 +24,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import { collectDaemonLaunchEnv } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -29,6 +39,7 @@ const childDiagnostics = new WeakMap<ChildProcess, { stdout: string; stderr: str
 const PROCESS_STRESS_WORKERS = Number.parseInt(process.env.PRIME_AGENT_STRESS_WORKERS ?? "10", 10);
 
 afterEach(async () => {
+	delete process.env.PRIME_AGENT_OWNED_TEST;
 	for (const socketPath of daemonSockets) {
 		const client = new DaemonClient(socketPath);
 		try {
@@ -196,7 +207,11 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}\n` +
+			`stdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
+	);
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -479,11 +494,12 @@ describe("daemon supervisor resident workers", () => {
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 		const client = await connectEventually(socketPath, supervisor);
 		const launchEnvSentinel = `owned-env-${randomUUID()}`;
+		process.env.PRIME_AGENT_OWNED_TEST = launchEnvSentinel;
 		const created = await client.request({
 			type: "create",
 			sessionPath: sessionFile,
 			lifecycle: "client_owned",
-			launchEnv: { PRIME_AGENT_OWNED_TEST: launchEnvSentinel },
+			launchEnv: collectDaemonLaunchEnv(),
 			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 		});
 		expect(created.success).toBe(true);
@@ -492,6 +508,15 @@ describe("daemon supervisor resident workers", () => {
 			throw new Error("Client-owned worker did not expose its process identity");
 		}
 		workerPids.add(summary.workerPid);
+		const conflictingAttach = await client.request({
+			type: "attach",
+			activeSessionId: summary.activeSessionId,
+			launchEnv: { PRIME_AGENT_OWNED_TEST: "malicious-rebind" },
+		});
+		expect(conflictingAttach).toMatchObject({
+			success: false,
+			error: "Session launch environment does not match its immutable descriptor",
+		});
 
 		const publicList = await client.request({ type: "list" });
 		expect(publicList.success).toBe(true);
@@ -526,6 +551,7 @@ describe("daemon supervisor resident workers", () => {
 			ownedSession: true,
 			supportsExtensionUi: false,
 		});
+		delete process.env.PRIME_AGENT_OWNED_TEST;
 		await expect(connection.listHeartbeats()).resolves.toEqual([]);
 		await expect(connection.listCronJobs()).resolves.toEqual([]);
 		const cronResponse = await client.request({
@@ -559,6 +585,110 @@ describe("daemon supervisor resident workers", () => {
 		await client.request({ type: "shutdown" });
 		client.close();
 		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("checkpoints trusted launch environment separately from filtered client env", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-launch-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "launch env fixture", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Fixture session did not persist");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		const launchEnv = {
+			RECURSE_MODEL_POLICY: `trusted-policy-${randomUUID()}`,
+			RECURSE_SAFETY_DIR: join(root, "safety"),
+			PATH: `/trusted/skills:${process.env.PATH ?? "/usr/bin"}`,
+			RLM_MAX_DEPTH: "6",
+		};
+		const created = await client.request({
+			type: "create",
+			sessionPath: sessionFile,
+			lifecycle: "client_owned",
+			launchEnv,
+			env: { HERDR_PANE_ID: "pane-1", RECURSE_MODEL_POLICY: "malicious-client-policy" },
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Worker identity missing");
+		workerPids.add(summary.workerPid);
+		const persisted = await client.request({
+			type: "append_custom_message",
+			activeSessionId: summary.activeSessionId,
+			message: { customType: "launch_fixture", content: "persisted", display: false },
+		});
+		expect(persisted.success).toBe(true);
+		const promoted = await client.request({
+			type: "promote_owned_session",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(promoted.success).toBe(true);
+
+		const descriptor = readWorkerDescriptor(agentDir);
+		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
+		expect(JSON.stringify(descriptor)).not.toContain(launchEnv.RECURSE_MODEL_POLICY);
+		expect(descriptor.launchEnvDigest).toMatch(/^[a-f0-9]{64}$/);
+
+		const secondManager = SessionManager.create(projectDir, sessionDir);
+		secondManager.appendMessage({ role: "user", content: "second launch env fixture", timestamp: 2 });
+		const secondSessionFile = secondManager.getSessionFile();
+		if (!secondSessionFile) throw new Error("Second fixture session did not persist");
+		const secondLaunchEnv = {
+			RECURSE_MODEL_POLICY: `second-policy-${randomUUID()}`,
+			RECURSE_SAFETY_DIR: join(root, "second-safety"),
+			PATH: `/second/skills:${process.env.PATH ?? "/usr/bin"}`,
+			RLM_MAX_DEPTH: "3",
+		};
+		const secondCreated = await client.request({
+			type: "create",
+			sessionPath: secondSessionFile,
+			lifecycle: "client_owned",
+			launchEnv: secondLaunchEnv,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!secondCreated.success) throw new Error(secondCreated.error);
+		const secondSummary = requireSummary(secondCreated.data);
+		if (!secondSummary.activeSessionId || !secondSummary.workerPid) throw new Error("Second worker identity missing");
+		workerPids.add(secondSummary.workerPid);
+		const secondPersisted = await client.request({
+			type: "append_custom_message",
+			activeSessionId: secondSummary.activeSessionId,
+			message: { customType: "launch_fixture", content: "persisted", display: false },
+		});
+		expect(secondPersisted.success).toBe(true);
+		const secondPromoted = await client.request({
+			type: "promote_owned_session",
+			activeSessionId: secondSummary.activeSessionId,
+		});
+		expect(secondPromoted.success).toBe(true);
+
+		const prepared = await client.request({ type: "prepare_update_restart" }, 120_000);
+		if (!prepared.success) throw new Error(prepared.error);
+		const manifest = prepared.data as {
+			sessions: Array<{ launchEnv?: Record<string, string>; clientEnv?: Record<string, string> }>;
+		};
+		expect(manifest.sessions).toHaveLength(2);
+		expect(manifest.sessions).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ launchEnv, clientEnv: { HERDR_PANE_ID: "pane-1" } }),
+				expect.objectContaining({ launchEnv: secondLaunchEnv }),
+			]),
+		);
+		const manifestPath = getDaemonUpdateRestartManifestPath(socketPath, agentDir);
+		expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
+		expect(readFileSync(manifestPath, "utf8")).toContain(launchEnv.RECURSE_MODEL_POLICY);
+		await waitForProcessGone(summary.workerPid);
+		await waitForProcessGone(secondSummary.workerPid);
+		workerPids.delete(summary.workerPid);
+		workerPids.delete(secondSummary.workerPid);
+		client.close();
 	}, 60_000);
 
 	it("releases an adopted client-owned worker when disposal races supervisor replacement", async () => {

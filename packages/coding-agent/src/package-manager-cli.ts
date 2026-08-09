@@ -2,8 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { spawn } from "child_process";
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "fs";
-import { dirname, resolve, sep } from "path";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeSync,
+} from "fs";
+import { basename, dirname, join, resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
 	ensureInteractiveDaemonRunning,
@@ -569,6 +580,24 @@ function readOptionalStringRecord(value: unknown, fieldName: string): Record<str
 	return value as Record<string, string>;
 }
 
+function readRestartLaunchEnvironment(value: unknown): Record<string, string> | undefined {
+	const environment = readOptionalStringRecord(value, "launchEnv");
+	if (environment === undefined) return undefined;
+	const entries = Object.entries(environment);
+	if (entries.length > 256) throw new Error("Daemon update restart response contains too many launchEnv entries");
+	let bytes = 0;
+	const parsed: Record<string, string> = {};
+	for (const [key, entry] of entries) {
+		if (!key || key.length > 256 || key === "__proto__" || key === "prototype" || key === "constructor") {
+			throw new Error("Daemon update restart response contains an invalid launchEnv key");
+		}
+		bytes += Buffer.byteLength(key) + Buffer.byteLength(entry);
+		if (bytes > 256 * 1024) throw new Error("Daemon update restart response contains an oversized launchEnv");
+		parsed[key] = entry;
+	}
+	return parsed;
+}
+
 function isMessageContentBlock(value: unknown): value is TextContent | ImageContent {
 	return (
 		isRecord(value) &&
@@ -729,6 +758,7 @@ function parseDaemonUpdateRestartSession(value: unknown): DaemonUpdateRestartSes
 	if (!isRecord(config)) {
 		throw new Error("Daemon update restart response contains an invalid session config");
 	}
+	const launchEnv = readRestartLaunchEnvironment(value.launchEnv);
 	const clientEnv = readOptionalStringRecord(value.clientEnv, "clientEnv");
 	const runtimeMetadata = parseDaemonUpdateRestartRuntimeMetadata(value.runtimeMetadata);
 	return {
@@ -738,6 +768,7 @@ function parseDaemonUpdateRestartSession(value: unknown): DaemonUpdateRestartSes
 		cwd: readString(value.cwd, "cwd"),
 		config: config as DaemonUpdateRestartSession["config"],
 		...(runtimeMetadata ? { runtimeMetadata } : {}),
+		...(launchEnv !== undefined ? { launchEnv } : {}),
 		...(clientEnv ? { clientEnv } : {}),
 		queue: {
 			actions: parseSessionActionRecoverySnapshot(queue.actions),
@@ -757,7 +788,7 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	if (!isRecord(value)) {
 		throw new Error("Daemon update restart response is invalid");
 	}
-	if (value.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
+	if (value.formatVersion !== 1 && value.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
 		throw new Error(`Unsupported daemon update restart format version: ${String(value.formatVersion)}`);
 	}
 	const sessions = value.sessions;
@@ -788,16 +819,32 @@ function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: 
 		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
 		getLegacyDaemonUpdateRestartManifestPath(agentDir),
 	]) {
+		const directory = dirname(manifestPath);
+		let removed = false;
 		try {
 			rmSync(manifestPath);
-			const descriptor = openSync(dirname(manifestPath), "r");
+			removed = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		try {
+			const prefix = `${basename(manifestPath)}.`;
+			for (const name of readdirSync(directory)) {
+				if (name.startsWith(prefix) && name.endsWith(".tmp")) {
+					rmSync(join(directory, name), { force: true });
+					removed = true;
+				}
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (removed) {
+			const descriptor = openSync(directory, "r");
 			try {
 				fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);
 			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
 }
@@ -1096,6 +1143,7 @@ async function restoreDaemonUpdateRestartSession(
 			type: "create",
 			sessionPath: session.sessionFile,
 			config: session.config,
+			...(session.launchEnv !== undefined ? { launchEnv: { ...session.launchEnv } } : {}),
 			...(runtimeMetadata ? { runtimeMetadata } : {}),
 			...(session.clientEnv ? { env: session.clientEnv } : {}),
 		},
