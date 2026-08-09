@@ -683,6 +683,7 @@ describe("daemon supervisor resident workers", () => {
 		);
 		const manifestPath = getDaemonUpdateRestartManifestPath(socketPath, agentDir);
 		expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
+		expect(statSync(dirname(manifestPath)).mode & 0o777).toBe(0o700);
 		expect(readFileSync(manifestPath, "utf8")).toContain(launchEnv.RECURSE_MODEL_POLICY);
 		await waitForProcessGone(summary.workerPid);
 		await waitForProcessGone(secondSummary.workerPid);

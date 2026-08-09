@@ -5063,6 +5063,7 @@ export class DaemonSupervisor {
 		}
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		chmodSync(dirname(path), 0o700);
 		const tempPath = `${path}.${process.pid}.tmp`;
 		const descriptor = openSync(tempPath, "w", 0o600);
 		try {

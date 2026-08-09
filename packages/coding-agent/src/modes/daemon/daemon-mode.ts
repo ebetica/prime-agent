@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
@@ -5813,6 +5814,7 @@ export class AgentDaemon {
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
 		const directory = dirname(path);
 		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
 		const tempPath = `${path}.${process.pid}.tmp`;
 		const descriptor = openSync(tempPath, "w", 0o600);
 		try {
