@@ -1057,11 +1057,15 @@ export class DaemonSupervisor {
 				const preparedLaunchEnv = descriptor.sessionFile
 					? preparedLaunchEnvironments.get(canonicalSessionPath(descriptor.sessionFile))
 					: undefined;
+				const preparedLaunchEnvDigest = preparedLaunchEnv ? launchEnvironmentDigest(preparedLaunchEnv) : undefined;
 				const trustedLaunchEnv =
-					preparedLaunchEnv && descriptor.launchEnvDigest === launchEnvironmentDigest(preparedLaunchEnv)
+					preparedLaunchEnv &&
+					(descriptor.launchEnvDigest === undefined || descriptor.launchEnvDigest === preparedLaunchEnvDigest)
 						? preparedLaunchEnv
 						: undefined;
-				this.workers.set(descriptor.workerId, {
+				const migratedLaunchEnvDigest = trustedLaunchEnv !== undefined && !descriptor.launchEnvDigest;
+				if (migratedLaunchEnvDigest) descriptor.launchEnvDigest = preparedLaunchEnvDigest!;
+				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -1072,7 +1076,9 @@ export class DaemonSupervisor {
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
 					...(trustedLaunchEnv ? { launchEnv: { ...trustedLaunchEnv } } : {}),
-				});
+				};
+				this.workers.set(descriptor.workerId, worker);
+				if (migratedLaunchEnvDigest) this.persistWorker(worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -2438,6 +2444,14 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
+		if (existing && !existing.launchEnv && command.launchEnv !== undefined && command.sessionPath) {
+			const prepared = this.preparedLaunchEnvironments.get(canonicalSessionPath(command.sessionPath));
+			if (launchEnvironmentsEqual(prepared, command.launchEnv)) {
+				existing.launchEnv = { ...command.launchEnv };
+				existing.descriptor.launchEnvDigest = launchEnvironmentDigest(command.launchEnv);
+				this.persistWorker(existing);
+			}
+		}
 		let trustedResidentRestoreLaunchEnv: Record<string, string> | undefined;
 		if (!existing && !ownerClientId && command.launchEnv !== undefined) {
 			const prepared = command.sessionPath

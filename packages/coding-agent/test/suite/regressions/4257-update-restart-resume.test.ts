@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -1012,6 +1012,29 @@ describe("issue #4257 update restart resume", () => {
 				]),
 			},
 		});
+	});
+
+	it("refuses to persist credential-bearing launch environment overrides", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-sensitive",
+			createState(
+				harness,
+				"active-sensitive",
+				{ kind: "top-level", createdAt: Date.now() },
+				{
+					launchEnv: { ANTHROPIC_API_KEY: "must-not-persist" },
+				},
+			),
+		);
+		await expect(internals.prepareUpdateRestart()).rejects.toThrow(
+			"Cannot checkpoint sensitive launch environment key ANTHROPIC_API_KEY",
+		);
+		expect(existsSync(getDaemonUpdateRestartManifestPath(`${harness.tempDir}/daemon.sock`, harness.tempDir))).toBe(
+			false,
+		);
 	});
 
 	it("materializes queued in-memory drafts before update restart", async () => {
