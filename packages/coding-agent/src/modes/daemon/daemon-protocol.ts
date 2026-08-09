@@ -61,8 +61,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 16 adds transactional live resource-config replacement.
 // Revision 17 adds authenticated, durable planned-restart handoffs.
 // Revision 18 adds crash-safe completion proof and handoff acknowledgement/cancellation.
-export const DAEMON_SCHEMA_REVISION = 18;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-18-6afea788a5fb";
+// Revision 19 preserves immutable worker launch environment across planned restarts.
+export const DAEMON_SCHEMA_REVISION = 19;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-19-6afea788a5fb";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -210,10 +211,16 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+const RESTART_LAUNCH_ENV_KEYS = new Set(["PATH", "RECURSE_MODEL_POLICY", "RECURSE_SAFETY_DIR", "RLM_MAX_DEPTH"]);
+
+export function isDaemonRestartLaunchEnvKey(key: string): boolean {
+	return RESTART_LAUNCH_ENV_KEYS.has(key);
+}
+
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
-		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_")) {
+		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_") && isDaemonRestartLaunchEnvKey(key)) {
 			env[key] = value;
 		}
 	}
@@ -311,7 +318,7 @@ export interface DaemonAttachResult {
 	};
 }
 
-export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 1;
+export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 2;
 
 export interface DaemonUpdateRestartQueue {
 	actions: SessionActionRecoverySnapshot;
@@ -325,6 +332,8 @@ export interface DaemonUpdateRestartSession {
 	cwd: string;
 	config: AgentSessionRuntimeConfig;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
+	/** Trusted process launch overrides, distinct from allowlisted client identity env. */
+	launchEnv?: Record<string, string>;
 	clientEnv?: Record<string, string>;
 	queue: DaemonUpdateRestartQueue;
 	shouldResume: boolean;

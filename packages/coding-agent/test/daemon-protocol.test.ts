@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	collectDaemonLaunchEnv,
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
@@ -42,6 +43,23 @@ describe("daemon protocol helpers", () => {
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("keeps credential variables out of automatically collected launch overrides", () => {
+		expect(
+			collectDaemonLaunchEnv({
+				PATH: "/trusted/bin",
+				RECURSE_MODEL_POLICY: "policy",
+				ANTHROPIC_API_KEY: "secret",
+				SESSION_TOKEN: "secret",
+				GITHUB_PAT: "secret",
+				GOOGLE_APPLICATION_CREDENTIALS: "/secret.json",
+				PGPASSFILE: "/secret",
+				NETRC: "/secret",
+				NPM_CONFIG_REGISTRY_AUTH: "secret",
+				PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "internal",
+			}),
+		).toEqual({ PATH: "/trusted/bin", RECURSE_MODEL_POLICY: "policy" });
 	});
 
 	it("requires atomic reload compatibility only when idle admission is requested", () => {

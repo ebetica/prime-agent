@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +11,10 @@ import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
-import type { DaemonUpdateRestartManifest } from "../../../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+	type DaemonUpdateRestartManifest,
+} from "../../../src/modes/daemon/daemon-protocol.js";
 import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { prepareDaemonUpdateRestart } from "../../../src/package-manager-cli.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
@@ -61,7 +64,11 @@ function createState(
 	harness: Harness,
 	activeSessionId: string,
 	metadata: AgentSessionRuntime["metadata"],
-	options: { clientEnv?: Record<string, string>; onDispose?: () => void } = {},
+	options: {
+		clientEnv?: Record<string, string>;
+		launchEnv?: Record<string, string>;
+		onDispose?: () => void;
+	} = {},
 ): ActiveSessionState {
 	const runtime = {
 		session: harness.session,
@@ -82,6 +89,7 @@ function createState(
 		eventGeneration: `generation-${activeSessionId}`,
 		lastEventSequence: 0,
 		...(options.clientEnv ? { clientEnv: options.clientEnv } : {}),
+		...(options.launchEnv !== undefined ? { launchEnv: options.launchEnv } : {}),
 	};
 }
 
@@ -418,7 +426,7 @@ describe("issue #4257 update restart resume", () => {
 		});
 		Reflect.set(internals, "mutationDrain", mutationDrain);
 		const checkpoint = vi.spyOn(internals, "prepareUpdateRestartCheckpoint").mockResolvedValue({
-			formatVersion: 1,
+			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 			createdAt: "now",
 			sessions: [],
 		});
@@ -959,15 +967,33 @@ describe("issue #4257 update restart resume", () => {
 		});
 		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 
+		const launchEnv = {
+			RECURSE_MODEL_POLICY: "policy-json",
+			RECURSE_SAFETY_DIR: "/trusted/safety",
+			PATH: "/trusted/skills:/usr/bin",
+			RLM_MAX_DEPTH: "7",
+		};
 		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
-			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
+			createState(
+				harness,
+				"active-1",
+				{ kind: "top-level", createdAt: Date.now() },
+				{
+					clientEnv: { HERDR_PANE_ID: "pane-1" },
+					launchEnv,
+				},
+			),
 		);
 
 		const manifest = await internals.prepareUpdateRestart();
 
-		expect(manifest.formatVersion).toBe(1);
+		expect(manifest.formatVersion).toBe(DAEMON_UPDATE_RESTART_FORMAT_VERSION);
+		expect(manifest.sessions[0]).toMatchObject({
+			launchEnv,
+			clientEnv: { HERDR_PANE_ID: "pane-1" },
+		});
 		expect(manifest.sessions[0]?.queue.nextTurn).toEqual([pendingNextTurn]);
 		const recovered = manifest.sessions[0]?.queue.actions.actions[0];
 		expect(recovered).toMatchObject({
@@ -986,6 +1012,29 @@ describe("issue #4257 update restart resume", () => {
 				]),
 			},
 		});
+	});
+
+	it("refuses to persist credential-bearing launch environment overrides", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-sensitive",
+			createState(
+				harness,
+				"active-sensitive",
+				{ kind: "top-level", createdAt: Date.now() },
+				{
+					launchEnv: { ANTHROPIC_API_KEY: "must-not-persist" },
+				},
+			),
+		);
+		await expect(internals.prepareUpdateRestart()).rejects.toThrow(
+			"Cannot checkpoint unsupported launch environment key ANTHROPIC_API_KEY",
+		);
+		expect(existsSync(getDaemonUpdateRestartManifestPath(`${harness.tempDir}/daemon.sock`, harness.tempDir))).toBe(
+			false,
+		);
 	});
 
 	it("materializes queued in-memory drafts before update restart", async () => {

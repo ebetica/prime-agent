@@ -119,6 +119,8 @@ export interface DaemonWorkerDescriptor {
 	rootActiveSessionId: string;
 	/** Stable protocol client that owns this worker. Omitted for resident sessions. */
 	ownerClientId?: string;
+	/** Secret-free commitment to immutable process launch overrides. */
+	launchEnvDigest?: string;
 	rootSessionId?: string;
 	sessionFile?: string;
 	createdAt: string;

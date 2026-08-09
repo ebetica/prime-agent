@@ -51,6 +51,8 @@ export interface ActiveSessionState {
 	 * extensions capture identity at load. Subagents inherit the parent's.
 	 */
 	clientEnv?: Record<string, string>;
+	/** Immutable supervisor-provided process launch overrides, kept distinct from client env. */
+	launchEnv?: Record<string, string>;
 }
 
 export interface ActiveSessionExtensionUiRequest {
