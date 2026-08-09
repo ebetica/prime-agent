@@ -342,6 +342,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_session_entry_label",
 	"extension_ui_response",
 	"register_planned_restart_handoff",
+	"cancel_planned_restart_handoff",
+	"acknowledge_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -4643,6 +4645,8 @@ export class AgentDaemon {
 			}
 
 			case "register_planned_restart_handoff":
+			case "cancel_planned_restart_handoff":
+			case "acknowledge_planned_restart_handoff":
 			case "restore_planned_restart_handoff":
 				throw new Error("Planned restart handoffs require the daemon supervisor");
 

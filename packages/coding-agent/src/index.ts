@@ -290,7 +290,11 @@ export {
 export { AtomicResourceReloadRestartRequiredError } from "./modes/daemon/daemon-errors.js";
 // Run modes for programmatic SDK usage
 export {
+	type AcknowledgeDaemonPlannedRestartHandoffOptions,
+	acknowledgeDaemonPlannedRestartHandoff,
+	type CancelDaemonPlannedRestartHandoffOptions,
 	ClientPromptStashStore,
+	cancelDaemonPlannedRestartHandoff,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServices,
 	createInteractiveModeUiServicesFromServices,
@@ -314,8 +318,11 @@ export {
 	type DaemonOutbound,
 	type DaemonPlannedRestartBlocker,
 	type DaemonPlannedRestartClaim,
+	type DaemonPlannedRestartCompletion,
 	type DaemonPlannedRestartHandoff,
 	type DaemonPlannedRestartHandoffState,
+	type DaemonPlannedRestartLifecycleResult,
+	type DaemonPlannedRestartRestoredSession,
 	type DaemonPlannedRestartTarget,
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,

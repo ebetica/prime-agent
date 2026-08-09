@@ -142,6 +142,8 @@ import {
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
+	acknowledgePlannedRestartHandoff,
+	cancelPlannedRestartHandoff,
 	readPlannedRestartHandoff,
 	registerPlannedRestartHandoff,
 	updatePlannedRestartHandoff,
@@ -278,6 +280,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_session_entry_label",
 	"extension_ui_response",
 	"register_planned_restart_handoff",
+	"cancel_planned_restart_handoff",
+	"acknowledge_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -1734,6 +1738,42 @@ export class DaemonSupervisor {
 				const handoff = await this.registerPlannedRestartHandoff(command);
 				return success(command.id, command.type, handoff);
 			}
+			case "cancel_planned_restart_handoff": {
+				if (!command.workerToken) throw new Error("Planned restart worker token is required");
+				const match = await this.findWorker(
+					command.activeSessionId,
+					(worker) => worker.descriptor.authenticationToken === command.workerToken,
+				);
+				const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+				if (activeSessionId !== command.activeSessionId) {
+					throw new Error(`Unknown active session: ${command.activeSessionId}`);
+				}
+				const result = cancelPlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+					{ activeSessionId, sessionId: match.summary.sessionId },
+				);
+				return success(command.id, command.type, result);
+			}
+			case "acknowledge_planned_restart_handoff": {
+				await this.assertCurrentOwnership();
+				const owner = this.ownership?.record;
+				if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+				const result = acknowledgePlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+					command.acknowledgementToken,
+					{
+						supervisorGeneration: owner.generation,
+						supervisorOwnerToken: owner.token,
+						pid: process.pid,
+						...(owner.processStartId ? { processStartId: owner.processStartId } : {}),
+					},
+				);
+				return success(command.id, command.type, result);
+			}
 			case "restore_planned_restart_handoff": {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				const handoff = readPlannedRestartHandoff(
@@ -1742,7 +1782,10 @@ export class DaemonSupervisor {
 					command.requestId,
 				);
 				if (!handoff) throw new Error(`Unknown planned restart request: ${command.requestId}`);
-				if ((handoff.state !== "prepared" && handoff.state !== "delivered") || !handoff.claim) {
+				if (
+					(handoff.state !== "prepared" && handoff.state !== "delivered" && handoff.state !== "completed") ||
+					!handoff.claim
+				) {
 					throw new Error(`Planned restart request ${command.requestId} has no strict quiescence claim`);
 				}
 				const owner = this.ownership?.record;

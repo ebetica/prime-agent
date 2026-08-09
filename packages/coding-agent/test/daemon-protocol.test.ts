@@ -83,6 +83,10 @@ describe("daemon protocol helpers", () => {
 		).toContainEqual(compatibility);
 		expect(getDaemonCommandCompatibilities({ type: "prepare_update_restart" })).toEqual([{ minProtocol: 7 }]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff");
+		const lifecycle = { minProtocol: 7, minSchemaRevision: 18, capability: "planned_restart_handoff_lifecycle" };
+		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_planned_restart_handoff).toEqual(lifecycle);
+		expect(DAEMON_COMMAND_COMPATIBILITY.acknowledge_planned_restart_handoff).toEqual(lifecycle);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff_lifecycle");
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
