@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added durable, capability-gated planned restart handoffs that resume an owned idle session exactly once after its replacement daemon is ready.
+- Added crash-safe planned restart completion proofs plus authenticated acknowledgement and cancellation, with bounded terminal handoff reclamation.
 - Added capability-gated extension host requests for Python skills, bound to the current durable session outside the kernel.
 
 ## [0.7.0] - 2026-08-05

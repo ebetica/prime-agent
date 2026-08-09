@@ -5011,7 +5011,13 @@ export class AgentSession {
 			const marker = this._plannedRestartMarker(entry);
 			return marker?.completed === true && marker.actionId === actionId;
 		});
-		if (completed) return "already_admitted";
+		if (completed) {
+			const marker = this._plannedRestartMarker(completed);
+			if (marker?.message !== text) {
+				throw new Error(`Planned restart action ${actionId} conflicts with its completed message`);
+			}
+			return "already_admitted";
+		}
 		const existing = this._actionStore.ownedActions().find((action) => action.id === actionId);
 		if (existing) {
 			if (existing.payload.kind !== "turn" || existing.payload.text !== text) {

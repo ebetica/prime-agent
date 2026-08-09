@@ -214,6 +214,9 @@ describe("issue #4257 update restart resume", () => {
 		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
 			"already_admitted",
 		);
+		expect(() => harness.session.admitPlannedRestartContinuation("restart-action-1", "different nonce")).toThrow(
+			/conflicts with its completed message/,
+		);
 	});
 
 	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {

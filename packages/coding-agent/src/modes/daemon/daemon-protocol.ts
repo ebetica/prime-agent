@@ -60,8 +60,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 15 adds stable queued-user-action identities and atomic cancellation.
 // Revision 16 adds transactional live resource-config replacement.
 // Revision 17 adds authenticated, durable planned-restart handoffs.
-export const DAEMON_SCHEMA_REVISION = 17;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-538c44407310";
+// Revision 18 adds crash-safe completion proof and handoff acknowledgement/cancellation.
+export const DAEMON_SCHEMA_REVISION = 18;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-18-6afea788a5fb";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -103,7 +104,8 @@ export type DaemonServerCapability =
 	| "atomic_reload"
 	| "atomic_resource_reload"
 	| "queued_action_cancellation"
-	| "planned_restart_handoff";
+	| "planned_restart_handoff"
+	| "planned_restart_handoff_lifecycle";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -145,6 +147,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"atomic_resource_reload",
 	"queued_action_cancellation",
 	"planned_restart_handoff",
+	"planned_restart_handoff_lifecycle",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -339,7 +342,7 @@ export interface DaemonPlannedRestartTarget {
 	sessionFile: string;
 }
 
-export type DaemonPlannedRestartHandoffState = "registered" | "prepared" | "delivered" | "failed";
+export type DaemonPlannedRestartHandoffState = "registered" | "prepared" | "delivered" | "completed" | "failed";
 
 export interface DaemonPlannedRestartClaim {
 	claimedAt: string;
@@ -359,7 +362,46 @@ export interface DaemonPlannedRestartHandoff {
 	createdAt: string;
 	updatedAt: string;
 	claim?: DaemonPlannedRestartClaim;
+	completion?: DaemonPlannedRestartCompletion;
 	error?: string;
+}
+
+export interface DaemonPlannedRestartRestoredSession {
+	sourceActiveSessionId: string;
+	restoredActiveSessionId: string;
+	sessionId: string;
+}
+
+export interface DaemonPlannedRestartCompletion {
+	requestId: string;
+	actionId: string;
+	completedAt: string;
+	manifestDigest: string;
+	predecessor: {
+		pid: number;
+		processStartId?: string;
+		supervisorGeneration: string;
+		supervisorOwnerToken: string;
+	};
+	successor: {
+		pid: number;
+		processStartId?: string;
+		supervisorGeneration: string;
+		supervisorOwnerToken: string;
+	};
+	counts: { total: number; restored: number; resumed: number; failed: number };
+	restoredSessions: DaemonPlannedRestartRestoredSession[];
+	discardedActiveSessionIds: string[];
+	continuation: {
+		sessionId: string;
+		restoredActiveSessionId: string;
+		admissionStatus: "admitted" | "already_admitted";
+	};
+	acknowledgementToken: string;
+}
+
+export interface DaemonPlannedRestartLifecycleResult {
+	status: "acknowledged" | "already_acknowledged" | "cancelled" | "already_cancelled";
 }
 
 export interface DaemonPlannedRestartBlocker {
@@ -676,6 +718,19 @@ export type DaemonCommand =
 			workerToken: string;
 			message: string;
 	  }
+	| {
+			id?: string;
+			type: "cancel_planned_restart_handoff";
+			requestId: string;
+			activeSessionId: string;
+			workerToken: string;
+	  }
+	| {
+			id?: string;
+			type: "acknowledge_planned_restart_handoff";
+			requestId: string;
+			acknowledgementToken: string;
+	  }
 	| { id?: string; type: "prepare_update_restart"; handoffRequestId?: string }
 	| { id?: string; type: "retry_worker"; activeSessionId: string }
 	| { id?: string; type: "restart" }
@@ -728,6 +783,11 @@ const PLANNED_RESTART_HANDOFF_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 17,
 	capability: "planned_restart_handoff",
+} as const;
+const PLANNED_RESTART_LIFECYCLE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 18,
+	capability: "planned_restart_handoff_lifecycle",
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 
@@ -829,6 +889,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_session_entry_label: LEGACY_DAEMON_COMMAND,
 	extension_ui_response: LEGACY_DAEMON_COMMAND,
 	register_planned_restart_handoff: PLANNED_RESTART_HANDOFF_COMMAND,
+	cancel_planned_restart_handoff: PLANNED_RESTART_LIFECYCLE_COMMAND,
+	acknowledge_planned_restart_handoff: PLANNED_RESTART_LIFECYCLE_COMMAND,
 	prepare_update_restart: LEGACY_DAEMON_COMMAND,
 	retry_worker: LEGACY_DAEMON_COMMAND,
 	restart: LEGACY_DAEMON_COMMAND,

@@ -83,8 +83,11 @@ export type {
 	DaemonOutbound,
 	DaemonPlannedRestartBlocker,
 	DaemonPlannedRestartClaim,
+	DaemonPlannedRestartCompletion,
 	DaemonPlannedRestartHandoff,
 	DaemonPlannedRestartHandoffState,
+	DaemonPlannedRestartLifecycleResult,
+	DaemonPlannedRestartRestoredSession,
 	DaemonPlannedRestartTarget,
 	DaemonProtocolInfo,
 	DaemonProtocolName,
@@ -105,6 +108,10 @@ export { resolveAttachModelFallbackMessage } from "./daemon/daemon-session-list.
 export { defaultDaemonSocketPath } from "./daemon/daemon-socket.js";
 export { runDaemonSupervisorMode } from "./daemon/daemon-supervisor.js";
 export {
+	type AcknowledgeDaemonPlannedRestartHandoffOptions,
+	acknowledgeDaemonPlannedRestartHandoff,
+	type CancelDaemonPlannedRestartHandoffOptions,
+	cancelDaemonPlannedRestartHandoff,
 	type RegisterDaemonPlannedRestartHandoffOptions,
 	registerDaemonPlannedRestartHandoff,
 } from "./daemon/planned-restart-client.js";
