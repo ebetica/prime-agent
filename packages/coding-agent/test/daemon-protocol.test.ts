@@ -20,6 +20,7 @@ import {
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 
@@ -162,7 +163,8 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability-gates queued action identity and cancellation", () => {
-		for (const command of ["get_queued_user_actions", "cancel_queued_action"] as const) {
+		expect(QUEUED_ACTION_CANCELLATION_COMMAND_TYPES).toEqual(["get_queued_user_actions", "cancel_queued_action"]);
+		for (const command of QUEUED_ACTION_CANCELLATION_COMMAND_TYPES) {
 			expect(DAEMON_COMMAND_COMPATIBILITY[command]).toEqual({
 				minProtocol: 7,
 				minSchemaRevision: 15,
