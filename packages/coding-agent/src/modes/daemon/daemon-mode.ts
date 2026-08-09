@@ -177,7 +177,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
-	isSensitiveDaemonLaunchEnvKey,
+	isDaemonRestartLaunchEnvKey,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -5738,9 +5738,9 @@ export class AgentDaemon {
 	}
 
 	private createUpdateRestartSession(state: ActiveSessionState): DaemonUpdateRestartSession | undefined {
-		const sensitiveLaunchKey = Object.keys(state.launchEnv ?? {}).find(isSensitiveDaemonLaunchEnvKey);
-		if (sensitiveLaunchKey) {
-			throw new Error(`Cannot checkpoint sensitive launch environment key ${sensitiveLaunchKey}`);
+		const unsupportedLaunchKey = Object.keys(state.launchEnv ?? {}).find((key) => !isDaemonRestartLaunchEnvKey(key));
+		if (unsupportedLaunchKey) {
+			throw new Error(`Cannot checkpoint unsupported launch environment key ${unsupportedLaunchKey}`);
 		}
 		const session = state.runtime.session;
 		const queue = {

@@ -1030,7 +1030,7 @@ describe("issue #4257 update restart resume", () => {
 			),
 		);
 		await expect(internals.prepareUpdateRestart()).rejects.toThrow(
-			"Cannot checkpoint sensitive launch environment key ANTHROPIC_API_KEY",
+			"Cannot checkpoint unsupported launch environment key ANTHROPIC_API_KEY",
 		);
 		expect(existsSync(getDaemonUpdateRestartManifestPath(`${harness.tempDir}/daemon.sock`, harness.tempDir))).toBe(
 			false,

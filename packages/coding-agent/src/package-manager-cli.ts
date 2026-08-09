@@ -70,6 +70,7 @@ import {
 	type DaemonPlannedRestartRestoredSession,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
+	isDaemonRestartLaunchEnvKey,
 	isUnknownDaemonCommandError,
 } from "./modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath } from "./modes/daemon/daemon-socket.js";
@@ -759,6 +760,10 @@ function parseDaemonUpdateRestartSession(value: unknown): DaemonUpdateRestartSes
 		throw new Error("Daemon update restart response contains an invalid session config");
 	}
 	const launchEnv = readRestartLaunchEnvironment(value.launchEnv);
+	const unsupportedLaunchKey = Object.keys(launchEnv ?? {}).find((key) => !isDaemonRestartLaunchEnvKey(key));
+	if (unsupportedLaunchKey) {
+		throw new Error(`Daemon update restart response contains an unsupported launchEnv key: ${unsupportedLaunchKey}`);
+	}
 	const clientEnv = readOptionalStringRecord(value.clientEnv, "clientEnv");
 	const runtimeMetadata = parseDaemonUpdateRestartRuntimeMetadata(value.runtimeMetadata);
 	return {

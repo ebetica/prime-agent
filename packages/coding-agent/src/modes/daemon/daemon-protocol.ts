@@ -211,16 +211,16 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
-const SENSITIVE_LAUNCH_ENV_KEY = /(?:^|_)(?:AUTH|COOKIE|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)(?:_|$)/i;
+const RESTART_LAUNCH_ENV_KEYS = new Set(["PATH", "RECURSE_MODEL_POLICY", "RECURSE_SAFETY_DIR", "RLM_MAX_DEPTH"]);
 
-export function isSensitiveDaemonLaunchEnvKey(key: string): boolean {
-	return SENSITIVE_LAUNCH_ENV_KEY.test(key);
+export function isDaemonRestartLaunchEnvKey(key: string): boolean {
+	return RESTART_LAUNCH_ENV_KEYS.has(key);
 }
 
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
-		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_") && !isSensitiveDaemonLaunchEnvKey(key)) {
+		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_") && isDaemonRestartLaunchEnvKey(key)) {
 			env[key] = value;
 		}
 	}

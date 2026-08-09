@@ -52,6 +52,11 @@ describe("daemon protocol helpers", () => {
 				RECURSE_MODEL_POLICY: "policy",
 				ANTHROPIC_API_KEY: "secret",
 				SESSION_TOKEN: "secret",
+				GITHUB_PAT: "secret",
+				GOOGLE_APPLICATION_CREDENTIALS: "/secret.json",
+				PGPASSFILE: "/secret",
+				NETRC: "/secret",
+				NPM_CONFIG_REGISTRY_AUTH: "secret",
 				PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "internal",
 			}),
 		).toEqual({ PATH: "/trusted/bin", RECURSE_MODEL_POLICY: "policy" });
