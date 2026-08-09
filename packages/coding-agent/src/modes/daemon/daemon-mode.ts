@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
@@ -176,6 +177,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
+	isDaemonRestartLaunchEnvKey,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -1220,6 +1222,7 @@ export class AgentDaemon {
 		runtime: AgentSessionRuntime,
 		name?: string,
 		clientEnv?: Record<string, string>,
+		launchEnv?: Record<string, string>,
 		onStateCreated?: (state: ActiveSessionState) => void,
 		runtimeOpenGuard?: RuntimeOpenGuard,
 		onStateBound?: (state: ActiveSessionState) => void,
@@ -1242,6 +1245,7 @@ export class AgentDaemon {
 			eventGeneration: createActiveSessionId(),
 			lastEventSequence: 0,
 			clientEnv,
+			launchEnv: launchEnv === undefined ? undefined : { ...launchEnv },
 		};
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
@@ -1549,6 +1553,7 @@ export class AgentDaemon {
 				runtime,
 				command.name,
 				clientEnv,
+				command.launchEnv,
 				(state) => {
 					stateRef = state;
 				},
@@ -2407,6 +2412,7 @@ export class AgentDaemon {
 			runtime,
 			undefined,
 			parentState.clientEnv,
+			parentState.launchEnv,
 			(state) => {
 				stateRef = state;
 			},
@@ -2806,6 +2812,7 @@ export class AgentDaemon {
 				runtime,
 				undefined,
 				hydrationEnv,
+				parentState.launchEnv,
 				(createdState) => {
 					stateRef = createdState;
 				},
@@ -5741,6 +5748,10 @@ export class AgentDaemon {
 	}
 
 	private createUpdateRestartSession(state: ActiveSessionState): DaemonUpdateRestartSession | undefined {
+		const unsupportedLaunchKey = Object.keys(state.launchEnv ?? {}).find((key) => !isDaemonRestartLaunchEnvKey(key));
+		if (unsupportedLaunchKey) {
+			throw new Error(`Cannot checkpoint unsupported launch environment key ${unsupportedLaunchKey}`);
+		}
 		const session = state.runtime.session;
 		const queue = {
 			actions: session.getSessionActionRecoverySnapshot(),
@@ -5781,6 +5792,7 @@ export class AgentDaemon {
 				cwd: session.sessionManager.getCwd(),
 			},
 			runtimeMetadata: state.runtime.metadata,
+			...(state.launchEnv !== undefined ? { launchEnv: { ...state.launchEnv } } : {}),
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),
 			queue,
 			shouldResume,
@@ -5815,8 +5827,24 @@ export class AgentDaemon {
 
 	private writeUpdateRestartManifest(manifest: DaemonUpdateRestartManifest): void {
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(manifest)}\n`);
+		const directory = dirname(path);
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
+		const tempPath = `${path}.${process.pid}.tmp`;
+		const descriptor = openSync(tempPath, "w", 0o600);
+		try {
+			writeSync(descriptor, `${JSON.stringify(manifest)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(directory, "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	}
 
 	private getUpdateRestartSessionDepth(state: ActiveSessionState): number {

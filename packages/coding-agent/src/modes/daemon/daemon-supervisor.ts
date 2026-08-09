@@ -14,7 +14,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
@@ -446,6 +446,21 @@ function withoutPendingResourceReload(descriptor: DaemonWorkerDescriptor): Daemo
 	return committed;
 }
 
+function launchEnvironmentDigest(environment: Record<string, string>): string {
+	const canonical = Object.keys(environment)
+		.sort()
+		.map((key) => [key, environment[key]] as const);
+	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function launchEnvironmentsEqual(
+	left: Record<string, string> | undefined,
+	right: Record<string, string> | undefined,
+): boolean {
+	if (left === undefined || right === undefined) return left === right;
+	return launchEnvironmentDigest(left) === launchEnvironmentDigest(right);
+}
+
 function isSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
 		return false;
@@ -469,6 +484,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.launchEnvDigest === undefined || /^[a-f0-9]{64}$/.test(descriptor.launchEnvDigest)) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -641,6 +657,8 @@ export class DaemonSupervisor {
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
+	private preparedLaunchEnvironments = new Map<string, Record<string, string>>();
+
 	private readonly resourceReloadTails = new Map<string, Promise<void>>();
 
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
@@ -964,7 +982,74 @@ export class DaemonSupervisor {
 		};
 	}
 
+	private loadPreparedLaunchEnvironments(): Map<string, Record<string, string>> {
+		const environments = new Map<string, Record<string, string>>();
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) return environments;
+		try {
+			const manifestPath = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
+			const directory = dirname(manifestPath);
+			const tempPrefix = `${basename(manifestPath)}.`;
+			let removedTemp = false;
+			for (const name of readdirSync(directory)) {
+				if (name.startsWith(tempPrefix) && name.endsWith(".tmp")) {
+					rmSync(join(directory, name), { force: true });
+					removedTemp = true;
+				}
+			}
+			if (removedTemp) {
+				const descriptor = openSync(directory, "r");
+				try {
+					fsyncSync(descriptor);
+				} finally {
+					closeSync(descriptor);
+				}
+			}
+			const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+				formatVersion?: unknown;
+				sessions?: unknown;
+			};
+			if (parsed.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION || !Array.isArray(parsed.sessions)) {
+				return environments;
+			}
+			for (const candidate of parsed.sessions) {
+				if (!candidate || typeof candidate !== "object") continue;
+				const session = candidate as { sessionFile?: unknown; launchEnv?: unknown };
+				if (
+					typeof session.sessionFile !== "string" ||
+					!session.launchEnv ||
+					typeof session.launchEnv !== "object"
+				) {
+					continue;
+				}
+				const entries = Object.entries(session.launchEnv);
+				if (
+					entries.length > 256 ||
+					entries.some(
+						([key, value]) =>
+							!key ||
+							key.length > 256 ||
+							key === "__proto__" ||
+							key === "prototype" ||
+							key === "constructor" ||
+							typeof value !== "string",
+					)
+				) {
+					continue;
+				}
+				const environment = Object.fromEntries(entries) as Record<string, string>;
+				if (Buffer.byteLength(JSON.stringify(environment)) > 256 * 1024) continue;
+				environments.set(canonicalSessionPath(session.sessionFile), environment);
+			}
+		} catch {
+			// No committed restart checkpoint is the normal startup case.
+		}
+		return environments;
+	}
+
 	private loadWorkerDescriptors(): void {
+		this.preparedLaunchEnvironments = this.loadPreparedLaunchEnvironments();
+		const preparedLaunchEnvironments = this.preparedLaunchEnvironments;
 		for (const name of readdirSync(this.descriptorDir)) {
 			if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) {
 				continue;
@@ -978,7 +1063,18 @@ export class DaemonSupervisor {
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
-				this.workers.set(descriptor.workerId, {
+				const preparedLaunchEnv = descriptor.sessionFile
+					? preparedLaunchEnvironments.get(canonicalSessionPath(descriptor.sessionFile))
+					: undefined;
+				const preparedLaunchEnvDigest = preparedLaunchEnv ? launchEnvironmentDigest(preparedLaunchEnv) : undefined;
+				const trustedLaunchEnv =
+					preparedLaunchEnv &&
+					(descriptor.launchEnvDigest === undefined || descriptor.launchEnvDigest === preparedLaunchEnvDigest)
+						? preparedLaunchEnv
+						: undefined;
+				const migratedLaunchEnvDigest = trustedLaunchEnv !== undefined && !descriptor.launchEnvDigest;
+				if (migratedLaunchEnvDigest) descriptor.launchEnvDigest = preparedLaunchEnvDigest!;
+				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -988,7 +1084,10 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
-				});
+					...(trustedLaunchEnv ? { launchEnv: { ...trustedLaunchEnv } } : {}),
+				};
+				this.workers.set(descriptor.workerId, worker);
+				if (migratedLaunchEnvDigest) this.persistWorker(worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -2255,6 +2354,14 @@ export class DaemonSupervisor {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
 				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+			if (activeMatches.length === 1) {
+				return this.reuseWorkerForCreate(
+					activeMatches[0]!.worker,
+					ownerClientId,
+					command.sessionPath,
+					command.launchEnv,
+				);
+
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2267,6 +2374,9 @@ export class DaemonSupervisor {
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
 				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
+			if (existing) {
+				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, createCommand.launchEnv);
+
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -2309,8 +2419,12 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		launchEnv?: Record<string, string>,
 	): ResidentWorker {
 		if (worker.descriptor.ownerClientId === ownerClientId) {
+			if (launchEnv !== undefined && worker.descriptor.launchEnvDigest !== launchEnvironmentDigest(launchEnv)) {
+				throw new Error("Session launch environment does not match its immutable descriptor");
+			}
 			return worker;
 		}
 		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
@@ -2377,7 +2491,6 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		worker.launchEnv = undefined;
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
@@ -2391,8 +2504,31 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
-		const launchEnv =
-			ownerClientId || existing?.descriptor.ownerClientId ? (command.launchEnv ?? existing?.launchEnv) : undefined;
+		if (existing && !existing.launchEnv && command.launchEnv !== undefined && command.sessionPath) {
+			const prepared = this.preparedLaunchEnvironments.get(canonicalSessionPath(command.sessionPath));
+			if (launchEnvironmentsEqual(prepared, command.launchEnv)) {
+				existing.launchEnv = { ...command.launchEnv };
+				existing.descriptor.launchEnvDigest = launchEnvironmentDigest(command.launchEnv);
+				this.persistWorker(existing);
+			}
+		}
+		let trustedResidentRestoreLaunchEnv: Record<string, string> | undefined;
+		if (!existing && !ownerClientId && command.launchEnv !== undefined) {
+			const prepared = command.sessionPath
+				? this.preparedLaunchEnvironments.get(canonicalSessionPath(command.sessionPath))
+				: undefined;
+			if (!launchEnvironmentsEqual(prepared, command.launchEnv)) {
+				throw new Error("Resident launch environment is not authorized by the prepared restart checkpoint");
+			}
+			trustedResidentRestoreLaunchEnv = { ...command.launchEnv };
+		}
+		const launchEnv = existing
+			? existing.launchEnv
+			: ownerClientId
+				? command.launchEnv === undefined
+					? undefined
+					: { ...command.launchEnv }
+				: trustedResidentRestoreLaunchEnv;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2470,6 +2606,7 @@ export class DaemonSupervisor {
 				authenticationToken: token,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
+				...(launchEnv !== undefined ? { launchEnvDigest: launchEnvironmentDigest(launchEnv) } : {}),
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
@@ -2527,7 +2664,11 @@ export class DaemonSupervisor {
 				child.unref();
 			}
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
-			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
+			// The worker needs the exact immutable launch overrides for a future
+			// checkpoint, but they must never enter the durable worker descriptor.
+			const workerCreateCommand: DaemonCreateCommand =
+				launchEnv === undefined ? createCommand : { ...createCommand, launchEnv: { ...launchEnv } };
+			const response = await client.request(withoutCommandId(workerCreateCommand), WORKER_REQUEST_TIMEOUT_MS);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
 			}
@@ -3052,6 +3193,12 @@ export class DaemonSupervisor {
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
+			return;
+		}
+		if (worker.descriptor.launchEnvDigest && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for the trusted launch environment checkpoint";
+			this.persistWorker(worker);
 			return;
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
@@ -3638,6 +3785,26 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
+		if (command.launchEnv !== undefined) {
+			const descriptorMatches = [...this.workers.values()].filter(
+				(worker) =>
+					worker.descriptor.rootActiveSessionId === command.activeSessionId ||
+					worker.descriptor.rootSessionId === command.activeSessionId,
+			);
+			if (descriptorMatches.length === 1) {
+				const worker = descriptorMatches[0]!;
+				const expectedDigest = worker.descriptor.launchEnvDigest;
+				if (expectedDigest) {
+					if (expectedDigest !== launchEnvironmentDigest(command.launchEnv)) {
+						throw new Error("Session launch environment does not match its immutable descriptor");
+					}
+					if (worker.launchEnv === undefined) worker.launchEnv = { ...command.launchEnv };
+					else if (!launchEnvironmentsEqual(worker.launchEnv, command.launchEnv)) {
+						throw new Error("Session launch environment is immutable");
+					}
+				}
+			}
+		}
 		const ownedWorker = [...this.workers.values()].find(
 			(worker) =>
 				worker.descriptor.ownerClientId !== undefined &&
@@ -3650,6 +3817,21 @@ export class DaemonSupervisor {
 			}
 			this.assertTelemetryAttachAllowed(ownedWorker, command.telemetryDisabled);
 			ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
+			if (command.launchEnv !== undefined) {
+				const digest = launchEnvironmentDigest(command.launchEnv);
+				if (ownedWorker.descriptor.launchEnvDigest && ownedWorker.descriptor.launchEnvDigest !== digest) {
+					throw new Error("Session launch environment does not match its immutable descriptor");
+				}
+				if (!ownedWorker.descriptor.launchEnvDigest) {
+					ownedWorker.descriptor.launchEnvDigest = digest;
+					this.persistWorker(ownedWorker);
+				}
+				if (ownedWorker.launchEnv === undefined) ownedWorker.launchEnv = { ...command.launchEnv };
+				else if (!launchEnvironmentsEqual(ownedWorker.launchEnv, command.launchEnv)) {
+					throw new Error("Session launch environment is immutable");
+				}
+			}
+
 			if (!ownedWorker.client || ownedWorker.descriptor.lifecycle !== "ready") {
 				if (!ownedWorker.launchEnv) {
 					throw new Error("Client-owned session recovery requires the owning client environment");
@@ -3666,6 +3848,21 @@ export class DaemonSupervisor {
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
+		if (
+			command.launchEnv !== undefined &&
+			match.worker.descriptor.ownerClientId === undefined &&
+			match.worker.descriptor.launchEnvDigest
+		) {
+			const digest = launchEnvironmentDigest(command.launchEnv);
+			if (match.worker.descriptor.launchEnvDigest !== digest) {
+				throw new Error("Session launch environment does not match its immutable descriptor");
+			}
+			if (match.worker.launchEnv === undefined) match.worker.launchEnv = { ...command.launchEnv };
+			else if (!launchEnvironmentsEqual(match.worker.launchEnv, command.launchEnv)) {
+				throw new Error("Session launch environment is immutable");
+			}
+		}
+
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {
@@ -4820,6 +5017,9 @@ export class DaemonSupervisor {
 				if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
 					throw new Error(`Worker returned unsupported update manifest version ${manifest.formatVersion}`);
 				}
+				if (manifest.sessions.some((session) => !launchEnvironmentsEqual(session.launchEnv, worker.launchEnv))) {
+					throw new Error(`Worker ${worker.descriptor.workerId} returned an untrusted launch environment`);
+				}
 				if (
 					!manifest.sessions.some(
 						(session) => session.activeSessionId === worker.descriptor.rootActiveSessionId,
@@ -5008,6 +5208,7 @@ export class DaemonSupervisor {
 		}
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		chmodSync(dirname(path), 0o700);
 		const tempPath = `${path}.${process.pid}.tmp`;
 		const descriptor = openSync(tempPath, "w", 0o600);
 		try {
