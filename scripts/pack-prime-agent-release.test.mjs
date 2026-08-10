@@ -8,17 +8,21 @@ import test from "node:test";
 import {
 	createReleaseManifest,
 	createReleasePackageJson,
+	internalTarballUrl,
 	normalizePackageVersion,
 	npmTarballName,
-	releaseTarballUrl,
+	parseArgs,
 } from "./pack-prime-agent-release.mjs";
 
 test("keeps stable metadata, manifest, filenames, and R2 URLs on the package version", () => {
+	const args = parseArgs(["--base-url", "https://downloads.example/"]);
 	const packageVersion = normalizePackageVersion("0.7.1-recurse.8");
 	const stable = `v${packageVersion}`;
 	const coreFile = npmTarballName("prime-agent-core", packageVersion);
 	const cliFile = npmTarballName("prime-agent", packageVersion);
-	const coreUrl = releaseTarballUrl("https://downloads.example", packageVersion, coreFile);
+	assert.equal(args.baseUrl, "https://downloads.example");
+	assert.equal(args.internalBaseUrl, undefined);
+	const coreUrl = internalTarballUrl(args.baseUrl, args.internalBaseUrl, packageVersion, coreFile);
 	const packageJson = createReleasePackageJson(
 		{
 			name: "@earendil-works/pi-coding-agent",
@@ -45,6 +49,81 @@ test("keeps stable metadata, manifest, filenames, and R2 URLs on the package ver
 		tarball: "releases/v0.7.1-recurse.8/prime-agent-0.7.1-recurse.8.tgz",
 		tarballs: [{ package: "prime-agent", file: cliFile, sha256: "abc123" }],
 	});
+});
+
+test("uses one GitHub release directory for every internal dependency", () => {
+	const packageVersion = "0.7.1-recurse.8";
+	const args = parseArgs([
+		"--base-url",
+		"https://downloads.example",
+		"--internal-base-url",
+		"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8",
+	]);
+	const internalBaseUrl = args.internalBaseUrl;
+	const internalPackages = [
+		["@earendil-works/pi-ai", "prime-agent-ai"],
+		["@earendil-works/pi-agent-core", "prime-agent-core"],
+		["@earendil-works/pi-tui", "prime-agent-tui"],
+	];
+	const internalPackageUrls = new Map(
+		internalPackages.map(([packageName, artifactName]) => {
+			const file = npmTarballName(artifactName, packageVersion);
+			return [
+				packageName,
+				internalTarballUrl("https://downloads.example", internalBaseUrl, packageVersion, file),
+			];
+		}),
+	);
+	const packageJson = createReleasePackageJson(
+		{
+			name: "@earendil-works/pi-coding-agent",
+			version: "0.7.0",
+			dependencies: Object.fromEntries(internalPackages.map(([name]) => [name, "^0.7.0"])),
+		},
+		"prime-agent",
+		packageVersion,
+		internalPackageUrls,
+	);
+
+	assert.deepEqual(packageJson.dependencies, {
+		"@earendil-works/pi-ai":
+			"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8/prime-agent-ai-0.7.1-recurse.8.tgz",
+		"@earendil-works/pi-agent-core":
+			"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8/prime-agent-core-0.7.1-recurse.8.tgz",
+		"@earendil-works/pi-tui":
+			"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8/prime-agent-tui-0.7.1-recurse.8.tgz",
+	});
+});
+
+test("validates and normalizes the internal dependency base URL", () => {
+	assert.equal(
+		parseArgs([
+			"--base-url",
+			"https://downloads.example",
+			"--internal-base-url",
+			"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8///",
+		]).internalBaseUrl,
+		"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8/",
+	);
+
+	for (const value of [
+		"releases/download/v0.7.0.8",
+		"https:github.com/ebetica/prime-agent/releases/download/v0.7.0.8",
+		"http://github.com/ebetica/prime-agent/releases/download/v0.7.0.8",
+		"https://user:secret@github.com/ebetica/prime-agent/releases/download/v0.7.0.8",
+		"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8?token=secret",
+		"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8#assets",
+		"https://github.com/ebetica/../prime-agent/releases/download/v0.7.0.8",
+		"https://github.com/ebetica/%2e%2e/prime-agent/releases/download/v0.7.0.8",
+		"https://github.com/ebetica/%252e%252e/prime-agent/releases/download/v0.7.0.8",
+		"https://github.com/ebetica/prime-agent/releases/download/v0.7.0.8\n",
+		"https://github.com/ebetica/prime-agent/releases/download/%0av0.7.0.8",
+	]) {
+		assert.throws(
+			() => parseArgs(["--base-url", "https://downloads.example", "--internal-base-url", value]),
+			/--internal-base-url/,
+		);
+	}
 });
 
 test("requires package versions to be valid SemVer", () => {

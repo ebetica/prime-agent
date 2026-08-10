@@ -32,10 +32,11 @@ const releasePackages = [
 	{ packageDir: "coding-agent", publicName: publicPackageName, artifactName: publicPackageName },
 ];
 
-function parseArgs(args) {
+export function parseArgs(args) {
 	const parsed = {
 		baseUrl: defaultBaseUrl,
 		channel: "stable",
+		internalBaseUrl: undefined,
 		outDir: defaultOutputDir,
 		version: undefined,
 	};
@@ -56,6 +57,13 @@ function parseArgs(args) {
 				const value = args[i + 1];
 				if (!value) throw new Error("--base-url requires a value");
 				parsed.baseUrl = value;
+				i += 1;
+				break;
+			}
+			case "--internal-base-url": {
+				const value = args[i + 1];
+				if (!value) throw new Error("--internal-base-url requires a value");
+				parsed.internalBaseUrl = normalizeInternalBaseUrl(value);
 				i += 1;
 				break;
 			}
@@ -92,10 +100,12 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version semver] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--internal-base-url url] [--channel stable|beta] [--version semver] [--out-dir path]
 
-Creates private npm tarballs for R2 distribution. --version selects package.json
-versions, filenames, and the release download path.
+Creates private npm tarballs for distribution. --version selects package.json
+versions and filenames. --base-url controls release metadata and, by default,
+the internal dependency download path. --internal-base-url overrides only the
+complete directory URL for internal dependency tarballs.
 
   <out-dir>/artifacts/prime-agent-<version>.tgz
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
@@ -117,6 +127,52 @@ export function normalizePackageVersion(version) {
 		throw new Error(`Invalid package version (expected SemVer): ${version}`);
 	}
 	return normalized;
+}
+
+export function normalizeInternalBaseUrl(value) {
+	if (typeof value !== "string" || !/^https:\/\//i.test(value)) {
+		throw new Error("--internal-base-url must be an absolute https URL");
+	}
+	if (/[\u0000-\u001f\u007f]/.test(value)) {
+		throw new Error("--internal-base-url must not contain control characters");
+	}
+
+	let url;
+	try {
+		url = new URL(value);
+	} catch {
+		throw new Error("--internal-base-url must be an absolute https URL");
+	}
+	if (url.protocol !== "https:") {
+		throw new Error("--internal-base-url must be an absolute https URL");
+	}
+	if (url.username || url.password) {
+		throw new Error("--internal-base-url must not contain credentials");
+	}
+	if (url.search || url.hash) {
+		throw new Error("--internal-base-url must not contain a query or fragment");
+	}
+
+	const authorityAndPath = value.slice(value.indexOf("://") + 3);
+	const pathStart = authorityAndPath.search(/[\/\\]/);
+	let decodedPath = pathStart === -1 ? "" : authorityAndPath.slice(pathStart);
+	try {
+		for (;;) {
+			const decoded = decodeURIComponent(decodedPath);
+			if (decoded === decodedPath) break;
+			decodedPath = decoded;
+		}
+	} catch {
+		throw new Error("--internal-base-url contains invalid path encoding");
+	}
+	if (
+		/[\u0000-\u001f\u007f]/.test(decodedPath) ||
+		decodedPath.replaceAll("\\", "/").split("/").includes("..")
+	) {
+		throw new Error("--internal-base-url must not contain path traversal or control characters");
+	}
+
+	return `${url.href.replace(/\/+$/, "")}/`;
 }
 
 function readJson(path) {
@@ -162,6 +218,12 @@ export function npmTarballName(packageName, version) {
 
 export function releaseTarballUrl(baseUrl, packageVersion, tarballFile) {
 	return `${baseUrl}/releases/v${packageVersion}/${tarballFile}`;
+}
+
+export function internalTarballUrl(baseUrl, internalBaseUrl, packageVersion, tarballFile) {
+	return internalBaseUrl
+		? `${internalBaseUrl}${tarballFile}`
+		: releaseTarballUrl(baseUrl, packageVersion, tarballFile);
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -289,7 +351,10 @@ function main() {
 		if (releasePackage.packageDir === "coding-agent") continue;
 		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
 		const artifactFile = artifactFiles.get(releasePackage.packageDir);
-		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, packageVersion, artifactFile));
+		internalPackageUrls.set(
+			sourcePackageName,
+			internalTarballUrl(args.baseUrl, args.internalBaseUrl, packageVersion, artifactFile),
+		);
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
