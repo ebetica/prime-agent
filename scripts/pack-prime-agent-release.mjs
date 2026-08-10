@@ -37,6 +37,7 @@ function parseArgs(args) {
 		baseUrl: defaultBaseUrl,
 		channel: "stable",
 		outDir: defaultOutputDir,
+		releaseTag: undefined,
 		version: undefined,
 	};
 
@@ -69,7 +70,14 @@ function parseArgs(args) {
 			case "--version": {
 				const value = args[i + 1];
 				if (!value) throw new Error("--version requires a value");
-				parsed.version = normalizeVersion(value);
+				parsed.version = normalizePackageVersion(value);
+				i += 1;
+				break;
+			}
+			case "--release-tag": {
+				const value = args[i + 1];
+				if (!value) throw new Error("--release-tag requires a value");
+				parsed.releaseTag = normalizeReleaseTag(value);
 				i += 1;
 				break;
 			}
@@ -92,9 +100,11 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version semver] [--release-tag tag] [--out-dir path]
 
-Creates private npm tarballs for R2 distribution:
+Creates private npm tarballs for R2 distribution. --version selects package.json
+versions and filenames. --release-tag selects the release download path and defaults
+to v<version> for compatibility.
 
   <out-dir>/artifacts/prime-agent-<version>.tgz
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
@@ -106,10 +116,22 @@ Creates private npm tarballs for R2 distribution:
 `);
 }
 
-function normalizeVersion(version) {
+export function normalizeReleaseTag(tag) {
+	const normalized = tag.startsWith("v") ? tag.slice(1) : tag;
+	if (!/^[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*$/.test(normalized)) {
+		throw new Error(`Invalid release tag: ${tag}`);
+	}
+	return `v${normalized}`;
+}
+
+export function normalizePackageVersion(version) {
 	const normalized = version.startsWith("v") ? version.slice(1) : version;
-	if (!/^[0-9A-Za-z.-]+$/.test(normalized)) {
-		throw new Error(`Invalid release version: ${version}`);
+	const identifier = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
+	const semver = new RegExp(
+		`^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-${identifier}(?:\\.${identifier})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`,
+	);
+	if (!semver.test(normalized)) {
+		throw new Error(`Invalid package version (expected SemVer): ${version}`);
 	}
 	return normalized;
 }
@@ -151,12 +173,12 @@ function copyIfExists(source, target) {
 	}
 }
 
-function npmTarballName(packageName, version) {
+export function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
-function releaseTarballUrl(baseUrl, version, tarballFile) {
-	return `${baseUrl}/releases/v${version}/${tarballFile}`;
+export function releaseTarballUrl(baseUrl, releaseTag, tarballFile) {
+	return `${baseUrl}/releases/${releaseTag}/${tarballFile}`;
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -175,11 +197,11 @@ function releaseScripts(sourceScripts) {
 	};
 }
 
-function createReleasePackageJson(sourcePackage, packageName, releaseVersion, internalPackageUrls) {
+export function createReleasePackageJson(sourcePackage, packageName, packageVersion, internalPackageUrls) {
 	const packageJson = {
 		...sourcePackage,
 		name: packageName,
-		version: releaseVersion,
+		version: packageVersion,
 		dependencies: rewriteInternalDependencies(sourcePackage.dependencies, internalPackageUrls),
 		optionalDependencies: rewriteInternalDependencies(sourcePackage.optionalDependencies, internalPackageUrls),
 		scripts: releaseScripts(sourcePackage.scripts),
@@ -235,6 +257,20 @@ function sha256File(path) {
 	return hash.digest("hex");
 }
 
+export function createReleaseManifest(packageVersion, releaseTag, cliArtifactFile, tarballs) {
+	return {
+		version: `v${packageVersion}`,
+		releaseTag,
+		package: publicPackageName,
+		tarball: `releases/${releaseTag}/${cliArtifactFile}`,
+		tarballs: tarballs.map((tarball) => ({
+			package: tarball.name,
+			file: tarball.file,
+			sha256: tarball.sha256,
+		})),
+	};
+}
+
 function main() {
 	const args = parseArgs(process.argv.slice(2));
 	const sourcePackages = new Map(
@@ -244,7 +280,8 @@ function main() {
 		]),
 	);
 	const cliPackage = sourcePackages.get("coding-agent");
-	const releaseVersion = args.version || normalizeVersion(process.env.PRIME_AGENT_VERSION || cliPackage.version);
+	const packageVersion = args.version || normalizePackageVersion(process.env.PRIME_AGENT_VERSION || cliPackage.version);
+	const releaseTag = args.releaseTag || `v${packageVersion}`;
 
 	for (const releasePackage of releasePackages) {
 		requireBuiltPackage(releasePackage.packageDir);
@@ -262,7 +299,7 @@ function main() {
 		packageNames.set(releasePackage.packageDir, packageName);
 		artifactFiles.set(
 			releasePackage.packageDir,
-			npmTarballName(releasePackage.artifactName || packageName, releaseVersion),
+			npmTarballName(releasePackage.artifactName || packageName, packageVersion),
 		);
 	}
 
@@ -271,7 +308,7 @@ function main() {
 		if (releasePackage.packageDir === "coding-agent") continue;
 		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
 		const artifactFile = artifactFiles.get(releasePackage.packageDir);
-		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseVersion, artifactFile));
+		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseTag, artifactFile));
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
@@ -289,7 +326,7 @@ function main() {
 		const packageJson = createReleasePackageJson(
 			sourcePackage,
 			packageName,
-			releaseVersion,
+			packageVersion,
 			internalPackageUrls,
 		);
 
@@ -326,27 +363,23 @@ function main() {
 		join(artifactsDir, "SHA256SUMS"),
 		tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`).join("\n") + "\n",
 	);
-	writeFileSync(join(artifactsDir, args.channel), `v${releaseVersion}\n`);
+	writeFileSync(join(artifactsDir, args.channel), `v${packageVersion}\n`);
 	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
-	writeJson(join(artifactsDir, manifestName), {
-		version: `v${releaseVersion}`,
-		package: publicPackageName,
-		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
-		tarballs: tarballs.map((tarball) => ({
-			package: tarball.name,
-			file: tarball.file,
-			sha256: tarball.sha256,
-		})),
-	});
+	writeJson(
+		join(artifactsDir, manifestName),
+		createReleaseManifest(packageVersion, releaseTag, artifactFiles.get("coding-agent"), tarballs),
+	);
 
 	for (const tarball of tarballs) {
 		console.log(`Created ${join(artifactsDir, tarball.file)}`);
 	}
 }
 
-try {
-	main();
-} catch (error) {
-	console.error(error instanceof Error ? error.message : String(error));
-	process.exit(1);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	try {
+		main();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(1);
+	}
 }
