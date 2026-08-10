@@ -1146,6 +1146,7 @@ export class AgentSession {
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
+	private _idleQueuePromotionGeneration = 0;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private _sessionActionCommitTail: Promise<void> = Promise.resolve();
@@ -6720,7 +6721,24 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	private _promoteQueuedWorkAfterAbort(generation: number): void {
+		void this.agent
+			.waitForIdle()
+			.then(() => this._agentEventQueue)
+			.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+			.then(() => {
+				if (generation !== this._idleQueuePromotionGeneration || this._disposed || this._disposing) {
+					return;
+				}
+				this._sessionInputPumpSuspended = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+			})
+			.catch(() => undefined);
+	}
+
 	requestAbort(): void {
+		const promotionGeneration = ++this._idleQueuePromotionGeneration;
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -6738,6 +6756,7 @@ export class AgentSession {
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
 		this.agent.abort();
+		this._promoteQueuedWorkAfterAbort(promotionGeneration);
 	}
 
 	/**
@@ -6762,6 +6781,7 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		this._idleQueuePromotionGeneration++;
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
 		this._sessionInputPumpRequested = false;
