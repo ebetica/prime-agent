@@ -287,15 +287,126 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		await session.abort();
 		await firstPrompt.catch(() => {});
-
-		expect(sawSteeringMessage).toBe(false);
-		expect(session.getSteeringMessages()).toContain("Steer from extension");
-		expect(session.queuedActionCount).toBe(1);
-
-		await session.prompt("After abort");
+		await session.waitForIdle();
 
 		expect(sawSteeringMessage).toBe(true);
 		expect(session.queuedActionCount).toBe(0);
+	});
+
+	it("promotes a restored backlog when abort finds the lower run already idle", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		await session.restoreSteeringMessage("orphaned-first");
+		await session.restoreSteeringMessage("orphaned-second");
+		expect(session.isStreaming).toBe(false);
+		expect(session.queuedActionCount).toBe(2);
+
+		await session.abort();
+		await session.waitForIdle();
+
+		const delivered = session.agent.state.messages
+			.filter((message) => message.role === "user")
+			.flatMap((message) =>
+				typeof message.content === "string"
+					? [message.content]
+					: message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text),
+			);
+		expect(delivered).toEqual(["orphaned-first", "orphaned-second"]);
+		expect(session.queuedActionCount).toBe(0);
+	});
+
+	it("promotes an aborted backlog once while preserving concurrent admission order", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let invocation = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: "Test",
+				tools: [],
+			},
+			streamFn: (_model, _context, options) => {
+				invocation++;
+				const currentInvocation = invocation;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (currentInvocation > 1) {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+						return;
+					}
+					const checkAbort = () => {
+						if (options?.signal?.aborted) {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						} else {
+							setTimeout(checkAbort, 5);
+						}
+					};
+					checkAbort();
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		const initial = session.prompt("initial");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await session.steer("first");
+		await session.steer("second");
+		const concurrentAdmission = session.steer("third");
+		session.requestAbort();
+		await concurrentAdmission;
+		await initial.catch(() => {});
+		await session.waitForIdle();
+
+		const delivered = session.agent.state.messages
+			.filter((message) => message.role === "user")
+			.flatMap((message) =>
+				typeof message.content === "string"
+					? [message.content]
+					: message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text),
+			);
+		expect(delivered).toEqual(["initial", "first", "second", "third"]);
+		expect(session.queuedActionCount).toBe(0);
+		expect(invocation).toBe(4);
 	});
 
 	it("delivers accepted agent messages without extension input interception", async () => {
