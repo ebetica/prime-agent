@@ -9,17 +9,16 @@ import {
 	createReleaseManifest,
 	createReleasePackageJson,
 	normalizePackageVersion,
-	normalizeReleaseTag,
 	npmTarballName,
 	releaseTarballUrl,
 } from "./pack-prime-agent-release.mjs";
 
-test("keeps the release tag separate from package metadata and artifact names", () => {
-	const releaseTag = normalizeReleaseTag("v0.7.0.8");
+test("keeps stable metadata, manifest, filenames, and R2 URLs on the package version", () => {
 	const packageVersion = normalizePackageVersion("0.7.1-recurse.8");
+	const stable = `v${packageVersion}`;
 	const coreFile = npmTarballName("prime-agent-core", packageVersion);
 	const cliFile = npmTarballName("prime-agent", packageVersion);
-	const coreUrl = releaseTarballUrl("https://downloads.example", releaseTag, coreFile);
+	const coreUrl = releaseTarballUrl("https://downloads.example", packageVersion, coreFile);
 	const packageJson = createReleasePackageJson(
 		{
 			name: "@earendil-works/pi-coding-agent",
@@ -30,18 +29,22 @@ test("keeps the release tag separate from package metadata and artifact names", 
 		packageVersion,
 		new Map([["@earendil-works/pi-agent-core", coreUrl]]),
 	);
-	const manifest = createReleaseManifest(packageVersion, releaseTag, cliFile, [
+	const manifest = createReleaseManifest(packageVersion, cliFile, [
 		{ name: "prime-agent", file: cliFile, sha256: "abc123" },
 	]);
 
+	assert.equal(stable, "v0.7.1-recurse.8");
 	assert.equal(packageJson.version, "0.7.1-recurse.8");
 	assert.equal(
 		packageJson.dependencies["@earendil-works/pi-agent-core"],
-		"https://downloads.example/releases/v0.7.0.8/prime-agent-core-0.7.1-recurse.8.tgz",
+		"https://downloads.example/releases/v0.7.1-recurse.8/prime-agent-core-0.7.1-recurse.8.tgz",
 	);
-	assert.equal(manifest.version, "v0.7.1-recurse.8");
-	assert.equal(manifest.releaseTag, "v0.7.0.8");
-	assert.equal(manifest.tarball, "releases/v0.7.0.8/prime-agent-0.7.1-recurse.8.tgz");
+	assert.deepEqual(manifest, {
+		version: "v0.7.1-recurse.8",
+		package: "prime-agent",
+		tarball: "releases/v0.7.1-recurse.8/prime-agent-0.7.1-recurse.8.tgz",
+		tarballs: [{ package: "prime-agent", file: cliFile, sha256: "abc123" }],
+	});
 });
 
 test("requires package versions to be valid SemVer", () => {
@@ -49,8 +52,10 @@ test("requires package versions to be valid SemVer", () => {
 	assert.throws(() => normalizePackageVersion("0.7.0.8"), /expected SemVer/);
 	assert.throws(() => normalizePackageVersion("0.7.1-recurse.08"), /expected SemVer/);
 	assert.throws(() => normalizePackageVersion("0.7"), /expected SemVer/);
-	assert.equal(normalizeReleaseTag("0.7.0.8"), "v0.7.0.8");
-	assert.throws(() => normalizeReleaseTag("v0.7.0.8/asset"), /Invalid release tag/);
+	assert.throws(() => normalizePackageVersion("01.7.1"), /expected SemVer/);
+	assert.throws(() => normalizePackageVersion("0.7.1-"), /expected SemVer/);
+	assert.throws(() => normalizePackageVersion("0.7.1+build..1"), /expected SemVer/);
+	assert.throws(() => normalizePackageVersion("0.7.1/recurse.8"), /expected SemVer/);
 });
 
 test("npm replaces an installed 0.7.0 tarball with the distinct package version", () => {

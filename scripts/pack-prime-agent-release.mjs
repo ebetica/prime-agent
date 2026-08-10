@@ -37,7 +37,6 @@ function parseArgs(args) {
 		baseUrl: defaultBaseUrl,
 		channel: "stable",
 		outDir: defaultOutputDir,
-		releaseTag: undefined,
 		version: undefined,
 	};
 
@@ -74,13 +73,6 @@ function parseArgs(args) {
 				i += 1;
 				break;
 			}
-			case "--release-tag": {
-				const value = args[i + 1];
-				if (!value) throw new Error("--release-tag requires a value");
-				parsed.releaseTag = normalizeReleaseTag(value);
-				i += 1;
-				break;
-			}
 			case "--help":
 			case "-h":
 				printHelp();
@@ -100,11 +92,10 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version semver] [--release-tag tag] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version semver] [--out-dir path]
 
 Creates private npm tarballs for R2 distribution. --version selects package.json
-versions and filenames. --release-tag selects the release download path and defaults
-to v<version> for compatibility.
+versions, filenames, and the release download path.
 
   <out-dir>/artifacts/prime-agent-<version>.tgz
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
@@ -114,14 +105,6 @@ to v<version> for compatibility.
   <out-dir>/artifacts/<channel>
   <out-dir>/artifacts/latest.json (stable) or beta.json (beta)
 `);
-}
-
-export function normalizeReleaseTag(tag) {
-	const normalized = tag.startsWith("v") ? tag.slice(1) : tag;
-	if (!/^[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*$/.test(normalized)) {
-		throw new Error(`Invalid release tag: ${tag}`);
-	}
-	return `v${normalized}`;
 }
 
 export function normalizePackageVersion(version) {
@@ -177,8 +160,8 @@ export function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
-export function releaseTarballUrl(baseUrl, releaseTag, tarballFile) {
-	return `${baseUrl}/releases/${releaseTag}/${tarballFile}`;
+export function releaseTarballUrl(baseUrl, packageVersion, tarballFile) {
+	return `${baseUrl}/releases/v${packageVersion}/${tarballFile}`;
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -257,12 +240,11 @@ function sha256File(path) {
 	return hash.digest("hex");
 }
 
-export function createReleaseManifest(packageVersion, releaseTag, cliArtifactFile, tarballs) {
+export function createReleaseManifest(packageVersion, cliArtifactFile, tarballs) {
 	return {
 		version: `v${packageVersion}`,
-		releaseTag,
 		package: publicPackageName,
-		tarball: `releases/${releaseTag}/${cliArtifactFile}`,
+		tarball: `releases/v${packageVersion}/${cliArtifactFile}`,
 		tarballs: tarballs.map((tarball) => ({
 			package: tarball.name,
 			file: tarball.file,
@@ -281,7 +263,6 @@ function main() {
 	);
 	const cliPackage = sourcePackages.get("coding-agent");
 	const packageVersion = args.version || normalizePackageVersion(process.env.PRIME_AGENT_VERSION || cliPackage.version);
-	const releaseTag = args.releaseTag || `v${packageVersion}`;
 
 	for (const releasePackage of releasePackages) {
 		requireBuiltPackage(releasePackage.packageDir);
@@ -308,7 +289,7 @@ function main() {
 		if (releasePackage.packageDir === "coding-agent") continue;
 		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
 		const artifactFile = artifactFiles.get(releasePackage.packageDir);
-		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseTag, artifactFile));
+		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, packageVersion, artifactFile));
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
@@ -367,7 +348,7 @@ function main() {
 	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
 	writeJson(
 		join(artifactsDir, manifestName),
-		createReleaseManifest(packageVersion, releaseTag, artifactFiles.get("coding-agent"), tarballs),
+		createReleaseManifest(packageVersion, artifactFiles.get("coding-agent"), tarballs),
 	);
 
 	for (const tarball of tarballs) {
