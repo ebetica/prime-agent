@@ -7,6 +7,7 @@
 - Added crash-safe planned restart completion proofs plus authenticated acknowledgement and cancellation, with bounded terminal handoff reclamation.
 - Added capability-gated extension host requests for Python skills, bound to the current durable session outside the kernel.
 - Fixed resident daemons rejecting queued-action inspection and cancellation commands after advertising support for them.
+- Fixed worker crash recovery leaving interrupted RLM and other tool calls waiting forever by recording terminal, non-replayed tool results before resuming the transcript.
 
 ## [0.7.0] - 2026-08-05
 
