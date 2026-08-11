@@ -1329,9 +1329,6 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
-		// A new runtime generation must send full provider context. Session-scoped
-		// transports may still cache a previous_response_id from a replaced runtime.
-		cleanupSessionResources(this.sessionManager.getSessionId());
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		this._actionQueueJournal = artifactDir ? new SessionActionQueueJournal(artifactDir) : undefined;
 		this._actionStore = new ActionStore<QueuedSessionAction>((queued, admitted) => this._persistSessionActionState(queued, admitted));
@@ -1410,20 +1407,52 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		const durableActions = this._actionQueueJournal?.read();
-		if (durableActions?.admittedActionIds.length) {
-			this.sessionManager.appendCustomMessageEntry(
-				"prime-agent.session_actions_interrupted",
-				`Worker replacement interrupted admitted session action${durableActions.admittedActionIds.length === 1 ? "" : "s"}: ${durableActions.admittedActionIds.join(", ")}. The action was not replayed.`,
-				true,
-				{ actionIds: durableActions.admittedActionIds },
+		if (durableActions?.admitted.actions.length) {
+			const recorded = new Set(
+				this.sessionManager.getBranch()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "custom" &&
+							entry.message.customType === "prime-agent.session_action_interrupted",
+					)
+					.map((entry) =>
+						entry.type === "message" && entry.message.role === "custom"
+							? (entry.message.details as { actionId?: unknown } | undefined)?.actionId
+							: undefined,
+					)
+					.filter((id): id is string => typeof id === "string"),
 			);
+			for (const action of durableActions.admitted.actions) {
+				if (recorded.has(action.id)) continue;
+				const interrupted: CustomMessage = {
+					role: "custom",
+					customType: "prime-agent.session_action_interrupted",
+					content: `Interrupted before execution; not replayed.\n\n${action.payload.text}`,
+					display: true,
+					timestamp: Date.now(),
+					details: {
+						actionId: action.id,
+						state: "interrupted",
+						source: action.source,
+						...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
+					},
+				};
+				this.sessionManager.appendMessage(interrupted);
+				this.agent.state.messages.push(interrupted);
+			}
 		}
 		if (durableActions?.queue.actions.length) {
 			this._sessionInputPumpSuspended = true;
 			void this.restoreSessionActions(durableActions.queue);
 		} else if (durableActions) {
-			this._actionQueueJournal?.write({ formatVersion: 1, queue: durableActions.queue, admittedActionIds: [] });
+			this._actionQueueJournal?.write({
+				formatVersion: 1,
+				queue: durableActions.queue,
+				admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
+			});
 		}
+
 		if (this._recoverPlannedRestartContinuationIntents() > 0) {
 			// A prior successor may have acknowledged resume and crashed before the
 			// queued continuation reached the transcript. The durable intent is
@@ -5492,14 +5521,14 @@ export class AgentSession {
 		};
 	}
 
-	private _assertSessionActionAdmissionAvailable(): void {
+	private _assertSessionActionAdmissionAvailable(restoring = false): void {
 		if (this._resourceReloadInProgress) {
 			throw new Error("Cannot admit a session action while resources are reloading.");
 		}
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
+		if (!restoring && this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
 		}
 	}
@@ -5517,7 +5546,8 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		this._assertSessionActionAdmissionAvailable();
+		if (!options.restore && action.wake === "immediate") this._sessionInputPumpSuspended = false;
+		this._assertSessionActionAdmissionAvailable(options.restore === true);
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -6426,7 +6456,7 @@ export class AgentSession {
 		this._actionQueueJournal?.write({
 			formatVersion: 1,
 			queue: this._sessionActionRecoverySnapshot(queued),
-			admittedActionIds: admitted.map((action) => action.id),
+			admitted: this._sessionActionRecoverySnapshot(admitted),
 		});
 	}
 

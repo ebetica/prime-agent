@@ -12,11 +12,11 @@ describe("SessionActionQueueJournal", () => {
 		const dir = mkdtempSync(join(tmpdir(), "prime-action-queue-"));
 		dirs.push(dir);
 		const journal = new SessionActionQueueJournal(dir);
-		const queued = { formatVersion: 1 as const, queue: { formatVersion: 1 as const, actions: [{ id: "first" }, { id: "second" }] as never[] }, admittedActionIds: [] };
+		const queued = { formatVersion: 1 as const, queue: { formatVersion: 1 as const, actions: [{ id: "first" }, { id: "second" }] as never[] }, admitted: { formatVersion: 1 as const, actions: [] } };
 		journal.write(queued);
 		expect(journal.read()).toEqual(queued);
-		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admittedActionIds: ["running"] });
-		expect(journal.read()?.admittedActionIds).toEqual(["running"]);
+		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admitted: { formatVersion: 1, actions: [{ id: "running" }] as never[] } });
+		expect(journal.read()?.admitted.actions.map((action) => action.id)).toEqual(["running"]);
 		expect(readFileSync(sessionActionQueuePath(dir), "utf8")).toMatch(/running/);
 	});
 
@@ -25,7 +25,7 @@ describe("SessionActionQueueJournal", () => {
 		dirs.push(dir);
 		const journal = new SessionActionQueueJournal(dir);
 		expect(journal.read()).toBeUndefined();
-		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admittedActionIds: [] });
+		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admitted: { formatVersion: 1, actions: [] } });
 		expect(journal.read()).toBeUndefined();
 	});
 });

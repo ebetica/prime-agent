@@ -17,7 +17,7 @@ const FILE_NAME = "session-action-queue.json";
 export interface SessionActionQueueCheckpoint {
 	formatVersion: 1;
 	queue: SessionActionRecoverySnapshot;
-	admittedActionIds: string[];
+	admitted: SessionActionRecoverySnapshot;
 }
 
 export function sessionActionQueuePath(artifactDir: string): string {
@@ -37,8 +37,8 @@ export class SessionActionQueueJournal {
 				value.formatVersion !== 1 ||
 				value.queue?.formatVersion !== 1 ||
 				!Array.isArray(value.queue.actions) ||
-				!Array.isArray(value.admittedActionIds) ||
-				!value.admittedActionIds.every((id) => typeof id === "string")
+				value.admitted?.formatVersion !== 1 ||
+				!Array.isArray(value.admitted.actions)
 			) {
 				throw new Error(`Invalid durable session queue: ${this.path}`);
 			}
@@ -50,7 +50,7 @@ export class SessionActionQueueJournal {
 	}
 
 	write(checkpoint: SessionActionQueueCheckpoint): void {
-		if (checkpoint.queue.actions.length === 0 && checkpoint.admittedActionIds.length === 0) {
+		if (checkpoint.queue.actions.length === 0 && checkpoint.admitted.actions.length === 0) {
 			rmSync(this.path, { force: true });
 			try {
 				const descriptor = openSync(dirname(this.path), "r");

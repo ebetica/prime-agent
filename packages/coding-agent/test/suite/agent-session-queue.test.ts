@@ -11,8 +11,10 @@ import {
 	createAgentSessionMessage,
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
+import type { SessionActionRecoveryAction } from "../../src/core/agent-session.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
-import { createSessionSlashCommandMessage } from "../../src/core/messages.js";
+import { type CustomMessage, createSessionSlashCommandMessage } from "../../src/core/messages.js";
+import { SessionActionQueueJournal } from "../../src/core/session-action-queue-journal.js";
 import {
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
@@ -102,12 +104,69 @@ function heartbeatJob(): AgentCronJob {
 const skipReviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 
 describe("AgentSession queue characterization", () => {
+
+
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("materializes a durably admitted crash-window action once as interrupted without replay", async () => {
+		const action = {
+			id: "action-crash-window",
+			source: "internal" as const,
+			delivery: "when_run_idle" as const,
+			wake: "external_resume" as const,
+			agentMessageId: "agent-message-7",
+			payload: {
+				kind: "turn" as const,
+				text: "operator action text",
+				records: [{
+					id: "record-crash-window",
+					role: "primary" as const,
+					message: { role: "user" as const, content: "operator action text", timestamp: 1 },
+					ownerActionId: "action-crash-window",
+				}],
+				executionPolicy: {
+					preparation: { emitBeforeAgentStart: true, applyPromptTemplate: true, preservePromptContent: true },
+					turn: { allowAutoCompaction: true, allowAutoRetry: true, allowOverflowRecovery: true },
+				},
+				queueVisible: true,
+				acceptedAgentMessage: true,
+				acceptedBeforeCompletion: true,
+			},
+		} as unknown as SessionActionRecoveryAction;
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				const artifactDir = sessionManager.getSessionArtifactDir();
+				if (!artifactDir) throw new Error("missing durable fixture state");
+				new SessionActionQueueJournal(artifactDir).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [] },
+					admitted: { formatVersion: 1, actions: [action] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+		const interrupted = replacement.session.messages.filter(
+			(message): message is CustomMessage =>
+				message.role === "custom" && message.customType === "prime-agent.session_action_interrupted",
+		);
+		expect(interrupted).toHaveLength(1);
+		expect(getMessageText(interrupted[0]!)).toContain("operator action text");
+		expect(interrupted[0]?.details).toMatchObject({
+			actionId: action.id,
+			agentMessageId: "agent-message-7",
+			state: "interrupted",
+			source: "internal",
+		});
+		expect(replacement.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		expect(new SessionActionQueueJournal(replacement.session.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
 	it("does not count failed assistant messages toward the auto-refine interval", async () => {
