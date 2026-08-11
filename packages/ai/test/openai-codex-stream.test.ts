@@ -8,7 +8,6 @@ import {
 	streamOpenAICodexResponses,
 	streamSimpleOpenAICodexResponses,
 } from "../src/providers/openai-codex-responses.js";
-import { cleanupSessionResources } from "../src/session-resources.js";
 import type { Context, Model } from "../src/types.js";
 
 const originalFetch = global.fetch;
@@ -1005,7 +1004,7 @@ describe("openai-codex streaming", () => {
 
 		const first = await streamOpenAICodexResponses(model, firstContext, {
 			apiKey: token,
-			sessionId: "session-1",
+			sessionId: "session-1:generation-1",
 			transport: "websocket-cached",
 		}).result();
 
@@ -1015,20 +1014,19 @@ describe("openai-codex streaming", () => {
 		};
 		const second = await streamOpenAICodexResponses(model, secondContext, {
 			apiKey: token,
-			sessionId: "session-1",
+			sessionId: "session-1:generation-1",
 			transport: "websocket-cached",
 		}).result();
 
 		// A replacement runtime keeps the transcript but clears process-local provider
 		// chaining. Its first request must send full context, never a stale response ID.
-		cleanupSessionResources("session-1");
 		const replacementContext: Context = {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [...secondContext.messages, second, { role: "user", content: "Fresh worker", timestamp: 3 }],
 		};
 		await streamOpenAICodexResponses(model, replacementContext, {
 			apiKey: token,
-			sessionId: "session-1",
+			sessionId: "session-1:generation-2",
 			transport: "websocket-cached",
 		}).result();
 
@@ -1044,14 +1042,20 @@ describe("openai-codex streaming", () => {
 		expect(secondBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
 		expect(replacementBody.previous_response_id).toBeUndefined();
 		expect(replacementBody.input.length).toBeGreaterThan(1);
-		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
-			requests: 3,
-			connectionsCreated: 2,
+		expect(getOpenAICodexWebSocketDebugStats("session-1:generation-1")).toMatchObject({
+			requests: 2,
+			connectionsCreated: 1,
 			connectionsReused: 1,
-			cachedContextRequests: 3,
-			storeTrueRequests: 0,
-			fullContextRequests: 2,
+			fullContextRequests: 1,
 			deltaRequests: 1,
+			lastPreviousResponseId: "resp_1",
+		});
+		expect(getOpenAICodexWebSocketDebugStats("session-1:generation-2")).toMatchObject({
+			requests: 1,
+			connectionsCreated: 1,
+			connectionsReused: 0,
+			fullContextRequests: 1,
+			deltaRequests: 0,
 			lastPreviousResponseId: undefined,
 		});
 	});
