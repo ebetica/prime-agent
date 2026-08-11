@@ -349,30 +349,58 @@ describe("AgentSession queue characterization", () => {
 		).toHaveLength(1);
 	});
 
-	it("admits the recovery instruction once without replaying interrupted work", async () => {
+	it("prioritizes one recovery instruction ahead of queued steering and follow-up work", async () => {
 		const interrupted = crashWindowAction();
+		const queuedAction = (
+			id: string,
+			text: string,
+			delivery: SessionActionRecoveryAction["delivery"],
+		): SessionActionRecoveryAction => {
+			const action = structuredClone(interrupted);
+			action.id = id;
+			action.delivery = delivery;
+			action.payload.text = text;
+			if (action.payload.kind === "turn") {
+				action.payload.records[0]!.id = `record-${id}`;
+				action.payload.records[0]!.ownerActionId = id;
+				action.payload.records[0]!.message = { role: "user", content: text, timestamp: 2 };
+			}
+			return action;
+		};
+		const steering = queuedAction("queued-steering", "queued steering work", "next_turn_boundary");
+		const followUp = queuedAction("queued-follow-up", "queued follow-up work", "when_run_idle");
 		const replacement = await createHarness({
 			persistSession: true,
 			beforeSessionCreate: (sessionManager) => {
 				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
 					formatVersion: 1,
-					queue: { formatVersion: 1, actions: [] },
+					queue: { formatVersion: 1, actions: [steering, followUp] },
 					admitted: { formatVersion: 1, actions: [interrupted] },
 				});
 			},
 		});
 		harnesses.push(replacement);
-		replacement.setResponses([fauxAssistantMessage("recovered safely")]);
+		expect(replacement.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			steering.id,
+			followUp.id,
+		]);
+		replacement.setResponses([
+			fauxAssistantMessage("recovered safely"),
+			fauxAssistantMessage("steering done"),
+			fauxAssistantMessage("follow-up done"),
+		]);
 
 		expect(replacement.session.resumeQueuedWork()).toBe(true);
 		await replacement.session.waitForIdle();
 
 		const delivered = getUserTexts(replacement);
-		expect(delivered).toHaveLength(1);
+		expect(delivered).toHaveLength(3);
 		expect(delivered[0]).toContain("Inspect the transcript, Git state");
 		expect(delivered[0]).not.toContain("operator action text");
 		expect(delivered[0]).not.toContain("sensitive prepared payload");
-		expect(getAssistantTexts(replacement)).toContain("recovered safely");
+		expect(delivered.slice(1)).toEqual(["queued steering work", "queued follow-up work"]);
+		expect(getAssistantTexts(replacement)).toEqual(["recovered safely", "steering done", "follow-up done"]);
 		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
@@ -3420,7 +3448,7 @@ describe("AgentSession scheduler scenarios", () => {
 	});
 
 	it("S4: restart abort snapshots queued work and restores it, envelopes as commands", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		let providerCalls = 0;
 		const firstGate = createDeferred();
@@ -3461,6 +3489,9 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.agent.waitForIdle();
 		await harness.session.waitForSessionInputIdle();
 		expect(providerCalls).toBe(0);
+		expect(
+			new SessionActionQueueJournal(harness.sessionManager.getSessionArtifactDir()!).read()?.admitted.actions,
+		).toEqual([expect.objectContaining({ payload: expect.objectContaining({ text: "first" }) })]);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
 		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
 			expect.objectContaining({ payload: expect.objectContaining({ text: "queued for restart" }) }),

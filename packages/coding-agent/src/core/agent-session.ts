@@ -1149,6 +1149,7 @@ export class AgentSession {
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore: ActionStore<QueuedSessionAction>;
 	private readonly _actionQueueJournal?: SessionActionQueueJournal;
+	private _updateRestartInterruptedActions: QueuedSessionAction[] = [];
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	// Coalesces wakes so overlapping submissions cannot start competing pumps.
 	private _sessionInputPumpRequested = false;
@@ -1461,7 +1462,7 @@ export class AgentSession {
 			const recoveryRoot = interruptedWork[0];
 			const recoveryActions = recoveryRoot
 				? this._sessionActionRecoverySnapshot([
-						this._createPreparedTurnAction("followUp", INTERRUPTED_RUN_RECOVERY_PROMPT, undefined, {
+						this._createPreparedTurnAction("steer", INTERRUPTED_RUN_RECOVERY_PROMPT, undefined, {
 							actionId: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
 							queueKey: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
 							source: "internal",
@@ -6497,10 +6498,12 @@ export class AgentSession {
 		queued: readonly QueuedSessionAction[],
 		admitted: readonly QueuedSessionAction[],
 	): void {
+		const admittedById = new Map(admitted.map((action) => [action.id, action]));
+		for (const action of this._updateRestartInterruptedActions) admittedById.set(action.id, action);
 		this._actionQueueJournal?.write({
 			formatVersion: 1,
 			queue: this._sessionActionRecoverySnapshot(queued),
-			admitted: this._sessionActionRecoverySnapshot(admitted),
+			admitted: this._sessionActionRecoverySnapshot([...admittedById.values()]),
 		});
 	}
 
@@ -6903,6 +6906,9 @@ export class AgentSession {
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
+		const interruptedActions = [...this._actionStore.activeActions()];
+		if (interruptedActions.length > 0) this._updateRestartInterruptedActions = interruptedActions;
+		this._persistSessionActionState(this._actionStore.queuedActions(), this._actionStore.activeActions());
 		this.agent.abort();
 		if (this._goalAbortInProgress) {
 			void this.agent
