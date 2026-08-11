@@ -167,6 +167,7 @@ describe("AgentSession queue characterization", () => {
 					: [],
 			);
 		expect(interrupted).toHaveLength(1);
+		expect(getMessageText(interrupted[0]!)).toContain("execution and outcome are uncertain");
 		expect(getMessageText(interrupted[0]!)).toContain("operator action text");
 		expect(interrupted[0]?.details).toMatchObject({
 			interruptionId: `session-action-interrupted:${action.id}`,
@@ -185,6 +186,41 @@ describe("AgentSession queue characterization", () => {
 		).toBeUndefined();
 	});
 
+	it("restores a durable action batch without checkpointing a lossy prefix", async () => {
+		const first = crashWindowAction();
+		const second = structuredClone(first);
+		second.id = "action-crash-window-second";
+		second.payload.text = "second operator action";
+		if (second.payload.kind === "turn") {
+			second.payload.records[0]!.id = "record-crash-window-second";
+			second.payload.records[0]!.ownerActionId = second.id;
+		}
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				const artifactDir = sessionManager.getSessionArtifactDir();
+				if (!artifactDir) throw new Error("missing durable fixture state");
+				new SessionActionQueueJournal(artifactDir).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [first, second] },
+					admitted: { formatVersion: 1, actions: [] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+
+		expect(replacement.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			first.id,
+			second.id,
+		]);
+		expect(
+			new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!)
+				.read()
+				?.queue.actions.map((action) => action.id),
+		).toEqual([first.id, second.id]);
+	});
+
 	it("does not duplicate an interruption after crashing between transcript append and journal clear", async () => {
 		const action = crashWindowAction();
 		const replacement = await createHarness({
@@ -195,7 +231,7 @@ describe("AgentSession queue characterization", () => {
 				sessionManager.appendMessage({
 					role: "custom",
 					customType: "prime-agent.session_action_interrupted",
-					content: `Interrupted before execution; not replayed.\n\n${action.payload.text}`,
+					content: `Interrupted by worker loss; execution and outcome are uncertain. Not replayed automatically.\n\n${action.payload.text}`,
 					display: true,
 					timestamp: 1,
 					details: {

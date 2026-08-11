@@ -1431,7 +1431,7 @@ export class AgentSession {
 				const interrupted: CustomMessage = {
 					role: "custom",
 					customType: "prime-agent.session_action_interrupted",
-					content: `Interrupted before execution; not replayed.\n\n${action.payload.text}`,
+					content: `Interrupted by worker loss; execution and outcome are uncertain. Not replayed automatically.\n\n${action.payload.text}`,
 					display: true,
 					timestamp: Date.now(),
 					details: {
@@ -5197,7 +5197,17 @@ export class AgentSession {
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 			};
 		});
-		for (const action of actions) this._admitSessionInput(action, { restore: true });
+		this._assertSessionActionAdmissionAvailable(true);
+		this._actionStore.enqueueMany(actions);
+		for (const action of actions) {
+			this._actionStore.ticketFor(action).settleAccepted({
+				status: "accepted",
+				actionId: action.id,
+				disposition: "queued",
+			});
+			this._sessionInputArrivalEpoch++;
+		}
+		if (actions.length > 0) this._emitQueueUpdate();
 		return actions.length;
 	}
 

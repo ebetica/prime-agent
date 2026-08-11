@@ -330,6 +330,18 @@ describe("child passivation capability", () => {
 });
 
 describe("ActionStore durable queue ordering", () => {
+	it("publishes a restored batch only after every action is resident", () => {
+		const writes: string[][] = [];
+		const store = new ActionStore<SessionAction>((actions) => writes.push(actions.map((action) => action.id)));
+		const first = turn("first restored");
+		const second = turn("second restored");
+
+		store.enqueueMany([first, second]);
+
+		expect(writes).toEqual([[first.id, second.id]]);
+		expect(store.queuedActions()).toEqual([first, second]);
+	});
+
 	it("persists enqueue before selection and records admission before changing lifecycle", () => {
 		const writes: Array<Array<{ id: string; state: string }>> = [];
 		const store = new ActionStore<SessionAction>((actions) => {

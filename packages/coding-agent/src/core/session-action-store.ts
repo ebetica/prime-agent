@@ -203,10 +203,22 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 	private readonly tickets = new Map<string, ActionTicketController>();
 
 	enqueue(action: TAction): void {
-		this.assertNewAction(action);
-		this.list(action.delivery).push(action);
-		this.tickets.set(action.id, new ActionTicketController(action.id));
-		this.persistState(this.queuedActions(), this.activeActions());
+		this.enqueueMany([action]);
+	}
+
+	/** Restores a complete durable batch before publishing one replacement checkpoint. */
+	enqueueMany(actions: readonly TAction[]): void {
+		const batchIds = new Set<string>();
+		for (const action of actions) {
+			this.assertNewAction(action);
+			if (batchIds.has(action.id)) throw new Error(`Duplicate session action id: ${action.id}`);
+			batchIds.add(action.id);
+		}
+		for (const action of actions) {
+			this.list(action.delivery).push(action);
+			this.tickets.set(action.id, new ActionTicketController(action.id));
+		}
+		if (actions.length > 0) this.persistState(this.queuedActions(), this.activeActions());
 	}
 
 	enqueueFront(action: TAction): void {
