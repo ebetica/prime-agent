@@ -4099,7 +4099,7 @@ export class AgentSession {
 			);
 			this._disconnectFromAgent();
 			this._eventListeners = [];
-			cleanupSessionResources(this.sessionId);
+			cleanupSessionResources(this.agent.sessionId);
 		} finally {
 			for (const callback of this._disposeCallbacks) {
 				try {
