@@ -172,13 +172,15 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				websocketRequestId,
 			);
 			const bodyJson = JSON.stringify(body);
+			const requestBytes = new TextEncoder().encode(bodyJson).byteLength;
 			const transport = options?.transport || "auto";
+			const oversizedPlainWebSocket = transport === "websocket" && requestBytes > MAX_PLAIN_WEBSOCKET_REQUEST_BYTES;
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(options?.sessionId);
-			if (websocketDisabledForSession) {
+			if (websocketDisabledForSession || oversizedPlainWebSocket) {
 				recordWebSocketSseFallback(options?.sessionId);
 			}
 
-			if (transport !== "sse" && !websocketDisabledForSession) {
+			if (transport !== "sse" && !websocketDisabledForSession && !oversizedPlainWebSocket) {
 				let websocketStarted = false;
 				try {
 					await processWebSocketStream(
@@ -216,7 +218,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 							fallbackTransport: websocketStarted ? undefined : "sse",
 							eventsEmitted: websocketStarted,
 							phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-							requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+							requestBytes,
 						}),
 					);
 					recordWebSocketFailure(options?.sessionId, error);
@@ -591,6 +593,9 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
+// Large full-context WebSocket frames are vulnerable to intermediary/TLS closes.
+// Cached/auto transports may reduce these to deltas; forced plain WebSocket cannot.
+const MAX_PLAIN_WEBSOCKET_REQUEST_BYTES = 256 * 1024;
 
 type WebSocketEventType = "open" | "message" | "error" | "close";
 type WebSocketListener = (event: unknown) => void;

@@ -124,7 +124,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
-import { DaemonWorkerClient } from "./daemon-worker-client.js";
+import { DaemonWorkerClient, isDaemonWorkerRequestTimeout } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -158,6 +158,8 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+// Focused browser reads must fail over before the browser's own 10s request budget.
+const FOCUSED_WORKER_READ_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
@@ -2260,10 +2262,8 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "list" }>,
 	): Promise<DaemonResponse> {
-		await Promise.all(
-			[...this.workers.values()].map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
-		);
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+		// The supervisor's event-fed summaries are authoritative for roster reads.
+		// Never let one wedged worker hold the global list (including list { all: true }).
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
 		const active = [...this.workers.values()]
 			.filter(
@@ -2433,7 +2433,7 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+		void this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
 	private async launchWorker(
@@ -2714,7 +2714,7 @@ export class DaemonSupervisor {
 					1000,
 				);
 				await this.assertRecoveryAllowed();
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
+				client.onFrame((frame) => this.handleWorkerClientFrame(worker, client, frame));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
@@ -3647,6 +3647,74 @@ export class DaemonSupervisor {
 		return undefined;
 	}
 
+	private async replaceUnresponsiveWorker(
+		worker: ResidentWorker,
+		observedClient: DaemonWorkerClient | undefined,
+	): Promise<void> {
+		if (worker.client !== observedClient) {
+			await worker.recovery;
+			if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+				throw new Error(`Session worker recovery failed after a responsiveness timeout`);
+			}
+			return;
+		}
+		if (worker.recovery) {
+			await worker.recovery;
+			return;
+		}
+
+		// Fence the old channel before any await so no later response from the
+		// timed-out generation can be mistaken for a response from its replacement.
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "recovering";
+		worker.descriptor.lastError = "Session worker exceeded the focused read responsiveness lease";
+		this.persistWorker(worker);
+		observedClient?.close();
+
+		const recovery = (async () => {
+			try {
+				await this.assertRecoveryAllowed();
+				const processAlive = isProcessAlive(worker.descriptor.pid);
+				const observedProcessStartId = processAlive ? getProcessStartId(worker.descriptor.pid) : undefined;
+				const processIdentityMatches =
+					worker.descriptor.processStartId !== undefined &&
+					observedProcessStartId === worker.descriptor.processStartId;
+				if (processAlive && !processIdentityMatches) {
+					throw new Error(
+						`Cannot safely replace unresponsive session worker ${worker.descriptor.workerId} without a verified process identity`,
+					);
+				}
+				await this.recoverUncertainWorkerOperations(worker, processAlive && processIdentityMatches);
+				if (this.isWorkerRecoveryCancelled(worker)) return;
+				await this.launchWorker(worker.descriptor.createCommand, worker);
+			} catch (error) {
+				if (!isSupervisorRecoveryCancelled(error) && !this.isWorkerRecoveryCancelled(worker)) {
+					worker.descriptor.lifecycle = "failed";
+					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
+					this.persistWorker(worker);
+				}
+				throw error;
+			}
+		})();
+		worker.recovery = recovery.finally(() => {
+			worker.recovery = undefined;
+		});
+		await worker.recovery;
+	}
+
+	private async withFocusedWorkerReadRetry<T>(worker: ResidentWorker, operation: () => Promise<T>): Promise<T> {
+		const observedClient = worker.client;
+		try {
+			return await operation();
+		} catch (error) {
+			if (!isDaemonWorkerRequestTimeout(error)) throw error;
+			await this.replaceUnresponsiveWorker(worker, observedClient);
+			// One retry only: a second timeout is surfaced rather than creating a
+			// replacement loop under a persistently broken session.
+			return operation();
+		}
+	}
+
 	private async forwardToWorker(
 		worker: ResidentWorker,
 		command: DaemonCommand,
@@ -3655,7 +3723,15 @@ export class DaemonSupervisor {
 		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
 			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
 		}
-		const response = await worker.client.request(withoutCommandId(command), timeoutMs);
+		const response =
+			command.type === "get_state" || command.type === "get_messages"
+				? await this.withFocusedWorkerReadRetry(worker, async () => {
+						if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+							throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
+						}
+						return worker.client.request(withoutCommandId(command), FOCUSED_WORKER_READ_TIMEOUT_MS);
+					})
+				: await worker.client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
@@ -3774,14 +3850,22 @@ export class DaemonSupervisor {
 						if (!match.worker.client) {
 							throw new Error("Session worker is not connected");
 						}
-						const response = await match.worker.client.request({
-							type: "attach",
-							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
-							supportsExtensionUi: false,
-							env: command.env ?? collectDaemonClientEnv(),
+						const response = await this.withFocusedWorkerReadRetry(match.worker, async () => {
+							if (!match.worker.client || match.worker.descriptor.lifecycle !== "ready") {
+								throw new Error(`Session worker is ${match.worker.descriptor.lifecycle}`);
+							}
+							return match.worker.client.request(
+								{
+									type: "attach",
+									activeSessionId,
+									capabilities: client.capabilities.has("chunked_snapshot")
+										? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
+										: ["attach_snapshot", "event_sequence", "slim_attach"],
+									supportsExtensionUi: false,
+									env: command.env ?? collectDaemonClientEnv(),
+								},
+								FOCUSED_WORKER_READ_TIMEOUT_MS,
+							);
 						});
 						const loaded = attachResultFromResponse(response);
 						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
@@ -3831,6 +3915,19 @@ export class DaemonSupervisor {
 				}
 			}
 		}
+		// A passive-session attach hydrates the child in the worker. Publish the
+		// returned snapshot summary into the supervisor cache before list can race it.
+		const hydratedSummary = result.snapshot.summary;
+		for (const [summaryId, summary] of match.worker.summaries) {
+			if (
+				summary.sessionId === hydratedSummary.sessionId ||
+				(summary.sessionFile !== undefined && summary.sessionFile === hydratedSummary.sessionFile)
+			) {
+				match.worker.summaries.delete(summaryId);
+			}
+		}
+		match.worker.summaries.set(hydratedSummary.activeSessionId ?? hydratedSummary.id, hydratedSummary);
+
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
 		if (client.capabilities.has("chunked_snapshot")) {
@@ -4175,6 +4272,17 @@ export class DaemonSupervisor {
 		await this.subscribeWorker(match.worker, match.summary.activeSessionId ?? match.summary.id).catch(
 			() => undefined,
 		);
+	}
+
+	private handleWorkerClientFrame(
+		worker: ResidentWorker,
+		client: DaemonWorkerClient,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+	): void {
+		// close() cannot retract a frame already queued by the socket. Only the
+		// currently installed generation may update summaries or reach clients.
+		if (worker.client !== client) return;
+		this.handleWorkerFrame(worker, frame);
 	}
 
 	private handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void {

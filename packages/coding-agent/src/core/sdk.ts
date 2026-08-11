@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
@@ -336,7 +337,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				headers: response.headers,
 			});
 		},
-		sessionId: sessionManager.getSessionId(),
+		// Provider transport continuation is runtime-local, never durable session state.
+		sessionId: `${sessionManager.getSessionId()}:${randomUUID()}`,
 		transformContext: async (messages) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner) return messages;

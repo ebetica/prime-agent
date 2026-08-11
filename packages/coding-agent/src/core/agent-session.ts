@@ -240,6 +240,7 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import { SessionActionQueueJournal } from "./session-action-queue-journal.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -708,6 +709,15 @@ interface RestoredPromptInput {
 }
 
 export const SESSION_ACTION_RECOVERY_FORMAT_VERSION = 1;
+const INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX = "session-action-recovery:";
+const INTERRUPTED_RUN_RECOVERY_PROMPT =
+	"Your previous run was interrupted by a worker or server restart and was not replayed. " +
+	"Inspect the transcript, Git state, and any external side effects to determine what completed, then continue the task safely. " +
+	"Do not repeat side effects until you have verified their current state.";
+
+function isInterruptedRunRecoveryActionId(actionId: string): boolean {
+	return actionId.startsWith(INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX);
+}
 
 export interface SessionActionRecoveryRecord {
 	id: string;
@@ -1137,7 +1147,9 @@ export class AgentSession {
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
-	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _actionStore: ActionStore<QueuedSessionAction>;
+	private readonly _actionQueueJournal?: SessionActionQueueJournal;
+	private _updateRestartInterruptedActions: QueuedSessionAction[] = [];
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	// Coalesces wakes so overlapping submissions cannot start competing pumps.
 	private _sessionInputPumpRequested = false;
@@ -1327,6 +1339,11 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		this._actionQueueJournal = artifactDir ? new SessionActionQueueJournal(artifactDir) : undefined;
+		this._actionStore = new ActionStore<QueuedSessionAction>((queued, admitted) =>
+			this._persistSessionActionState(queued, admitted),
+		);
 		this.settingsManager = config.settingsManager;
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1401,6 +1418,73 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		const durableActions = this._actionQueueJournal?.read();
+		if (durableActions?.admitted.actions.length) {
+			const recorded = new Set(
+				this.sessionManager
+					.getBranch()
+					.filter(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "custom" &&
+							entry.message.customType === "prime-agent.session_action_interrupted",
+					)
+					.map((entry) =>
+						entry.type === "message" && entry.message.role === "custom"
+							? (entry.message.details as { actionId?: unknown } | undefined)?.actionId
+							: undefined,
+					)
+					.filter((id): id is string => typeof id === "string"),
+			);
+			for (const action of durableActions.admitted.actions) {
+				if (recorded.has(action.id)) continue;
+				const interrupted: CustomMessage = {
+					role: "custom",
+					customType: "prime-agent.session_action_interrupted",
+					content: `Interrupted by worker loss; execution and outcome are uncertain. Not replayed automatically.\n\n${action.payload.text}`,
+					display: true,
+					timestamp: Date.now(),
+					details: {
+						interruptionId: `session-action-interrupted:${action.id}`,
+						actionId: action.id,
+						state: "interrupted",
+						source: action.source,
+						...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
+					},
+				};
+				this.sessionManager.appendMessage(interrupted);
+			}
+		}
+		if (durableActions) {
+			const interruptedWork = durableActions.admitted.actions.filter(
+				(action) => !isInterruptedRunRecoveryActionId(action.id),
+			);
+			const recoveryRoot = interruptedWork[0];
+			const recoveryActions = recoveryRoot
+				? this._sessionActionRecoverySnapshot([
+						this._createPreparedTurnAction("steer", INTERRUPTED_RUN_RECOVERY_PROMPT, undefined, {
+							actionId: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
+							queueKey: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
+							source: "internal",
+						}),
+					]).actions
+				: [];
+			const restoredQueue: SessionActionRecoverySnapshot = {
+				formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+				actions: [...recoveryActions, ...durableActions.queue.actions],
+			};
+			if (restoredQueue.actions.length > 0) {
+				this._sessionInputPumpSuspended = true;
+				void this.restoreSessionActions(restoredQueue);
+			} else {
+				this._actionQueueJournal?.write({
+					formatVersion: 1,
+					queue: restoredQueue,
+					admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
+				});
+			}
+		}
+
 		if (this._recoverPlannedRestartContinuationIntents() > 0) {
 			// A prior successor may have acknowledged resume and crashed before the
 			// queued continuation reached the transcript. The durable intent is
@@ -4044,7 +4128,7 @@ export class AgentSession {
 			);
 			this._disconnectFromAgent();
 			this._eventListeners = [];
-			cleanupSessionResources(this.sessionId);
+			cleanupSessionResources(this.agent.sessionId);
 		} finally {
 			for (const callback of this._disposeCallbacks) {
 				try {
@@ -5142,7 +5226,17 @@ export class AgentSession {
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 			};
 		});
-		for (const action of actions) this._admitSessionInput(action, { restore: true });
+		this._assertSessionActionAdmissionAvailable(true);
+		this._actionStore.enqueueMany(actions);
+		for (const action of actions) {
+			this._actionStore.ticketFor(action).settleAccepted({
+				status: "accepted",
+				actionId: action.id,
+				disposition: "queued",
+			});
+			this._sessionInputArrivalEpoch++;
+		}
+		if (actions.length > 0) this._emitQueueUpdate();
 		return actions.length;
 	}
 
@@ -5173,6 +5267,7 @@ export class AgentSession {
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
 			source: "internal",
+			restoring: true,
 		});
 	}
 
@@ -5469,14 +5564,14 @@ export class AgentSession {
 		};
 	}
 
-	private _assertSessionActionAdmissionAvailable(): void {
+	private _assertSessionActionAdmissionAvailable(restoring = false): void {
 		if (this._resourceReloadInProgress) {
 			throw new Error("Cannot admit a session action while resources are reloading.");
 		}
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
+		if (!restoring && this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
 		}
 	}
@@ -5485,6 +5580,7 @@ export class AgentSession {
 		action: QueuedSessionAction,
 		options: {
 			restore?: boolean;
+			allowWhileSuspended?: boolean;
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
@@ -5494,7 +5590,8 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		this._assertSessionActionAdmissionAvailable();
+		if (!options.restore && action.wake === "immediate") this._sessionInputPumpSuspended = false;
+		this._assertSessionActionAdmissionAvailable(options.restore === true || options.allowWhileSuspended === true);
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5548,13 +5645,14 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			restoring?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(action, { allowWhileSuspended: options.restoring }).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -6396,10 +6494,28 @@ export class AgentSession {
 		);
 	}
 
+	private _persistSessionActionState(
+		queued: readonly QueuedSessionAction[],
+		admitted: readonly QueuedSessionAction[],
+	): void {
+		const admittedById = new Map(admitted.map((action) => [action.id, action]));
+		for (const action of this._updateRestartInterruptedActions) admittedById.set(action.id, action);
+		const durableQueued = queued.filter((action) => !admittedById.has(action.id));
+		this._actionQueueJournal?.write({
+			formatVersion: 1,
+			queue: this._sessionActionRecoverySnapshot(durableQueued),
+			admitted: this._sessionActionRecoverySnapshot([...admittedById.values()]),
+		});
+	}
+
 	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {
+		return this._sessionActionRecoverySnapshot(this._actionStore.snapshotActions());
+	}
+
+	private _sessionActionRecoverySnapshot(actions: readonly QueuedSessionAction[]): SessionActionRecoverySnapshot {
 		return {
 			formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
-			actions: this._actionStore.snapshotActions().map((action) => ({
+			actions: actions.map((action) => ({
 				id: action.id,
 				source: action.source,
 				delivery: action.delivery,
@@ -6636,6 +6752,10 @@ export class AgentSession {
 
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
+		if (this._updateRestartInterruptedActions.length > 0) {
+			this._updateRestartInterruptedActions = [];
+			this._persistSessionActionState(this._actionStore.queuedActions(), this._actionStore.activeActions());
+		}
 		this._sessionInputPumpSuspended = false;
 		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
@@ -6791,6 +6911,9 @@ export class AgentSession {
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
+		const interruptedActions = [...this._actionStore.activeActions()];
+		if (interruptedActions.length > 0) this._updateRestartInterruptedActions = interruptedActions;
+		this._persistSessionActionState(this._actionStore.queuedActions(), this._actionStore.activeActions());
 		this.agent.abort();
 		if (this._goalAbortInProgress) {
 			void this.agent

@@ -11,8 +11,9 @@ import {
 	createAgentSessionMessage,
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
+import type { SessionActionRecoveryAction } from "../../src/core/agent-session.js";
 import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
-import { createSessionSlashCommandMessage } from "../../src/core/messages.js";
+import { type CustomMessage, createSessionSlashCommandMessage } from "../../src/core/messages.js";
 import {
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
@@ -24,6 +25,7 @@ import {
 	type RefinementResult,
 	saveHarnessState,
 } from "../../src/core/refinement/index.js";
+import { SessionActionQueueJournal } from "../../src/core/session-action-queue-journal.js";
 import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
@@ -101,6 +103,35 @@ function heartbeatJob(): AgentCronJob {
 
 const skipReviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 
+function crashWindowAction(): SessionActionRecoveryAction {
+	return {
+		id: "action-crash-window",
+		source: "internal" as const,
+		delivery: "when_run_idle" as const,
+		wake: "external_resume" as const,
+		agentMessageId: "agent-message-7",
+		payload: {
+			kind: "turn" as const,
+			text: "operator action text",
+			records: [
+				{
+					id: "record-crash-window",
+					role: "primary" as const,
+					message: { role: "user" as const, content: "sensitive prepared payload", timestamp: 1 },
+					ownerActionId: "action-crash-window",
+				},
+			],
+			executionPolicy: {
+				preparation: { emitBeforeAgentStart: true, applyPromptTemplate: true, preservePromptContent: true },
+				turn: { allowAutoCompaction: true, allowAutoRetry: true, allowOverflowRecovery: true },
+			},
+			queueVisible: true,
+			acceptedAgentMessage: true,
+			acceptedBeforeCompletion: true,
+		},
+	} as unknown as SessionActionRecoveryAction;
+}
+
 describe("AgentSession queue characterization", () => {
 	const harnesses: Harness[] = [];
 
@@ -108,6 +139,309 @@ describe("AgentSession queue characterization", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("materializes a durably admitted crash-window action once as interrupted without replay", async () => {
+		const action = crashWindowAction();
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				const artifactDir = sessionManager.getSessionArtifactDir();
+				if (!artifactDir) throw new Error("missing durable fixture state");
+				new SessionActionQueueJournal(artifactDir).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [] },
+					admitted: { formatVersion: 1, actions: [action] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+		const interrupted = replacement.sessionManager
+			.getBranch()
+			.flatMap((entry) =>
+				entry.type === "message" &&
+				entry.message.role === "custom" &&
+				entry.message.customType === "prime-agent.session_action_interrupted"
+					? [entry.message as CustomMessage]
+					: [],
+			);
+		expect(interrupted).toHaveLength(1);
+		expect(getMessageText(interrupted[0]!)).toContain("execution and outcome are uncertain");
+		expect(getMessageText(interrupted[0]!)).toContain("operator action text");
+		expect(interrupted[0]?.details).toMatchObject({
+			interruptionId: `session-action-interrupted:${action.id}`,
+			actionId: action.id,
+			agentMessageId: "agent-message-7",
+			state: "interrupted",
+			source: "internal",
+		});
+		expect(JSON.stringify(interrupted[0])).not.toContain("sensitive prepared payload");
+		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
+			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
+		);
+		const recovery = replacement.session.getSessionActionRecoverySnapshot().actions;
+		expect(recovery).toHaveLength(1);
+		expect(recovery[0]).toMatchObject({
+			id: `session-action-recovery:${action.id}`,
+			source: "internal",
+			payload: { kind: "turn", text: expect.stringContaining("Inspect the transcript, Git state") },
+		});
+		expect(
+			new SessionActionQueueJournal(replacement.session.sessionManager.getSessionArtifactDir()!).read(),
+		).toMatchObject({
+			queue: { actions: [{ id: `session-action-recovery:${action.id}` }] },
+			admitted: { actions: [] },
+		});
+	});
+
+	it("restores a durable action batch without checkpointing a lossy prefix", async () => {
+		const first = crashWindowAction();
+		const second = structuredClone(first);
+		second.id = "action-crash-window-second";
+		second.payload.text = "second operator action";
+		if (second.payload.kind === "turn") {
+			second.payload.records[0]!.id = "record-crash-window-second";
+			second.payload.records[0]!.ownerActionId = second.id;
+		}
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				const artifactDir = sessionManager.getSessionArtifactDir();
+				if (!artifactDir) throw new Error("missing durable fixture state");
+				new SessionActionQueueJournal(artifactDir).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [first, second] },
+					admitted: { formatVersion: 1, actions: [] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+
+		expect(replacement.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			first.id,
+			second.id,
+		]);
+		expect(
+			new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!)
+				.read()
+				?.queue.actions.map((action) => action.id),
+		).toEqual([first.id, second.id]);
+	});
+
+	it("does not duplicate an interruption after crashing between transcript append and journal clear", async () => {
+		const action = crashWindowAction();
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				const artifactDir = sessionManager.getSessionArtifactDir();
+				if (!artifactDir) throw new Error("missing durable fixture state");
+				sessionManager.appendMessage({
+					role: "custom",
+					customType: "prime-agent.session_action_interrupted",
+					content: `Interrupted by worker loss; execution and outcome are uncertain. Not replayed automatically.\n\n${action.payload.text}`,
+					display: true,
+					timestamp: 1,
+					details: {
+						interruptionId: `session-action-interrupted:${action.id}`,
+						actionId: action.id,
+						state: "interrupted",
+						source: action.source,
+						agentMessageId: action.agentMessageId,
+					},
+				});
+				// Exact persisted state after the prior replacement appended history but
+				// crashed before clearing its admitted checkpoint.
+				new SessionActionQueueJournal(artifactDir).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [] },
+					admitted: { formatVersion: 1, actions: [action] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+		const interruptions = replacement.sessionManager
+			.getBranch()
+			.filter(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "custom" &&
+					entry.message.customType === "prime-agent.session_action_interrupted",
+			);
+		expect(interruptions).toHaveLength(1);
+		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
+			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
+		);
+		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toMatchObject({
+			queue: { actions: [{ id: `session-action-recovery:${action.id}` }] },
+			admitted: { actions: [] },
+		});
+	});
+
+	it("keeps one stable recovery action across marker, enqueue, and admission crashes", async () => {
+		const interrupted = crashWindowAction();
+		const later = structuredClone(interrupted);
+		later.id = "action-after-interruption";
+		later.payload.text = "later queued user work";
+		if (later.payload.kind === "turn") {
+			later.payload.records[0]!.id = "record-after-interruption";
+			later.payload.records[0]!.ownerActionId = later.id;
+			later.payload.records[0]!.message = { role: "user", content: "later queued user work", timestamp: 2 };
+		}
+		const afterMarker = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [later] },
+					admitted: { formatVersion: 1, actions: [interrupted] },
+				});
+			},
+		});
+		harnesses.push(afterMarker);
+		const afterMarkerActions = afterMarker.session.getSessionActionRecoverySnapshot().actions;
+		expect(afterMarkerActions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			later.id,
+		]);
+
+		const afterEnqueue = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: structuredClone(afterMarkerActions) },
+					admitted: { formatVersion: 1, actions: [] },
+				});
+			},
+		});
+		harnesses.push(afterEnqueue);
+		expect(afterEnqueue.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			later.id,
+		]);
+
+		const recovery = structuredClone(afterMarkerActions[0]!);
+		const afterAdmission = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [later] },
+					admitted: { formatVersion: 1, actions: [recovery] },
+				});
+			},
+		});
+		harnesses.push(afterAdmission);
+		expect(afterAdmission.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			later.id,
+		]);
+		expect(
+			afterAdmission.sessionManager
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "custom" &&
+						entry.message.customType === "prime-agent.session_action_interrupted",
+				),
+		).toHaveLength(1);
+	});
+
+	it("keeps a restart-interrupted selected action admitted when the invalidated pump rolls it back", async () => {
+		const interruptedRuntime = await createHarness({ persistSession: true });
+		harnesses.push(interruptedRuntime);
+		const pause = interruptedRuntime.session.acquireQueuedWorkPause();
+		await interruptedRuntime.session.followUp("selected original work");
+		const internals = interruptedRuntime.session as unknown as {
+			_actionStore: {
+				selectFirst(): unknown;
+				rollback(action: unknown): void;
+			};
+		};
+		const selected = internals._actionStore.selectFirst();
+		expect(selected).toBeDefined();
+		interruptedRuntime.session.abortForUpdateRestart();
+		internals._actionStore.rollback(selected);
+		pause.release();
+
+		const interruptedState = new SessionActionQueueJournal(
+			interruptedRuntime.sessionManager.getSessionArtifactDir()!,
+		).read();
+		expect(interruptedState?.queue.actions).toEqual([]);
+		expect(interruptedState?.admitted.actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ text: "selected original work" }) }),
+		]);
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write(interruptedState!);
+			},
+		});
+		harnesses.push(replacement);
+		replacement.setResponses([fauxAssistantMessage("inspected before continuing")]);
+		replacement.session.resumeQueuedWork();
+		await replacement.session.waitForIdle();
+		expect(getUserTexts(replacement)).toHaveLength(1);
+		expect(getUserTexts(replacement)[0]).toContain("Inspect the transcript, Git state");
+		expect(getUserTexts(replacement)).not.toContain("selected original work");
+	});
+
+	it("prioritizes one recovery instruction ahead of queued steering and follow-up work", async () => {
+		const interrupted = crashWindowAction();
+		const queuedAction = (
+			id: string,
+			text: string,
+			delivery: SessionActionRecoveryAction["delivery"],
+		): SessionActionRecoveryAction => {
+			const action = structuredClone(interrupted);
+			action.id = id;
+			action.delivery = delivery;
+			action.payload.text = text;
+			if (action.payload.kind === "turn") {
+				action.payload.records[0]!.id = `record-${id}`;
+				action.payload.records[0]!.ownerActionId = id;
+				action.payload.records[0]!.message = { role: "user", content: text, timestamp: 2 };
+			}
+			return action;
+		};
+		const steering = queuedAction("queued-steering", "queued steering work", "next_turn_boundary");
+		const followUp = queuedAction("queued-follow-up", "queued follow-up work", "when_run_idle");
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [steering, followUp] },
+					admitted: { formatVersion: 1, actions: [interrupted] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+		expect(replacement.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			steering.id,
+			followUp.id,
+		]);
+		replacement.setResponses([
+			fauxAssistantMessage("recovered safely"),
+			fauxAssistantMessage("steering done"),
+			fauxAssistantMessage("follow-up done"),
+		]);
+
+		expect(replacement.session.resumeQueuedWork()).toBe(true);
+		await replacement.session.waitForIdle();
+
+		const delivered = getUserTexts(replacement);
+		expect(delivered).toHaveLength(3);
+		expect(delivered[0]).toContain("Inspect the transcript, Git state");
+		expect(delivered[0]).not.toContain("operator action text");
+		expect(delivered[0]).not.toContain("sensitive prepared payload");
+		expect(delivered.slice(1)).toEqual(["queued steering work", "queued follow-up work"]);
+		expect(getAssistantTexts(replacement)).toEqual(["recovered safely", "steering done", "follow-up done"]);
+		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
 	it("does not count failed assistant messages toward the auto-refine interval", async () => {
@@ -372,32 +706,45 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it.each([
-		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort() },
+		{
+			name: "requestAbort",
+			abort: (harness: Harness) => harness.session.requestAbort(),
+			resumesQueuedWork: true,
+		},
 		{
 			name: "abortForUpdateRestart",
 			abort: (harness: Harness) => harness.session.abortForUpdateRestart(),
+			resumesQueuedWork: false,
 		},
-	])("cancels scheduled post-compaction continuation at $name without dropping queued input", async ({ abort }) => {
-		vi.useFakeTimers();
-		const harness = await createAutoRefineHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as AutoRefineInternals;
-		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+	])(
+		"cancels scheduled post-compaction continuation at $name without dropping queued input",
+		async ({ abort, resumesQueuedWork }) => {
+			vi.useFakeTimers();
+			const harness = await createAutoRefineHarness();
+			harnesses.push(harness);
+			const internals = harness.session as unknown as AutoRefineInternals;
+			const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 
-		try {
-			internals._schedulePostCompactionContinue();
-			await harness.session.followUp("queued across abort");
+			try {
+				internals._schedulePostCompactionContinue();
+				await harness.session.followUp("queued across abort");
 
-			abort(harness);
-			await vi.advanceTimersByTimeAsync(100);
+				abort(harness);
+				await vi.advanceTimersByTimeAsync(100);
 
-			expect(continueAgent).not.toHaveBeenCalled();
-			expect(internals._postCompactionContinuationScheduled).toBe(false);
-			expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
+				expect(continueAgent).not.toHaveBeenCalled();
+				expect(internals._postCompactionContinuationScheduled).toBe(false);
+				if (resumesQueuedWork) {
+					expect(harness.session.getFollowUpMessages()).toEqual([]);
+					expect(getUserTexts(harness)).toContain("queued across abort");
+				} else {
+					expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
+				}
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
 		vi.useFakeTimers();
@@ -3141,7 +3488,7 @@ describe("AgentSession scheduler scenarios", () => {
 	});
 
 	it("S4: restart abort snapshots queued work and restores it, envelopes as commands", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		let providerCalls = 0;
 		const firstGate = createDeferred();
@@ -3182,6 +3529,9 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.agent.waitForIdle();
 		await harness.session.waitForSessionInputIdle();
 		expect(providerCalls).toBe(0);
+		expect(
+			new SessionActionQueueJournal(harness.sessionManager.getSessionArtifactDir()!).read()?.admitted.actions,
+		).toEqual([expect.objectContaining({ payload: expect.objectContaining({ text: "first" }) })]);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
 		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
 			expect.objectContaining({ payload: expect.objectContaining({ text: "queued for restart" }) }),
@@ -3253,6 +3603,7 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(getUserTexts(harness)).toContain("queued for restart");
 		expect(getUserTexts(harness)).toContain(agentPrompt);
 		expect(harness.session.queuedActionCount).toBe(0);
+		expect(new SessionActionQueueJournal(harness.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
 	it("S5: settles queued command delivery before gated completion and rejects completion on failure", async () => {

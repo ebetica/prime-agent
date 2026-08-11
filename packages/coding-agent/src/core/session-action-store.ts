@@ -194,14 +194,31 @@ export class ActionTicketController {
 }
 
 export class ActionStore<TAction extends SessionAction = SessionAction> {
+	constructor(
+		private readonly persistState: (queued: readonly TAction[], admitted: readonly TAction[]) => void = () => {},
+	) {}
+
 	private readonly nextTurnBoundary: TAction[] = [];
 	private readonly whenRunIdle: TAction[] = [];
 	private readonly tickets = new Map<string, ActionTicketController>();
 
 	enqueue(action: TAction): void {
-		this.assertNewAction(action);
-		this.list(action.delivery).push(action);
-		this.tickets.set(action.id, new ActionTicketController(action.id));
+		this.enqueueMany([action]);
+	}
+
+	/** Restores a complete durable batch before publishing one replacement checkpoint. */
+	enqueueMany(actions: readonly TAction[]): void {
+		const batchIds = new Set<string>();
+		for (const action of actions) {
+			this.assertNewAction(action);
+			if (batchIds.has(action.id)) throw new Error(`Duplicate session action id: ${action.id}`);
+			batchIds.add(action.id);
+		}
+		for (const action of actions) {
+			this.list(action.delivery).push(action);
+			this.tickets.set(action.id, new ActionTicketController(action.id));
+		}
+		if (actions.length > 0) this.persistState(this.queuedActions(), this.activeActions());
 	}
 
 	enqueueFront(action: TAction): void {
@@ -210,23 +227,41 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		const firstQueued = list.findIndex((item) => item.lifecycle.state === "queued");
 		list.splice(firstQueued < 0 ? list.length : firstQueued, 0, action);
 		this.tickets.set(action.id, new ActionTicketController(action.id));
+		this.persistState(this.queuedActions(), this.activeActions());
 	}
 
 	selectFirst(): TAction | undefined {
 		const action =
 			this.nextTurnBoundary.find((item) => item.lifecycle.state === "queued") ??
 			this.whenRunIdle.find((item) => item.lifecycle.state === "queued");
-		if (action) transitionSessionAction(action, { state: "selected" });
+		if (action) {
+			this.persistState(
+				this.queuedActions().filter((candidate) => candidate !== action),
+				[...this.activeActions(), action],
+			);
+			transitionSessionAction(action, { state: "selected" });
+		}
 		return action;
 	}
 
 	remove(predicate: (action: TAction) => boolean, candidates = this.clearableActions()): TAction[] {
 		const removed = candidates.filter(predicate);
+		if (removed.length > 0) {
+			const removedSet = new Set(removed);
+			this.persistState(
+				this.queuedActions().filter((action) => !removedSet.has(action)),
+				this.activeActions().filter((action) => !removedSet.has(action)),
+			);
+		}
 		for (const action of removed) transitionSessionAction(action, { state: "cancelled" });
 		return removed;
 	}
 
 	rollback(action: TAction, proof?: RollbackProof): void {
+		this.persistState(
+			this.actions().filter((candidate) => candidate.lifecycle.state === "queued" || candidate === action),
+			this.activeActions().filter((candidate) => candidate !== action),
+		);
 		transitionSessionAction(action, { state: "queued" }, { rollbackProof: proof });
 	}
 
@@ -277,6 +312,7 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		if (!TERMINAL_STATES.has(action.lifecycle.state)) {
 			throw new Error(`Cannot release nonterminal session action ${action.id}`);
 		}
+		this.persistState(this.queuedActions(), this.activeActions());
 		const list = this.list(action.delivery);
 		const index = list.indexOf(action);
 		if (index >= 0) list.splice(index, 1);

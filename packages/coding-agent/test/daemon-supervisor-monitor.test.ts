@@ -20,6 +20,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonWorkerRequestTimeoutError } from "../src/modes/daemon/daemon-worker-client.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -1486,6 +1487,7 @@ describe("daemon worker supervisor monitoring", () => {
 			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 				descriptorDir,
 				socketPath: "/tmp/supervisor.sock",
+				defaultSessionConfig: {},
 				workers: new Map(),
 				log: vi.fn(),
 			}) as {
@@ -1575,6 +1577,163 @@ describe("daemon worker supervisor monitoring", () => {
 		await supervisor.attachClient(client, { type: "attach", activeSessionId });
 
 		expect(seed).toHaveBeenCalledWith(activeSessionId, streamingMessage);
+	});
+
+	it("fences one stale worker generation before sharing a single replacement", async () => {
+		const staleClient = { close: vi.fn() };
+		const worker = {
+			descriptor: {
+				workerId: "worker-stale",
+				lifecycle: "ready",
+				pid: 2_147_483_647,
+				createCommand: { type: "create" },
+			},
+			client: staleClient,
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const freshClient = { close: vi.fn() };
+		const recoverUncertainWorkerOperations = vi.fn(async () => undefined);
+		const launchWorker = vi.fn(async () => {
+			worker.client = freshClient;
+			worker.descriptor.lifecycle = "ready";
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			recoverUncertainWorkerOperations,
+			launchWorker,
+		}) as unknown as {
+			replaceUnresponsiveWorker(target: typeof worker, client: typeof staleClient): Promise<void>;
+		};
+
+		const first = supervisor.replaceUnresponsiveWorker(worker, staleClient);
+		const second = supervisor.replaceUnresponsiveWorker(worker, staleClient);
+		expect(worker.client).toBeUndefined();
+		expect(worker.descriptor.lifecycle).toBe("recovering");
+		expect(staleClient.close).toHaveBeenCalledTimes(1);
+
+		await Promise.all([first, second]);
+
+		expect(recoverUncertainWorkerOperations).toHaveBeenCalledTimes(1);
+		expect(launchWorker).toHaveBeenCalledTimes(1);
+		expect(worker.client).toBe(freshClient);
+	});
+
+	it("ignores queued frames from a fenced worker generation", () => {
+		const staleClient = {};
+		const currentClient = {};
+		const worker = { client: currentClient, heartbeatSnapshotStale: false };
+		const broadcastHeartbeatsChanged = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			broadcastHeartbeatsChanged,
+		}) as unknown as {
+			handleWorkerClientFrame(
+				target: typeof worker,
+				client: typeof staleClient,
+				frame: PrivateFrame<DaemonWorkerFrameHeader>,
+			): void;
+		};
+		const frame: PrivateFrame<DaemonWorkerFrameHeader> = {
+			header: { kind: "outbound", outboundType: "heartbeats_changed" },
+			payload: Buffer.from(""),
+		};
+
+		supervisor.handleWorkerClientFrame(worker, staleClient, frame);
+
+		expect(worker.heartbeatSnapshotStale).toBe(false);
+		expect(broadcastHeartbeatsChanged).not.toHaveBeenCalled();
+	});
+
+	it("replaces a worker after a focused read timeout and retries only once", async () => {
+		const firstRequest = vi.fn(async () => {
+			throw new DaemonWorkerRequestTimeoutError("wedged");
+		});
+		const secondRequest = vi.fn(async () => {
+			throw new DaemonWorkerRequestTimeoutError("still wedged");
+		});
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready" },
+			client: { request: firstRequest },
+		};
+		const replaceUnresponsiveWorker = vi.fn(async () => {
+			worker.client = { request: secondRequest };
+			worker.descriptor.lifecycle = "ready";
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			replaceUnresponsiveWorker,
+		}) as unknown as {
+			forwardToWorker(
+				target: typeof worker,
+				command: { type: "get_messages"; activeSessionId: string },
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.forwardToWorker(worker, { type: "get_messages", activeSessionId: "active-1" }),
+		).rejects.toThrow("still wedged");
+
+		expect(replaceUnresponsiveWorker).toHaveBeenCalledTimes(1);
+		expect(firstRequest).toHaveBeenCalledWith({ type: "get_messages", activeSessionId: "active-1" }, 5_000);
+		expect(secondRequest).toHaveBeenCalledTimes(1);
+		expect(secondRequest).toHaveBeenCalledWith({ type: "get_messages", activeSessionId: "active-1" }, 5_000);
+	});
+
+	it("serves list all from supervisor summaries without worker RPC", async () => {
+		const activeSessionId = "active-cached";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-cached",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const request = vi.fn();
+		const worker = {
+			descriptor: { workerId: "worker-cached", lifecycle: "ready", pid: 1234 },
+			client: { request },
+			summaries: new Map([[activeSessionId, summary]]),
+		};
+		const refreshWorkerSummaries = vi.fn(async () => {
+			throw new Error("worker wedged");
+		});
+		const syncAgentPeers = vi.fn(async () => {
+			throw new Error("worker wedged");
+		});
+		const client = { attachedActiveSessionIds: new Set<string>() };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			defaultSessionConfig: {},
+			catalog: { list: vi.fn(async () => []) },
+			refreshWorkerSummaries,
+			syncAgentPeers,
+		}) as unknown as {
+			handleList(
+				targetClient: typeof client,
+				command: { type: "list"; id: string; all: true },
+			): Promise<{
+				success: boolean;
+				data?: { sessions?: SessionSummary[] };
+			}>;
+		};
+
+		const response = await supervisor.handleList(client, { type: "list", id: "list-1", all: true });
+
+		expect(response.success).toBe(true);
+		expect(response.data?.sessions).toEqual([expect.objectContaining({ activeSessionId, workerState: "ready" })]);
+		expect(request).not.toHaveBeenCalled();
+		expect(refreshWorkerSummaries).not.toHaveBeenCalled();
+		expect(syncAgentPeers).not.toHaveBeenCalled();
 	});
 
 	it("catches up only after worker events are skipped behind a backpressured write", async () => {

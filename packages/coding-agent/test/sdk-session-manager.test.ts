@@ -63,6 +63,44 @@ describe("createAgentSession session manager defaults", () => {
 		session.dispose();
 	});
 
+	it("uses fresh provider generations when multiple persisted sessions are replaced", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+		const sessionDir = join(agentDir, "sessions");
+		const managers = [SessionManager.create(cwd, sessionDir), SessionManager.create(cwd, sessionDir)];
+		for (const manager of managers) {
+			manager.appendMessage({
+				role: "custom",
+				customType: "ipython_state_restored",
+				content: "prior disposable kernel was restored",
+				display: false,
+				timestamp: 1,
+			});
+			manager.flushNow();
+		}
+
+		const firstGeneration = await Promise.all(
+			managers.map((sessionManager) => createAgentSession({ cwd, agentDir, model: model!, sessionManager })),
+		);
+		const firstRuntimeIds = firstGeneration.map(({ session }) => session.agent.sessionId);
+		for (const { session } of firstGeneration) session.dispose();
+
+		const reopened = managers.map((manager) => SessionManager.open(manager.getSessionFile()!, sessionDir));
+		const replacements = await Promise.all(
+			reopened.map((sessionManager) => createAgentSession({ cwd, agentDir, model: model!, sessionManager })),
+		);
+		const replacementRuntimeIds = replacements.map(({ session }) => session.agent.sessionId);
+
+		for (let index = 0; index < replacements.length; index++) {
+			const durableId = reopened[index]!.getSessionId();
+			expect(firstRuntimeIds[index]).toMatch(new RegExp(`^${durableId}:`));
+			expect(replacementRuntimeIds[index]).toMatch(new RegExp(`^${durableId}:`));
+			expect(replacementRuntimeIds[index]).not.toBe(firstRuntimeIds[index]);
+		}
+		expect(new Set([...firstRuntimeIds, ...replacementRuntimeIds]).size).toBe(4);
+		for (const { session } of replacements) session.dispose();
+	});
+
 	it("derives cwd from an explicit sessionManager when cwd is omitted", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeTruthy();

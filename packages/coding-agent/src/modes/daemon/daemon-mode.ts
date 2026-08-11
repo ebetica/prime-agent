@@ -1301,6 +1301,9 @@ export class AgentDaemon {
 		// Restore the last persisted status so it shows before the first sweep.
 		this.summarizer.seed(state);
 		this.recordWorkerRecoveryState(state, "ready");
+		if (!this.options.worker || this.hasAuthenticatedSupervisorConnection()) {
+			(runtime.session as { resumeQueuedWork?: () => boolean }).resumeQueuedWork?.();
+		}
 		return state;
 	}
 
@@ -3222,6 +3225,7 @@ export class AgentDaemon {
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
+				for (const state of this.sessions.values()) state.runtime.session.resumeQueuedWork();
 				this.write(client, {
 					id: commandId,
 					type: "response",

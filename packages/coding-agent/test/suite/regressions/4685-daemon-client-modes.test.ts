@@ -156,9 +156,13 @@ describe("ENG-4685 daemon-backed client modes", () => {
 			launchEnv: { TEST: "value" },
 		};
 		const persistWorker = vi.fn();
-		const syncAgentPeers = vi.fn(async () => {
-			throw new Error("peer unavailable");
-		});
+		let rejectPeerSync: ((error: Error) => void) | undefined;
+		const syncAgentPeers = vi.fn(
+			() =>
+				new Promise<void>((_resolve, reject) => {
+					rejectPeerSync = reject;
+				}),
+		);
 		const log = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			protocolClientId: () => "protocol-client",
@@ -173,10 +177,11 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		await supervisor.promoteOwnedWorker(client, worker);
 
 		expect(worker.descriptor.ownerClientId).toBeUndefined();
-		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.launchEnv).toEqual({ TEST: "value" });
 		expect(persistWorker).toHaveBeenCalledOnce();
 		expect(syncAgentPeers).toHaveBeenCalledOnce();
-		expect(log).toHaveBeenCalledWith(expect.stringContaining("peer unavailable"));
+		rejectPeerSync?.(new Error("peer unavailable"));
+		await vi.waitFor(() => expect(log).toHaveBeenCalledWith(expect.stringContaining("peer unavailable")));
 	});
 
 	it("rolls back owned-worker promotion when persistence fails", async () => {

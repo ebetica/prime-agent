@@ -541,6 +541,8 @@ export function buildSessionContext(
 
 	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
+			if (entry.message.role === "custom" && entry.message.customType === "prime-agent.session_action_interrupted")
+				return;
 			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
 			target.push(
