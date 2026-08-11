@@ -3915,6 +3915,19 @@ export class DaemonSupervisor {
 				}
 			}
 		}
+		// A passive-session attach hydrates the child in the worker. Publish the
+		// returned snapshot summary into the supervisor cache before list can race it.
+		const hydratedSummary = result.snapshot.summary;
+		for (const [summaryId, summary] of match.worker.summaries) {
+			if (
+				summary.sessionId === hydratedSummary.sessionId ||
+				(summary.sessionFile !== undefined && summary.sessionFile === hydratedSummary.sessionFile)
+			) {
+				match.worker.summaries.delete(summaryId);
+			}
+		}
+		match.worker.summaries.set(hydratedSummary.activeSessionId ?? hydratedSummary.id, hydratedSummary);
+
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
 		if (client.capabilities.has("chunked_snapshot")) {
