@@ -349,6 +349,46 @@ describe("AgentSession queue characterization", () => {
 		).toHaveLength(1);
 	});
 
+	it("keeps a restart-interrupted selected action admitted when the invalidated pump rolls it back", async () => {
+		const interruptedRuntime = await createHarness({ persistSession: true });
+		harnesses.push(interruptedRuntime);
+		const pause = interruptedRuntime.session.acquireQueuedWorkPause();
+		await interruptedRuntime.session.followUp("selected original work");
+		const internals = interruptedRuntime.session as unknown as {
+			_actionStore: {
+				selectFirst(): unknown;
+				rollback(action: unknown): void;
+			};
+		};
+		const selected = internals._actionStore.selectFirst();
+		expect(selected).toBeDefined();
+		interruptedRuntime.session.abortForUpdateRestart();
+		internals._actionStore.rollback(selected);
+		pause.release();
+
+		const interruptedState = new SessionActionQueueJournal(
+			interruptedRuntime.sessionManager.getSessionArtifactDir()!,
+		).read();
+		expect(interruptedState?.queue.actions).toEqual([]);
+		expect(interruptedState?.admitted.actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ text: "selected original work" }) }),
+		]);
+
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write(interruptedState!);
+			},
+		});
+		harnesses.push(replacement);
+		replacement.setResponses([fauxAssistantMessage("inspected before continuing")]);
+		replacement.session.resumeQueuedWork();
+		await replacement.session.waitForIdle();
+		expect(getUserTexts(replacement)).toHaveLength(1);
+		expect(getUserTexts(replacement)[0]).toContain("Inspect the transcript, Git state");
+		expect(getUserTexts(replacement)).not.toContain("selected original work");
+	});
+
 	it("prioritizes one recovery instruction ahead of queued steering and follow-up work", async () => {
 		const interrupted = crashWindowAction();
 		const queuedAction = (
@@ -3563,6 +3603,7 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(getUserTexts(harness)).toContain("queued for restart");
 		expect(getUserTexts(harness)).toContain(agentPrompt);
 		expect(harness.session.queuedActionCount).toBe(0);
+		expect(new SessionActionQueueJournal(harness.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
 	it("S5: settles queued command delivery before gated completion and rejects completion on failure", async () => {

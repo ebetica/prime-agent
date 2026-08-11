@@ -6500,9 +6500,10 @@ export class AgentSession {
 	): void {
 		const admittedById = new Map(admitted.map((action) => [action.id, action]));
 		for (const action of this._updateRestartInterruptedActions) admittedById.set(action.id, action);
+		const durableQueued = queued.filter((action) => !admittedById.has(action.id));
 		this._actionQueueJournal?.write({
 			formatVersion: 1,
-			queue: this._sessionActionRecoverySnapshot(queued),
+			queue: this._sessionActionRecoverySnapshot(durableQueued),
 			admitted: this._sessionActionRecoverySnapshot([...admittedById.values()]),
 		});
 	}
@@ -6751,6 +6752,10 @@ export class AgentSession {
 
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
+		if (this._updateRestartInterruptedActions.length > 0) {
+			this._updateRestartInterruptedActions = [];
+			this._persistSessionActionState(this._actionStore.queuedActions(), this._actionStore.activeActions());
+		}
 		this._sessionInputPumpSuspended = false;
 		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
