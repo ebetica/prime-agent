@@ -709,6 +709,15 @@ interface RestoredPromptInput {
 }
 
 export const SESSION_ACTION_RECOVERY_FORMAT_VERSION = 1;
+const INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX = "session-action-recovery:";
+const INTERRUPTED_RUN_RECOVERY_PROMPT =
+	"Your previous run was interrupted by a worker or server restart and was not replayed. " +
+	"Inspect the transcript, Git state, and any external side effects to determine what completed, then continue the task safely. " +
+	"Do not repeat side effects until you have verified their current state.";
+
+function isInterruptedRunRecoveryActionId(actionId: string): boolean {
+	return actionId.startsWith(INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX);
+}
 
 export interface SessionActionRecoveryRecord {
 	id: string;
@@ -1445,15 +1454,34 @@ export class AgentSession {
 				this.sessionManager.appendMessage(interrupted);
 			}
 		}
-		if (durableActions?.queue.actions.length) {
-			this._sessionInputPumpSuspended = true;
-			void this.restoreSessionActions(durableActions.queue);
-		} else if (durableActions) {
-			this._actionQueueJournal?.write({
-				formatVersion: 1,
-				queue: durableActions.queue,
-				admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
-			});
+		if (durableActions) {
+			const interruptedWork = durableActions.admitted.actions.filter(
+				(action) => !isInterruptedRunRecoveryActionId(action.id),
+			);
+			const recoveryRoot = interruptedWork[0];
+			const recoveryActions = recoveryRoot
+				? this._sessionActionRecoverySnapshot([
+						this._createPreparedTurnAction("followUp", INTERRUPTED_RUN_RECOVERY_PROMPT, undefined, {
+							actionId: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
+							queueKey: `${INTERRUPTED_RUN_RECOVERY_ACTION_PREFIX}${recoveryRoot.id}`,
+							source: "internal",
+						}),
+					]).actions
+				: [];
+			const restoredQueue: SessionActionRecoverySnapshot = {
+				formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+				actions: [...recoveryActions, ...durableActions.queue.actions],
+			};
+			if (restoredQueue.actions.length > 0) {
+				this._sessionInputPumpSuspended = true;
+				void this.restoreSessionActions(restoredQueue);
+			} else {
+				this._actionQueueJournal?.write({
+					formatVersion: 1,
+					queue: restoredQueue,
+					admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
+				});
+			}
 		}
 
 		if (this._recoverPlannedRestartContinuationIntents() > 0) {

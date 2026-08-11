@@ -180,10 +180,19 @@ describe("AgentSession queue characterization", () => {
 		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
 			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
 		);
-		expect(replacement.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		const recovery = replacement.session.getSessionActionRecoverySnapshot().actions;
+		expect(recovery).toHaveLength(1);
+		expect(recovery[0]).toMatchObject({
+			id: `session-action-recovery:${action.id}`,
+			source: "internal",
+			payload: { kind: "turn", text: expect.stringContaining("Inspect the transcript, Git state") },
+		});
 		expect(
 			new SessionActionQueueJournal(replacement.session.sessionManager.getSessionArtifactDir()!).read(),
-		).toBeUndefined();
+		).toMatchObject({
+			queue: { actions: [{ id: `session-action-recovery:${action.id}` }] },
+			admitted: { actions: [] },
+		});
 	});
 
 	it("restores a durable action batch without checkpointing a lossy prefix", async () => {
@@ -264,6 +273,106 @@ describe("AgentSession queue characterization", () => {
 		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
 			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
 		);
+		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toMatchObject({
+			queue: { actions: [{ id: `session-action-recovery:${action.id}` }] },
+			admitted: { actions: [] },
+		});
+	});
+
+	it("keeps one stable recovery action across marker, enqueue, and admission crashes", async () => {
+		const interrupted = crashWindowAction();
+		const later = structuredClone(interrupted);
+		later.id = "action-after-interruption";
+		later.payload.text = "later queued user work";
+		if (later.payload.kind === "turn") {
+			later.payload.records[0]!.id = "record-after-interruption";
+			later.payload.records[0]!.ownerActionId = later.id;
+			later.payload.records[0]!.message = { role: "user", content: "later queued user work", timestamp: 2 };
+		}
+		const afterMarker = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [later] },
+					admitted: { formatVersion: 1, actions: [interrupted] },
+				});
+			},
+		});
+		harnesses.push(afterMarker);
+		const afterMarkerActions = afterMarker.session.getSessionActionRecoverySnapshot().actions;
+		expect(afterMarkerActions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			later.id,
+		]);
+
+		const afterEnqueue = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: structuredClone(afterMarkerActions) },
+					admitted: { formatVersion: 1, actions: [] },
+				});
+			},
+		});
+		harnesses.push(afterEnqueue);
+		expect(afterEnqueue.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			`session-action-recovery:${interrupted.id}`,
+			later.id,
+		]);
+
+		const recovery = structuredClone(afterMarkerActions[0]!);
+		const afterAdmission = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [later] },
+					admitted: { formatVersion: 1, actions: [recovery] },
+				});
+			},
+		});
+		harnesses.push(afterAdmission);
+		expect(afterAdmission.session.getSessionActionRecoverySnapshot().actions.map((action) => action.id)).toEqual([
+			later.id,
+		]);
+		expect(
+			afterAdmission.sessionManager
+				.getBranch()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "custom" &&
+						entry.message.customType === "prime-agent.session_action_interrupted",
+				),
+		).toHaveLength(1);
+	});
+
+	it("admits the recovery instruction once without replaying interrupted work", async () => {
+		const interrupted = crashWindowAction();
+		const replacement = await createHarness({
+			persistSession: true,
+			beforeSessionCreate: (sessionManager) => {
+				new SessionActionQueueJournal(sessionManager.getSessionArtifactDir()!).write({
+					formatVersion: 1,
+					queue: { formatVersion: 1, actions: [] },
+					admitted: { formatVersion: 1, actions: [interrupted] },
+				});
+			},
+		});
+		harnesses.push(replacement);
+		replacement.setResponses([fauxAssistantMessage("recovered safely")]);
+
+		expect(replacement.session.resumeQueuedWork()).toBe(true);
+		await replacement.session.waitForIdle();
+
+		const delivered = getUserTexts(replacement);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]).toContain("Inspect the transcript, Git state");
+		expect(delivered[0]).not.toContain("operator action text");
+		expect(delivered[0]).not.toContain("sensitive prepared payload");
+		expect(getAssistantTexts(replacement)).toContain("recovered safely");
 		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
