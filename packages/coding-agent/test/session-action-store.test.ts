@@ -328,3 +328,30 @@ describe("child passivation capability", () => {
 		expect(canPassivateSession(idleChild, Number.NaN, now)).toBe(false);
 	});
 });
+
+
+describe("ActionStore durable queue ordering", () => {
+	it("persists enqueue before selection and records admission before changing lifecycle", () => {
+		const writes: Array<Array<{ id: string; state: string }>> = [];
+		const store = new ActionStore<SessionAction>((actions) => {
+			writes.push(actions.map((action) => ({ id: action.id, state: action.lifecycle.state })));
+		});
+		const action = turn("durable");
+		store.enqueue(action);
+		expect(writes).toEqual([[{ id: action.id, state: "queued" }]]);
+		store.selectFirst();
+		expect(writes.at(-1)).toEqual([]);
+		expect(action.lifecycle.state).toBe("selected");
+	});
+
+	it("persists rollback before making an unadmitted action selectable again", () => {
+		const writes: string[][] = [];
+		const store = new ActionStore<SessionAction>((actions) => writes.push(actions.map((action) => action.id)));
+		const action = turn("retry");
+		store.enqueue(action);
+		store.selectFirst();
+		store.rollback(action);
+		expect(writes.at(-1)).toEqual([action.id]);
+		expect(action.lifecycle.state).toBe("queued");
+	});
+});

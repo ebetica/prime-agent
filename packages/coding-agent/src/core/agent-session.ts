@@ -216,6 +216,7 @@ import {
 	saveHarnessState,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
+import { SessionActionQueueJournal } from "./session-action-queue-journal.js";
 import type {
 	PreparedResourceReload,
 	ResourceExtensionPaths,
@@ -1137,7 +1138,8 @@ export class AgentSession {
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
-	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _actionStore: ActionStore<QueuedSessionAction>;
+	private readonly _actionQueueJournal?: SessionActionQueueJournal;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	// Coalesces wakes so overlapping submissions cannot start competing pumps.
 	private _sessionInputPumpRequested = false;
@@ -1327,6 +1329,12 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		// A new runtime generation must send full provider context. Session-scoped
+		// transports may still cache a previous_response_id from a replaced runtime.
+		cleanupSessionResources(this.sessionManager.getSessionId());
+		const artifactDir = this.sessionManager.getSessionArtifactDir();
+		this._actionQueueJournal = artifactDir ? new SessionActionQueueJournal(artifactDir) : undefined;
+		this._actionStore = new ActionStore<QueuedSessionAction>((actions) => this._persistQueuedSessionActions(actions));
 		this.settingsManager = config.settingsManager;
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1401,6 +1409,13 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		const durableQueue = this._actionQueueJournal?.read();
+		if (durableQueue?.actions.length) {
+			// The daemon resumes this only after the worker has proved the current
+			// supervisor generation. A stale competing worker may load, but cannot admit.
+			this._sessionInputPumpSuspended = true;
+			void this.restoreSessionActions(durableQueue);
+		}
 		if (this._recoverPlannedRestartContinuationIntents() > 0) {
 			// A prior successor may have acknowledged resume and crashed before the
 			// queued continuation reached the transcript. The durable intent is
@@ -6396,10 +6411,18 @@ export class AgentSession {
 		);
 	}
 
+	private _persistQueuedSessionActions(actions: readonly QueuedSessionAction[]): void {
+		this._actionQueueJournal?.write(this._sessionActionRecoverySnapshot(actions));
+	}
+
 	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {
+		return this._sessionActionRecoverySnapshot(this._actionStore.snapshotActions());
+	}
+
+	private _sessionActionRecoverySnapshot(actions: readonly QueuedSessionAction[]): SessionActionRecoverySnapshot {
 		return {
 			formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
-			actions: this._actionStore.snapshotActions().map((action) => ({
+			actions: actions.map((action) => ({
 				id: action.id,
 				source: action.source,
 				delivery: action.delivery,

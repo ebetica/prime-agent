@@ -8,6 +8,7 @@ import {
 	streamOpenAICodexResponses,
 	streamSimpleOpenAICodexResponses,
 } from "../src/providers/openai-codex-responses.js";
+import { cleanupSessionResources } from "../src/session-resources.js";
 import type { Context, Model } from "../src/types.js";
 
 const originalFetch = global.fetch;
@@ -863,12 +864,31 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
+	it("uses SSE for an oversized forced plain-WebSocket full-context request", async () => {
+		const websocket = vi.fn();
+		globalThis.WebSocket = websocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => new Response(buildSSEPayload({ status: "completed" }), { status: 200 }));
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.6-sol", name: "GPT", api: "openai-codex-responses", provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 400000, maxTokens: 128000,
+		};
+		await streamOpenAICodexResponses(model, {
+			systemPrompt: "system",
+			messages: [{ role: "user", content: "x".repeat(300_000), timestamp: 1 }],
+		}, { apiKey: mockToken(), sessionId: "oversized", transport: "websocket" }).result();
+		expect(websocket).not.toHaveBeenCalled();
+		expect(global.fetch).toHaveBeenCalledTimes(1);
+		expect(getOpenAICodexWebSocketDebugStats("oversized")).toMatchObject({ sseFallbacks: 1 });
+	});
+
 	it("sends only response input deltas in websocket-cached mode", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];
 		const responses = [
 			{ responseId: "resp_1", messageId: "msg_1", text: "Hello" },
 			{ responseId: "resp_2", messageId: "msg_2", text: "Done" },
+			{ responseId: "resp_3", messageId: "msg_3", text: "Fresh" },
 		];
 
 		class MockWebSocket {
@@ -982,31 +1002,46 @@ describe("openai-codex streaming", () => {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [...firstContext.messages, first, { role: "user", content: "Now finish", timestamp: 2 }],
 		};
-		await streamOpenAICodexResponses(model, secondContext, {
+		const second = await streamOpenAICodexResponses(model, secondContext, {
 			apiKey: token,
 			sessionId: "session-1",
 			transport: "websocket-cached",
 		}).result();
 
-		expect(sentBodies).toHaveLength(2);
+		// A replacement runtime keeps the transcript but clears process-local provider
+		// chaining. Its first request must send full context, never a stale response ID.
+		cleanupSessionResources("session-1");
+		const replacementContext: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [...secondContext.messages, second, { role: "user", content: "Fresh worker", timestamp: 3 }],
+		};
+		await streamOpenAICodexResponses(model, replacementContext, {
+			apiKey: token,
+			sessionId: "session-1",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(sentBodies).toHaveLength(3);
 		const firstBody = sentBodies[0] as { input: unknown[]; previous_response_id?: string; store?: boolean };
 		const secondBody = sentBodies[1] as { input: unknown[]; previous_response_id?: string; store?: boolean };
+		const replacementBody = sentBodies[2] as { input: unknown[]; previous_response_id?: string; store?: boolean };
 		expect(firstBody.store).toBe(false);
 		expect(firstBody.previous_response_id).toBeUndefined();
 		expect(firstBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Say hello" }] }]);
 		expect(secondBody.store).toBe(false);
 		expect(secondBody.previous_response_id).toBe("resp_1");
 		expect(secondBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Now finish" }] }]);
+		expect(replacementBody.previous_response_id).toBeUndefined();
+		expect(replacementBody.input.length).toBeGreaterThan(1);
 		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
-			requests: 2,
-			connectionsCreated: 1,
+			requests: 3,
+			connectionsCreated: 2,
 			connectionsReused: 1,
-			cachedContextRequests: 2,
+			cachedContextRequests: 3,
 			storeTrueRequests: 0,
-			fullContextRequests: 1,
+			fullContextRequests: 2,
 			deltaRequests: 1,
-			lastDeltaInputItems: 1,
-			lastPreviousResponseId: "resp_1",
+			lastPreviousResponseId: undefined,
 		});
 	});
 });

@@ -194,6 +194,8 @@ export class ActionTicketController {
 }
 
 export class ActionStore<TAction extends SessionAction = SessionAction> {
+	constructor(private readonly persistQueue: (actions: readonly TAction[]) => void = () => {}) {}
+
 	private readonly nextTurnBoundary: TAction[] = [];
 	private readonly whenRunIdle: TAction[] = [];
 	private readonly tickets = new Map<string, ActionTicketController>();
@@ -202,6 +204,7 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		this.assertNewAction(action);
 		this.list(action.delivery).push(action);
 		this.tickets.set(action.id, new ActionTicketController(action.id));
+		this.persistQueue(this.queuedActions());
 	}
 
 	enqueueFront(action: TAction): void {
@@ -210,23 +213,34 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		const firstQueued = list.findIndex((item) => item.lifecycle.state === "queued");
 		list.splice(firstQueued < 0 ? list.length : firstQueued, 0, action);
 		this.tickets.set(action.id, new ActionTicketController(action.id));
+		this.persistQueue(this.queuedActions());
 	}
 
 	selectFirst(): TAction | undefined {
 		const action =
 			this.nextTurnBoundary.find((item) => item.lifecycle.state === "queued") ??
 			this.whenRunIdle.find((item) => item.lifecycle.state === "queued");
-		if (action) transitionSessionAction(action, { state: "selected" });
+		if (action) {
+			this.persistQueue(this.queuedActions().filter((candidate) => candidate !== action));
+			transitionSessionAction(action, { state: "selected" });
+		}
 		return action;
 	}
 
 	remove(predicate: (action: TAction) => boolean, candidates = this.clearableActions()): TAction[] {
 		const removed = candidates.filter(predicate);
+		if (removed.length > 0) {
+			const removedSet = new Set(removed);
+			this.persistQueue(this.queuedActions().filter((action) => !removedSet.has(action)));
+		}
 		for (const action of removed) transitionSessionAction(action, { state: "cancelled" });
 		return removed;
 	}
 
 	rollback(action: TAction, proof?: RollbackProof): void {
+		this.persistQueue(this.actions().filter((candidate) =>
+			candidate.lifecycle.state === "queued" || candidate === action,
+		));
 		transitionSessionAction(action, { state: "queued" }, { rollbackProof: proof });
 	}
 
