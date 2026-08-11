@@ -216,7 +216,6 @@ import {
 	saveHarnessState,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
-import { SessionActionQueueJournal } from "./session-action-queue-journal.js";
 import type {
 	PreparedResourceReload,
 	ResourceExtensionPaths,
@@ -241,6 +240,7 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import { SessionActionQueueJournal } from "./session-action-queue-journal.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -957,7 +957,11 @@ type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
-export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
+export type {
+	RlmMaxDepthSource,
+	RlmMaxDepthStatus,
+	SetRlmMaxDepthResult,
+} from "./rlm-max-depth.js";
 
 interface PersistedRlmMaxDepthState {
 	maxDepth: number;
@@ -1331,7 +1335,9 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		this._actionQueueJournal = artifactDir ? new SessionActionQueueJournal(artifactDir) : undefined;
-		this._actionStore = new ActionStore<QueuedSessionAction>((queued, admitted) => this._persistSessionActionState(queued, admitted));
+		this._actionStore = new ActionStore<QueuedSessionAction>((queued, admitted) =>
+			this._persistSessionActionState(queued, admitted),
+		);
 		this.settingsManager = config.settingsManager;
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1350,7 +1356,10 @@ export class AgentSession {
 		this._agentObserveController = config.agentObserveController;
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._sessionStartEvent = config.sessionStartEvent ?? {
+			type: "session_start",
+			reason: "startup",
+		};
 		const headerRlmDepth = this.sessionManager.getHeader()?.rlmDepth;
 		this._rlmDepth =
 			config.rlmDepth ??
@@ -1409,7 +1418,8 @@ export class AgentSession {
 		const durableActions = this._actionQueueJournal?.read();
 		if (durableActions?.admitted.actions.length) {
 			const recorded = new Set(
-				this.sessionManager.getBranch()
+				this.sessionManager
+					.getBranch()
 					.filter(
 						(entry) =>
 							entry.type === "message" &&
@@ -1432,6 +1442,7 @@ export class AgentSession {
 					display: true,
 					timestamp: Date.now(),
 					details: {
+						interruptionId: `session-action-interrupted:${action.id}`,
 						actionId: action.id,
 						state: "interrupted",
 						source: action.source,
@@ -1439,7 +1450,6 @@ export class AgentSession {
 					},
 				};
 				this.sessionManager.appendMessage(interrupted);
-				this.agent.state.messages.push(interrupted);
 			}
 		}
 		if (durableActions?.queue.actions.length) {
@@ -1449,7 +1459,10 @@ export class AgentSession {
 			this._actionQueueJournal?.write({
 				formatVersion: 1,
 				queue: durableActions.queue,
-				admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
+				admitted: {
+					formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+					actions: [],
+				},
 			});
 		}
 
@@ -5225,6 +5238,7 @@ export class AgentSession {
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
 			source: "internal",
+			restoring: true,
 		});
 	}
 
@@ -5506,7 +5520,9 @@ export class AgentSession {
 		};
 	}
 
-	private _claimResourceMutationAdmission(operation: string): { release(): void } {
+	private _claimResourceMutationAdmission(operation: string): {
+		release(): void;
+	} {
 		if (this._resourceReloadInProgress) {
 			throw new Error(`Cannot ${operation} while resources are reloading.`);
 		}
@@ -5601,13 +5617,14 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			restoring?: boolean;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action).accepted;
+		return this._admitSessionInput(action, { restore: options.restoring }).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -6292,7 +6309,10 @@ export class AgentSession {
 		}
 	}
 
-	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -6351,7 +6371,11 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
+	getQueuedUserActions(): readonly {
+		id: string;
+		text: string;
+		delivery: "steering" | "followUp";
+	}[] {
 		return visibleSessionActionProjection(this._actionStore.queuedActions())
 			.filter((action) => action.payload.kind === "turn")
 			.map((action) => ({
@@ -9232,7 +9256,10 @@ export class AgentSession {
 						this._extensionShutdownHandler ||
 						this._extensionErrorListener;
 					if (hasBindings) {
-						await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+						await this._extensionRunner.emit({
+							type: "session_start",
+							reason: "reload",
+						});
 						await this.extendResourcesFromExtensions("reload");
 					}
 					if (candidateShutdownError) throw candidateShutdownError;
@@ -9301,7 +9328,10 @@ export class AgentSession {
 				this._extensionShutdownHandler ||
 				this._extensionErrorListener;
 			if (hasBindings) {
-				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+				await this._extensionRunner.emit({
+					type: "session_start",
+					reason: "reload",
+				});
 				await this.extendResourcesFromExtensions("reload");
 			}
 
