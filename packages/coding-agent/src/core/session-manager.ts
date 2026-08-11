@@ -105,9 +105,7 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 }
 
-type AssistantSessionMessageEntry = SessionMessageEntry & {
-	message: AssistantMessage;
-};
+type AssistantSessionMessageEntry = SessionMessageEntry & { message: AssistantMessage };
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
@@ -334,10 +332,7 @@ function getSessionFilePath(sessionDir: string, sessionId: string): string {
 	return join(sessionDir, `${sessionId}.jsonl`);
 }
 
-function createUniqueSessionFileTarget(sessionDir: string): {
-	sessionId: string;
-	sessionFile: string;
-} {
+function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string; sessionFile: string } {
 	for (let i = 0; i < 100; i++) {
 		const sessionId = createSessionId();
 		const sessionFile = getSessionFilePath(sessionDir, sessionId);
@@ -496,12 +491,7 @@ export function buildSessionContext(
 	let leaf: SessionEntry | undefined;
 	if (leafId === null) {
 		// Explicitly null - return no messages (navigated to before first entry)
-		return {
-			messages: [],
-			thinkingLevel: "off",
-			serviceTier: "default",
-			model: null,
-		};
+		return { messages: [], thinkingLevel: "off", serviceTier: "default", model: null };
 	}
 	if (leafId) {
 		leaf = byId.get(leafId);
@@ -512,12 +502,7 @@ export function buildSessionContext(
 	}
 
 	if (!leaf) {
-		return {
-			messages: [],
-			thinkingLevel: "off",
-			serviceTier: "default",
-			model: null,
-		};
+		return { messages: [], thinkingLevel: "off", serviceTier: "default", model: null };
 	}
 
 	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
@@ -543,10 +528,7 @@ export function buildSessionContext(
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			model = {
-				provider: entry.message.provider,
-				modelId: entry.message.model,
-			};
+			model = { provider: entry.message.provider, modelId: entry.message.model };
 		} else if (entry.type === "compaction") {
 			compaction = entry;
 		}
@@ -1034,11 +1016,7 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 		return cached.info;
 	}
 	const info = await scanSessionInfo(filePath, stats);
-	sessionInfoCache.set(filePath, {
-		size: stats.size,
-		mtimeMs: stats.mtimeMs,
-		info,
-	});
+	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
 	return info;
 }
 
@@ -2095,18 +2073,10 @@ export class SessionManager {
 
 		// Collect labels for entries in the path
 		const pathEntryIds = new Set(pathWithoutLabels.map((e) => e.id));
-		const labelsToWrite: Array<{
-			targetId: string;
-			label: string;
-			timestamp: string;
-		}> = [];
+		const labelsToWrite: Array<{ targetId: string; label: string; timestamp: string }> = [];
 		for (const [targetId, label] of this.labelsById) {
 			if (pathEntryIds.has(targetId)) {
-				labelsToWrite.push({
-					targetId,
-					label,
-					timestamp: this.labelTimestampsById.get(targetId)!,
-				});
+				labelsToWrite.push({ targetId, label, timestamp: this.labelTimestampsById.get(targetId)! });
 			}
 		}
 

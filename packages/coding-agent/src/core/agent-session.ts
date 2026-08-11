@@ -957,11 +957,7 @@ type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off
 
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
-export type {
-	RlmMaxDepthSource,
-	RlmMaxDepthStatus,
-	SetRlmMaxDepthResult,
-} from "./rlm-max-depth.js";
+export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
 interface PersistedRlmMaxDepthState {
 	maxDepth: number;
@@ -1356,10 +1352,7 @@ export class AgentSession {
 		this._agentObserveController = config.agentObserveController;
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? {
-			type: "session_start",
-			reason: "startup",
-		};
+		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		const headerRlmDepth = this.sessionManager.getHeader()?.rlmDepth;
 		this._rlmDepth =
 			config.rlmDepth ??
@@ -1459,10 +1452,7 @@ export class AgentSession {
 			this._actionQueueJournal?.write({
 				formatVersion: 1,
 				queue: durableActions.queue,
-				admitted: {
-					formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
-					actions: [],
-				},
+				admitted: { formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION, actions: [] },
 			});
 		}
 
@@ -5520,9 +5510,7 @@ export class AgentSession {
 		};
 	}
 
-	private _claimResourceMutationAdmission(operation: string): {
-		release(): void;
-	} {
+	private _claimResourceMutationAdmission(operation: string): { release(): void } {
 		if (this._resourceReloadInProgress) {
 			throw new Error(`Cannot ${operation} while resources are reloading.`);
 		}
@@ -5553,6 +5541,7 @@ export class AgentSession {
 		action: QueuedSessionAction,
 		options: {
 			restore?: boolean;
+			allowWhileSuspended?: boolean;
 			front?: boolean;
 			wake?: boolean;
 			immediatelyEligible?: boolean;
@@ -5563,7 +5552,7 @@ export class AgentSession {
 		ticket?: ActionTicket;
 	} {
 		if (!options.restore && action.wake === "immediate") this._sessionInputPumpSuspended = false;
-		this._assertSessionActionAdmissionAvailable(options.restore === true);
+		this._assertSessionActionAdmissionAvailable(options.restore === true || options.allowWhileSuspended === true);
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5624,7 +5613,7 @@ export class AgentSession {
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._admitSessionInput(action, { restore: options.restoring }).accepted;
+		return this._admitSessionInput(action, { allowWhileSuspended: options.restoring }).accepted;
 	}
 
 	private _runtimeActivity(): RuntimeActivity {
@@ -6309,10 +6298,7 @@ export class AgentSession {
 		}
 	}
 
-	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): {
-		steering: string[];
-		followUp: string[];
-	} {
+	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
 		const ownedActions = this._actionStore.ownedActions();
 		const dispatchedTurnCount = ownedActions.filter(
 			(action) =>
@@ -6371,11 +6357,7 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	getQueuedUserActions(): readonly {
-		id: string;
-		text: string;
-		delivery: "steering" | "followUp";
-	}[] {
+	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
 		return visibleSessionActionProjection(this._actionStore.queuedActions())
 			.filter((action) => action.payload.kind === "turn")
 			.map((action) => ({
@@ -9256,10 +9238,7 @@ export class AgentSession {
 						this._extensionShutdownHandler ||
 						this._extensionErrorListener;
 					if (hasBindings) {
-						await this._extensionRunner.emit({
-							type: "session_start",
-							reason: "reload",
-						});
+						await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 						await this.extendResourcesFromExtensions("reload");
 					}
 					if (candidateShutdownError) throw candidateShutdownError;
@@ -9328,10 +9307,7 @@ export class AgentSession {
 				this._extensionShutdownHandler ||
 				this._extensionErrorListener;
 			if (hasBindings) {
-				await this._extensionRunner.emit({
-					type: "session_start",
-					reason: "reload",
-				});
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 				await this.extendResourcesFromExtensions("reload");
 			}
 

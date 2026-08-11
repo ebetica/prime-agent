@@ -7,9 +7,10 @@
  * Admitted/running work belongs to worker-recovery interruption handling and is
  * deliberately never replayed from this file.
  */
+
+import { randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
 import type { SessionActionRecoverySnapshot } from "./agent-session.js";
 
 const FILE_NAME = "session-action-queue.json";
@@ -54,7 +55,11 @@ export class SessionActionQueueJournal {
 			rmSync(this.path, { force: true });
 			try {
 				const descriptor = openSync(dirname(this.path), "r");
-				try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+				try {
+					fsyncSync(descriptor);
+				} finally {
+					closeSync(descriptor);
+				}
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			}
@@ -72,7 +77,11 @@ export class SessionActionQueueJournal {
 			}
 			renameSync(temporary, this.path);
 			const directoryDescriptor = openSync(dirname(this.path), "r");
-			try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
+			try {
+				fsyncSync(directoryDescriptor);
+			} finally {
+				closeSync(directoryDescriptor);
+			}
 		} catch (error) {
 			rmSync(temporary, { force: true });
 			throw error;

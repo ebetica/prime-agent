@@ -101,10 +101,7 @@ function heartbeatJob(): AgentCronJob {
 	};
 }
 
-const skipReviewer = vi.fn(async () => ({
-	shouldRefine: true,
-	rationale: "durable lesson",
-}));
+const skipReviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 
 function crashWindowAction(): SessionActionRecoveryAction {
 	return {
@@ -120,25 +117,13 @@ function crashWindowAction(): SessionActionRecoveryAction {
 				{
 					id: "record-crash-window",
 					role: "primary" as const,
-					message: {
-						role: "user" as const,
-						content: "sensitive prepared payload",
-						timestamp: 1,
-					},
+					message: { role: "user" as const, content: "sensitive prepared payload", timestamp: 1 },
 					ownerActionId: "action-crash-window",
 				},
 			],
 			executionPolicy: {
-				preparation: {
-					emitBeforeAgentStart: true,
-					applyPromptTemplate: true,
-					preservePromptContent: true,
-				},
-				turn: {
-					allowAutoCompaction: true,
-					allowAutoRetry: true,
-					allowOverflowRecovery: true,
-				},
+				preparation: { emitBeforeAgentStart: true, applyPromptTemplate: true, preservePromptContent: true },
+				turn: { allowAutoCompaction: true, allowAutoRetry: true, allowOverflowRecovery: true },
 			},
 			queueVisible: true,
 			acceptedAgentMessage: true,
@@ -191,10 +176,8 @@ describe("AgentSession queue characterization", () => {
 			source: "internal",
 		});
 		expect(JSON.stringify(interrupted[0])).not.toContain("sensitive prepared payload");
-		expect(replacement.session.messages).not.toContainEqual(
-			expect.objectContaining({
-				customType: "prime-agent.session_action_interrupted",
-			}),
+		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
+			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
 		);
 		expect(replacement.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
 		expect(
@@ -243,27 +226,18 @@ describe("AgentSession queue characterization", () => {
 			);
 		expect(interruptions).toHaveLength(1);
 		expect(replacement.sessionManager.buildSessionContext().messages).not.toContainEqual(
-			expect.objectContaining({
-				customType: "prime-agent.session_action_interrupted",
-			}),
+			expect.objectContaining({ customType: "prime-agent.session_action_interrupted" }),
 		);
 		expect(new SessionActionQueueJournal(replacement.sessionManager.getSessionArtifactDir()!).read()).toBeUndefined();
 	});
 
 	it("does not count failed assistant messages toward the auto-refine interval", async () => {
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
-		harness.setResponses([
-			fauxAssistantMessage("failed", {
-				stopReason: "error",
-				errorMessage: "provider failed",
-			}),
-		]);
+		harness.setResponses([fauxAssistantMessage("failed", { stopReason: "error", errorMessage: "provider failed" })]);
 
 		await harness.session.prompt("fail once");
 
@@ -273,9 +247,7 @@ describe("AgentSession queue characterization", () => {
 	it.each([
 		{
 			name: "review runs after the configured turn interval",
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 } },
 			turns: 2,
 			reason: "turn_interval" as AutoRefineReason,
 			review: {
@@ -283,10 +255,7 @@ describe("AgentSession queue characterization", () => {
 				rationale: "durable lesson found",
 				instructions: "capture the durable lesson",
 			},
-			expectedReviewContext: {
-				reason: "turn_interval",
-				turnsSinceLastReview: 2,
-			},
+			expectedReviewContext: { reason: "turn_interval", turnsSinceLastReview: 2 },
 			refineFragments: ["capture the durable lesson", "local harness entries", "Do not promote anything global"],
 			turnsAfter: 0,
 			compactPendingAfter: undefined as boolean | undefined,
@@ -295,9 +264,7 @@ describe("AgentSession queue characterization", () => {
 		},
 		{
 			name: "compact hook does not require the turn interval",
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 			turns: 0,
 			reason: "compact" as AutoRefineReason,
 			review: { shouldRefine: false, rationale: "nothing durable" },
@@ -310,21 +277,11 @@ describe("AgentSession queue characterization", () => {
 		},
 		{
 			name: "falls back to turn-interval review when compact auto-refine is disabled",
-			settings: {
-				autoRefine: {
-					enabled: true,
-					compact: false,
-					turnInterval: 2,
-					cooldownMs: 0,
-				},
-			},
+			settings: { autoRefine: { enabled: true, compact: false, turnInterval: 2, cooldownMs: 0 } },
 			turns: 2,
 			reason: "compact" as AutoRefineReason,
 			review: { shouldRefine: false, rationale: "nothing durable" },
-			expectedReviewContext: {
-				reason: "turn_interval",
-				turnsSinceLastReview: 2,
-			},
+			expectedReviewContext: { reason: "turn_interval", turnsSinceLastReview: 2 },
 			refineFragments: undefined,
 			turnsAfter: undefined,
 			compactPendingAfter: false as boolean | undefined,
@@ -333,9 +290,7 @@ describe("AgentSession queue characterization", () => {
 		},
 		{
 			name: "declined compact review preserves an already-due turn interval",
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 } },
 			turns: 2,
 			reason: "compact" as AutoRefineReason,
 			review: { shouldRefine: false, rationale: "nothing compact-specific" },
@@ -348,9 +303,7 @@ describe("AgentSession queue characterization", () => {
 		},
 		{
 			name: "queued follow-up messages do not make an idle agent active",
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 			turns: 1,
 			reason: "turn_interval" as AutoRefineReason,
 			review: {
@@ -358,10 +311,7 @@ describe("AgentSession queue characterization", () => {
 				rationale: "durable lesson found",
 				instructions: "capture the durable lesson",
 			},
-			expectedReviewContext: {
-				reason: "turn_interval",
-				turnsSinceLastReview: 1,
-			},
+			expectedReviewContext: { reason: "turn_interval", turnsSinceLastReview: 1 },
 			refineFragments: [],
 			turnsAfter: undefined,
 			compactPendingAfter: undefined,
@@ -383,10 +333,7 @@ describe("AgentSession queue characterization", () => {
 			queuedMessages,
 		}) => {
 			const reviewer = vi.fn(async () => review);
-			const harness = await createAutoRefineHarness({
-				settings,
-				autoRefineReviewer: reviewer,
-			});
+			const harness = await createAutoRefineHarness({ settings, autoRefineReviewer: reviewer });
 			harnesses.push(harness);
 			const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
 			const internals = harness.session as unknown as AutoRefineInternals;
@@ -405,9 +352,7 @@ describe("AgentSession queue characterization", () => {
 				expect(refine).toHaveBeenCalled();
 				for (const fragment of refineFragments) {
 					expect(refine).toHaveBeenCalledWith(
-						expect.objectContaining({
-							instructions: expect.stringContaining(fragment),
-						}),
+						expect.objectContaining({ instructions: expect.stringContaining(fragment) }),
 					);
 				}
 			}
@@ -448,9 +393,7 @@ describe("AgentSession queue characterization", () => {
 		},
 	])("auto-refine compact hook $name", async ({ act }) => {
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -471,15 +414,10 @@ describe("AgentSession queue characterization", () => {
 			if (reason === "compact") {
 				await compactReviewGate.promise;
 			}
-			return {
-				shouldRefine: false,
-				rationale: `${reason} found nothing durable`,
-			};
+			return { shouldRefine: false, rationale: `${reason} found nothing durable` };
 		});
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
 		harnesses.push(harness);
@@ -508,9 +446,7 @@ describe("AgentSession queue characterization", () => {
 	it("retries a scheduled post-compaction continuation when another run starts first", async () => {
 		vi.useFakeTimers();
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -538,9 +474,7 @@ describe("AgentSession queue characterization", () => {
 	it("cancels scheduled post-compaction continuation on branch changes", async () => {
 		vi.useFakeTimers();
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -562,39 +496,47 @@ describe("AgentSession queue characterization", () => {
 		{
 			name: "requestAbort",
 			abort: (harness: Harness) => harness.session.requestAbort(),
+			resumesQueuedWork: true,
 		},
 		{
 			name: "abortForUpdateRestart",
 			abort: (harness: Harness) => harness.session.abortForUpdateRestart(),
+			resumesQueuedWork: false,
 		},
-	])("cancels scheduled post-compaction continuation at $name without dropping queued input", async ({ abort }) => {
-		vi.useFakeTimers();
-		const harness = await createAutoRefineHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as AutoRefineInternals;
-		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+	])(
+		"cancels scheduled post-compaction continuation at $name without dropping queued input",
+		async ({ abort, resumesQueuedWork }) => {
+			vi.useFakeTimers();
+			const harness = await createAutoRefineHarness();
+			harnesses.push(harness);
+			const internals = harness.session as unknown as AutoRefineInternals;
+			const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 
-		try {
-			internals._schedulePostCompactionContinue();
-			await harness.session.followUp("queued across abort");
+			try {
+				internals._schedulePostCompactionContinue();
+				await harness.session.followUp("queued across abort");
 
-			abort(harness);
-			await vi.advanceTimersByTimeAsync(100);
+				abort(harness);
+				await vi.advanceTimersByTimeAsync(100);
 
-			expect(continueAgent).not.toHaveBeenCalled();
-			expect(internals._postCompactionContinuationScheduled).toBe(false);
-			expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
+				expect(continueAgent).not.toHaveBeenCalled();
+				expect(internals._postCompactionContinuationScheduled).toBe(false);
+				if (resumesQueuedWork) {
+					expect(harness.session.getFollowUpMessages()).toEqual([]);
+					expect(getUserTexts(harness)).toContain("queued across abort");
+				} else {
+					expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
+				}
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
 		vi.useFakeTimers();
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -614,9 +556,7 @@ describe("AgentSession queue characterization", () => {
 
 	it("auto-refine pending review uses the in-progress guard and catches refine failures", async () => {
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -633,9 +573,7 @@ describe("AgentSession queue characterization", () => {
 		await internals._maybeAutoRefine("turn_interval");
 
 		expect(refine).toHaveBeenCalledWith(
-			expect.objectContaining({
-				instructions: expect.stringContaining("durable lesson"),
-			}),
+			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
 		);
 		expect(guardWasSetDuringRefine).toBe(true);
 		expect(internals._autoRefineInProgress).toBe(false);
@@ -657,14 +595,9 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("keeps the turn counter and stamps the cooldown when an approved immediate refine fails", async () => {
-		const reviewer = vi.fn(async () => ({
-			shouldRefine: true,
-			rationale: "durable lesson",
-		}));
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
 			autoRefineReviewer: reviewer,
 		});
 		harnesses.push(harness);
@@ -693,9 +626,7 @@ describe("AgentSession queue characterization", () => {
 			},
 		);
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
 		harnesses.push(harness);
@@ -725,9 +656,7 @@ describe("AgentSession queue characterization", () => {
 			throw new Error("review failed");
 		});
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
 			autoRefineReviewer: reviewer,
 		});
 		harnesses.push(harness);
@@ -746,9 +675,7 @@ describe("AgentSession queue characterization", () => {
 
 	it("auto-refine pending review respects the cooldown", async () => {
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
@@ -779,13 +706,9 @@ describe("AgentSession queue characterization", () => {
 			fauxAssistantMessage(refinePlanJson("second")),
 		]);
 
-		const firstRefine = harness.session.refine({
-			instructions: "first refine",
-		});
+		const firstRefine = harness.session.refine({ instructions: "first refine" });
 		await firstPlanStartedPromise.promise;
-		const secondRefine = harness.session.refine({
-			instructions: "second refine",
-		});
+		const secondRefine = harness.session.refine({ instructions: "second refine" });
 		await Promise.resolve();
 
 		expect(harness.getPendingResponseCount()).toBe(1);
@@ -819,15 +742,11 @@ describe("AgentSession queue characterization", () => {
 				);
 			},
 		]);
-		const internals = harness.session as unknown as {
-			_reconnectToAgent(): void;
-		};
+		const internals = harness.session as unknown as { _reconnectToAgent(): void };
 		const reconnect = vi.spyOn(internals, "_reconnectToAgent");
 		const entriesBeforeDispose = harness.sessionManager.getEntries().length;
 
-		const refine = harness.session.refine({
-			instructions: "write stale state",
-		});
+		const refine = harness.session.refine({ instructions: "write stale state" });
 		await planStartedPromise.promise;
 		harness.session.dispose();
 		planGate.resolve();
@@ -881,9 +800,7 @@ describe("AgentSession queue characterization", () => {
 		expect(target).toBeDefined();
 		await harness.session.prompt("two");
 
-		const navigation = harness.session.navigateTree(target!.id, {
-			summarize: false,
-		});
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
 		await treeEventReached.promise;
 		const controller = new AbortController();
 		const checkpoint = harness.session.waitForSessionInputCheckpoint(controller.signal);
@@ -911,12 +828,8 @@ describe("AgentSession queue characterization", () => {
 		const target = harness.sessionManager.getEntries().find((entry) => entry.type === "message");
 		expect(target).toBeDefined();
 
-		const navigation = harness.session.navigateTree(target!.id, {
-			summarize: false,
-		});
-		await harness.session.followUp("after navigation", undefined, {
-			resumeIfIdle: true,
-		});
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
+		await harness.session.followUp("after navigation", undefined, { resumeIfIdle: true });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(getUserTexts(harness)).not.toContain("after navigation");
 
@@ -930,9 +843,7 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
 		withStreaming(harness, true);
-		await harness.session.followUp("already queued", undefined, {
-			queueKey: "existing",
-		});
+		await harness.session.followUp("already queued", undefined, { queueKey: "existing" });
 		withStreaming(harness, false);
 
 		let queuedAtPreflight: boolean | undefined;
@@ -973,16 +884,12 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.waitForSessionInputIdle();
 		const store = (
 			harness.session as unknown as {
-				_actionStore: {
-					queuedActions(): readonly { payload: { prepared?: unknown } }[];
-				};
+				_actionStore: { queuedActions(): readonly { payload: { prepared?: unknown } }[] };
 			}
 		)._actionStore;
 		await vi.waitFor(() => expect(store.queuedActions()[0]?.payload.prepared).toBeDefined());
 
-		const navigation = harness.session.navigateTree(target!.id, {
-			summarize: false,
-		});
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
 		pause?.release();
 		pause = undefined;
 		await navigation;
@@ -995,9 +902,7 @@ describe("AgentSession queue characterization", () => {
 			name: "sessions without a local harness directory",
 			makeHarness: () =>
 				createHarness({
-					settings: {
-						autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-					},
+					settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 					autoRefineReviewer: skipReviewer,
 				}),
 			expectRefineChecked: true,
@@ -1006,9 +911,7 @@ describe("AgentSession queue characterization", () => {
 			name: "subagent sessions",
 			makeHarness: () =>
 				createAutoRefineHarness({
-					settings: {
-						autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-					},
+					settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 					rlmDepth: 1,
 					autoRefineReviewer: skipReviewer,
 				}),
@@ -1034,14 +937,10 @@ describe("AgentSession queue characterization", () => {
 
 	it("preserves compact auto-refine pending state when no model is selected", async () => {
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
-		const state = harness.session.agent.state as {
-			model: typeof harness.session.agent.state.model | undefined;
-		};
+		const state = harness.session.agent.state as { model: typeof harness.session.agent.state.model | undefined };
 		state.model = undefined;
 		const internals = harness.session as unknown as AutoRefineInternals;
 
@@ -1051,27 +950,14 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it.each([
-		{
-			reason: "turn_interval" as AutoRefineReason,
-			turns: 1,
-			pendingFlag: "_turnIntervalAutoRefinePending" as const,
-		},
-		{
-			reason: "compact" as AutoRefineReason,
-			turns: 0,
-			pendingFlag: "_compactAutoRefinePending" as const,
-		},
+		{ reason: "turn_interval" as AutoRefineReason, turns: 1, pendingFlag: "_turnIntervalAutoRefinePending" as const },
+		{ reason: "compact" as AutoRefineReason, turns: 0, pendingFlag: "_compactAutoRefinePending" as const },
 	])(
 		"auto-refine review obeys the cooldown and preserves a $reason checkpoint",
 		async ({ reason, turns, pendingFlag }) => {
-			const reviewer = vi.fn(async () => ({
-				shouldRefine: true,
-				rationale: "durable lesson",
-			}));
+			const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 			const harness = await createAutoRefineHarness({
-				settings: {
-					autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 },
-				},
+				settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
 				autoRefineReviewer: reviewer,
 			});
 			harnesses.push(harness);
@@ -1112,10 +998,7 @@ describe("AgentSession queue characterization", () => {
 			seedGlobal: true,
 			seedLocal: false,
 			editId: "global:shared",
-			refineOptions: {
-				instructions: "update the global shared memory",
-				global: true,
-			},
+			refineOptions: { instructions: "update the global shared memory", global: true },
 			updatedContent: "Updated global content",
 			expectLocalContent: undefined as string | undefined,
 			expectGlobalContent: "Updated global content" as string | undefined,
@@ -1146,15 +1029,7 @@ describe("AgentSession queue characterization", () => {
 							summary: `${scope} shared memory`,
 							rationale: "seed",
 							expectedOutcome: "seeded",
-							edits: [
-								{
-									action: "create",
-									kind: "memory",
-									id: "shared",
-									title: "Shared",
-									content,
-								},
-							],
+							edits: [{ action: "create", kind: "memory", id: "shared", title: "Shared", content }],
 						},
 						{ id: `seed_${scope}`, scope },
 					);
@@ -1169,13 +1044,7 @@ describe("AgentSession queue characterization", () => {
 							rationale: "The display id was selected from merged state.",
 							expectedOutcome: "Only the targeted entry changes.",
 							edits: [
-								{
-									action: "update",
-									kind: "memory",
-									id: editId,
-									title: "Shared",
-									content: updatedContent,
-								},
+								{ action: "update", kind: "memory", id: editId, title: "Shared", content: updatedContent },
 							],
 						}),
 					),
@@ -1183,10 +1052,7 @@ describe("AgentSession queue characterization", () => {
 
 				const result = await harness.session.refine(refineOptions);
 
-				expect(result.appliedEdits[0]).toMatchObject({
-					id: "shared",
-					applied: true,
-				});
+				expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
 				if (expectLocalContent !== undefined) {
 					expect(loadHarnessState(localDir, "local").entries.memory.shared.content).toBe(expectLocalContent);
 					expect(loadHarnessState(localDir, "local").entries.memory["global:shared"]).toBeUndefined();
@@ -1247,9 +1113,7 @@ describe("AgentSession queue characterization", () => {
 				),
 			]);
 
-			const originalRefinement = await original.session.refine({
-				instructions: "remember this locally",
-			});
+			const originalRefinement = await original.session.refine({ instructions: "remember this locally" });
 			branched.sessionManager.appendCustomEntry("prime-agent.refinement", originalRefinement);
 			expect(loadHarnessState(originalLocalDir, "local").entries.memory.remember_me.content).toBe(
 				"Original content should be rolled back.",
@@ -1295,9 +1159,7 @@ describe("AgentSession queue characterization", () => {
 				},
 			]);
 
-			const refinePromise = harness.session.refine({
-				instructions: "background refine",
-			});
+			const refinePromise = harness.session.refine({ instructions: "background refine" });
 			await planStartedPromise.promise;
 
 			const promptPromise = harness.session.prompt("hello during refine");
@@ -1400,9 +1262,7 @@ describe("AgentSession queue characterization", () => {
 				},
 			]);
 
-			const refinePromise = harness.session.refine({
-				instructions: "update shared memory",
-			});
+			const refinePromise = harness.session.refine({ instructions: "update shared memory" });
 			await planStartedPromise;
 			const concurrentState = loadHarnessState(localDir, "local");
 			concurrentState.entries.memory.shared.content = "concurrent kernel content";
@@ -1453,9 +1313,7 @@ describe("AgentSession queue characterization", () => {
 			seeded.harnessStatePath = saveHarnessState(recordedDir, recordedState);
 			harness.sessionManager.appendCustomEntry("prime-agent.refinement", seeded);
 
-			const result = await harness.session.refine({
-				rollbackId: "refine_recorded",
-			});
+			const result = await harness.session.refine({ rollbackId: "refine_recorded" });
 
 			expect(result.rollbackOf).toBe("refine_recorded");
 			expect(loadHarnessState(recordedDir, "local").entries.memory.remember_me).toBeUndefined();
@@ -1526,9 +1384,7 @@ describe("AgentSession queue characterization", () => {
 			};
 			harness.sessionManager.appendCustomEntry("prime-agent.refinement", legacyRefinement);
 
-			const result = await harness.session.refine({
-				rollbackId: "refine_legacy",
-			});
+			const result = await harness.session.refine({ rollbackId: "refine_legacy" });
 
 			expect(result.scope).toBe("global");
 			const stored = JSON.parse(readFileSync(getHarnessStatePath(globalDir), "utf8"));
@@ -1556,10 +1412,7 @@ describe("AgentSession queue characterization", () => {
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test",
-						handler: async () => gate,
-					});
+					pi.registerCommand("testcmd", { description: "Test", handler: async () => gate });
 					pi.registerCommand("fail", {
 						description: "Fail",
 						handler: async () => {
@@ -1571,9 +1424,7 @@ describe("AgentSession queue characterization", () => {
 		});
 		harnesses.push(harness);
 		const extensionErrors: string[] = [];
-		harness.session.bindExtensions({
-			onError: (error) => extensionErrors.push(error.error),
-		});
+		harness.session.bindExtensions({ onError: (error) => extensionErrors.push(error.error) });
 
 		await expect(harness.session.promptUntilAccepted("/testcmd")).resolves.toBeUndefined();
 		let completed = false;
@@ -1595,9 +1446,7 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("preparing turn", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("preparing turn", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 
@@ -1617,11 +1466,7 @@ describe("AgentSession queue characterization", () => {
 		const pause = harness.session.acquireQueuedWorkPause();
 		withStreaming(harness, true);
 		await harness.session.sendCustomMessage(
-			{
-				customType: "goal_context",
-				content: "stale goal context",
-				display: true,
-			},
+			{ customType: "goal_context", content: "stale goal context", display: true },
 			{ triggerTurn: true, deliverAs: "steer" },
 		);
 		withStreaming(harness, false);
@@ -1652,9 +1497,7 @@ describe("AgentSession queue characterization", () => {
 			},
 		]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.steer("checkpoint handoff", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.steer("checkpoint handoff", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 
@@ -1678,23 +1521,15 @@ describe("AgentSession queue characterization", () => {
 		const internals = harness.session as unknown as SteeringStopInternals;
 		harness.setResponses([fauxAssistantMessage("delivered")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.steer("active steering", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.steer("active steering", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 
 		// The pump owns the prompt during preparation, so it is active rather than queued.
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(internals._steeringStopPending).toBe(true);
-		expect(harness.session.clearQueue()).toEqual({
-			steering: ["active steering"],
-			followUp: [],
-		});
-		expect(harness.session.clearQueue()).toEqual({
-			steering: [],
-			followUp: [],
-		});
+		expect(harness.session.clearQueue()).toEqual({ steering: ["active steering"], followUp: [] });
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
 		expect(internals._steeringStopPending).toBe(false);
 
 		hook.release();
@@ -1708,22 +1543,14 @@ describe("AgentSession queue characterization", () => {
 		const harness = await createHarness({ extensionFactories: [hook.factory] });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("delivered")]);
-		const queueUpdates: {
-			steering: readonly string[];
-			followUp: readonly string[];
-		}[] = [];
+		const queueUpdates: { steering: readonly string[]; followUp: readonly string[] }[] = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "session_action_update") {
-				queueUpdates.push({
-					steering: [...event.actions.steering],
-					followUp: [...event.actions.followUps],
-				});
+				queueUpdates.push({ steering: [...event.actions.steering], followUp: [...event.actions.followUps] });
 			}
 		});
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("owned prompt", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("owned prompt", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 
@@ -1742,17 +1569,11 @@ describe("AgentSession queue characterization", () => {
 	it("hides queued trigger-turn actions from user-visible queue projections", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const internals = harness.session as unknown as {
-			_scheduleSessionInputPump(): void;
-		};
+		const internals = harness.session as unknown as { _scheduleSessionInputPump(): void };
 		const schedule = vi.spyOn(internals, "_scheduleSessionInputPump").mockImplementation(() => {});
 		await harness.session.followUp("visible queued prompt");
 		const hidden = harness.session.sendCustomMessage(
-			{
-				customType: "hidden-trigger",
-				content: "hidden queued prompt",
-				display: false,
-			},
+			{ customType: "hidden-trigger", content: "hidden queued prompt", display: false },
 			{ triggerTurn: true },
 		);
 		const hiddenRejection = expect(hidden).rejects.toThrow("Prompt aborted before delivery.");
@@ -1772,10 +1593,7 @@ describe("AgentSession queue characterization", () => {
 		]);
 
 		harness.session.requestAbort();
-		expect(harness.session.clearQueue()).toEqual({
-			steering: [],
-			followUp: ["visible queued prompt"],
-		});
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["visible queued prompt"] });
 		schedule.mockRestore();
 		await hiddenRejection;
 	});
@@ -1791,9 +1609,7 @@ describe("AgentSession queue characterization", () => {
 			}
 		});
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("phase probe", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("phase probe", undefined, { resumeIfIdle: true });
 
 		pause.release();
 		await harness.session.waitForIdle();
@@ -1824,10 +1640,7 @@ describe("AgentSession queue characterization", () => {
 		await selected.promise;
 		harness.session.requestAbort();
 		expect(harness.session.resumeQueuedWork()).toBe(true);
-		expect(harness.session.clearQueue()).toEqual({
-			steering: [],
-			followUp: [command!.text],
-		});
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [command!.text] });
 		releaseSelection.resolve();
 		await harness.session.waitForSessionInputIdle();
 	});
@@ -1871,9 +1684,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.waitForSessionInputIdle();
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		expect((await removedOutcome).error).toEqual(
-			expect.objectContaining({
-				message: "Queued agent message was cleared before delivery.",
-			}),
+			expect.objectContaining({ message: "Queued agent message was cleared before delivery." }),
 		);
 		expect((await survivorOutcome).error).toBeUndefined();
 		expect(getUserTexts(harness)).toEqual(["survive re-selection"]);
@@ -1885,17 +1696,12 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("never delivered")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("cleared prompt", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("cleared prompt", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 		expect(harness.session.queuedActionCount).toBe(0);
 
-		expect(harness.session.clearQueue()).toEqual({
-			steering: [],
-			followUp: ["cleared prompt"],
-		});
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["cleared prompt"] });
 		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 
@@ -1910,18 +1716,11 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.steer("steering heartbeat", undefined, {
-			queueKey: "heartbeat",
-			resumeIfIdle: true,
-		});
+		await harness.session.steer("steering heartbeat", undefined, { queueKey: "heartbeat", resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
 
-		expect(
-			await harness.session.followUp("duplicate heartbeat", undefined, {
-				queueKey: "heartbeat",
-			}),
-		).toBe(false);
+		expect(await harness.session.followUp("duplicate heartbeat", undefined, { queueKey: "heartbeat" })).toBe(false);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 
 		hook.release();
@@ -1945,20 +1744,13 @@ describe("AgentSession queue characterization", () => {
 				return originalPrompt(messages);
 			});
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("first heartbeat", undefined, {
-			queueKey: "heartbeat",
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("first heartbeat", undefined, { queueKey: "heartbeat", resumeIfIdle: true });
 		pause.release();
 		await promptCalled.promise;
 
 		// The first prompt handed off to the turn; a same-key follow-up must queue
 		// for the next turn instead of coalescing into the committed one.
-		expect(
-			await harness.session.followUp("second heartbeat", undefined, {
-				queueKey: "heartbeat",
-			}),
-		).toBe(true);
+		expect(await harness.session.followUp("second heartbeat", undefined, { queueKey: "heartbeat" })).toBe(true);
 		expect(harness.session.getFollowUpMessages()).toEqual(["second heartbeat"]);
 
 		dispatchGate.resolve();
@@ -1983,16 +1775,11 @@ describe("AgentSession queue characterization", () => {
 				return originalPrompt(messages);
 			});
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("handed off", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("handed off", undefined, { resumeIfIdle: true });
 		pause.release();
 		await promptCalled.promise;
 
-		expect(harness.session.clearQueue()).toEqual({
-			steering: [],
-			followUp: [],
-		});
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
 		dispatchGate.resolve();
 		await harness.session.waitForIdle();
 		expect(getUserTexts(harness)).toEqual(["handed off"]);
@@ -2027,9 +1814,7 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("delivered")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("claimed", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("claimed", undefined, { resumeIfIdle: true });
 		const [action] = harness.session.getQueuedUserActions();
 		expect(action).toBeDefined();
 
@@ -2107,9 +1892,7 @@ describe("AgentSession queue characterization", () => {
 			],
 		});
 		harnesses.push(harness);
-		sessionInternals = harness.session as unknown as {
-			_refineInFlight?: Promise<void>;
-		};
+		sessionInternals = harness.session as unknown as { _refineInFlight?: Promise<void> };
 		harness.setResponses([fauxAssistantMessage("kept response")]);
 
 		const clearedAgentMessage = agentPromptText("agentmsg_cleared", "cleared");
@@ -2135,22 +1918,12 @@ describe("AgentSession queue characterization", () => {
 		const secondPrompt = agentPromptText("agentmsg_restore_second", "second");
 		withStreaming(harness, true);
 		await harness.session.sendCustomMessage(
-			{
-				customType: "next-turn",
-				content: "context A",
-				display: true,
-				details: {},
-			},
+			{ customType: "next-turn", content: "context A", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
 		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
 		await harness.session.sendCustomMessage(
-			{
-				customType: "next-turn",
-				content: "context B",
-				display: true,
-				details: {},
-			},
+			{ customType: "next-turn", content: "context B", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
 		await harness.session.queueAgentMessagePrompt(secondPrompt, "followUp");
@@ -2193,12 +1966,7 @@ describe("AgentSession queue characterization", () => {
 
 		const pause = harness.session.acquireQueuedWorkPause();
 		await harness.session.sendCustomMessage(
-			{
-				customType: "next-turn",
-				content: "carry this",
-				display: true,
-				details: {},
-			},
+			{ customType: "next-turn", content: "carry this", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
 		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
@@ -2223,12 +1991,7 @@ describe("AgentSession queue characterization", () => {
 			"_checkCompaction",
 		).mockImplementationOnce(async () => {
 			await harness.session.sendCustomMessage(
-				{
-					customType: "next-turn",
-					content: "carry this",
-					display: true,
-					details: {},
-				},
+				{ customType: "next-turn", content: "carry this", display: true, details: {} },
 				{ deliverAs: "nextTurn" },
 			);
 			return false;
@@ -2345,9 +2108,7 @@ describe("AgentSession queue characterization", () => {
 
 		harness.setResponses([fauxAssistantMessage("later response")]);
 		await expect(
-			harness.session.promptAndWait("later prompt", {
-				agentMessageId: "agentmsg_clear_first",
-			}),
+			harness.session.promptAndWait("later prompt", { agentMessageId: "agentmsg_clear_first" }),
 		).resolves.toBeUndefined();
 		expect(getUserTexts(harness)).toEqual(["later prompt"]);
 		expect(getAssistantTexts(harness)).toEqual(["later response"]);
@@ -2356,9 +2117,7 @@ describe("AgentSession queue characterization", () => {
 		const errors: string[] = [];
 		const authHarness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(authHarness);
-		await authHarness.session.bindExtensions({
-			onError: (error) => errors.push(error.error),
-		});
+		await authHarness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
 		withStreaming(authHarness, true);
 		const delivery = authHarness.session.waitForAgentMessagePromptDelivery("agentmsg_terminal");
 		const terminalCompletion = authHarness.session.promptAndWait("cannot start", {
@@ -2424,9 +2183,7 @@ describe("AgentSession queue characterization", () => {
 			const id = `agentmsg_completed_${index}`;
 			harness.setResponses([fauxAssistantMessage(`done ${index}`)]);
 			await expect(
-				harness.session.promptAndWait(`prompt ${index}`, {
-					agentMessageId: id,
-				}),
+				harness.session.promptAndWait(`prompt ${index}`, { agentMessageId: id }),
 			).resolves.toBeUndefined();
 		}
 
@@ -2542,9 +2299,7 @@ describe("AgentSession queue characterization", () => {
 		const pause = harness.session.acquireQueuedWorkPause();
 		const id = "agentmsg_command_append_failed";
 		const delivery = harness.session.waitForAgentMessagePromptDelivery(id);
-		const completion = harness.session.promptAndWait("/autonomous status", {
-			agentMessageId: id,
-		});
+		const completion = harness.session.promptAndWait("/autonomous status", { agentMessageId: id });
 
 		pause.release();
 		await expect(delivery).rejects.toThrow("durable invocation append failed");
@@ -2745,10 +2500,7 @@ describe("AgentSession queue characterization", () => {
 				expect(harness.session.getFollowUpMessages()).toEqual([]);
 			}
 			await expect(
-				harness.session.restoreFollowUpMessage("duplicate", undefined, {
-					queueKey: "same",
-					agentMessageId: id,
-				}),
+				harness.session.restoreFollowUpMessage("duplicate", undefined, { queueKey: "same", agentMessageId: id }),
 			).resolves.toBe(false);
 
 			withStreaming(harness, false);
@@ -2778,18 +2530,11 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("queued done"), fauxAssistantMessage("direct done")]);
 		withStreaming(harness, true);
-		await harness.session.followUp("queued", undefined, {
-			queueKey: "same",
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("queued", undefined, { queueKey: "same", resumeIfIdle: true });
 		withStreaming(harness, false);
 		await vi.waitFor(() => expect(pause).toBeDefined());
 
-		expect(
-			await harness.session.followUp("duplicate", undefined, {
-				queueKey: "same",
-			}),
-		).toBe(false);
+		expect(await harness.session.followUp("duplicate", undefined, { queueKey: "same" })).toBe(false);
 		const direct = harness.session.prompt("direct");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(getUserTexts(harness)).toEqual([]);
@@ -2806,17 +2551,12 @@ describe("AgentSession queue characterization", () => {
 			label: "Instant",
 			description: "Returns immediately",
 			parameters: Type.Object({}),
-			execute: async () => ({
-				content: [{ type: "text", text: "done" }],
-				details: {},
-			}),
+			execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
 		};
 		const harness = await createHarness({ tools: [tool] });
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("instant", {}), {
-				stopReason: "toolUse",
-			}),
+			fauxAssistantMessage(fauxToolCall("instant", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("second handled"),
 		]);
 		const pause = harness.session.acquireQueuedWorkPause();
@@ -2885,9 +2625,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.prompt("two");
 		const secondId = harness.sessionManager.getLeafId();
 
-		const unrelatedNavigation = harness.session.navigateTree(targetId!, {
-			summarize: false,
-		});
+		const unrelatedNavigation = harness.session.navigateTree(targetId!, { summarize: false });
 		await vi.waitFor(() => expect(navigationStarts).toBe(1));
 		const extensionCommand = harness.session.prompt("/back");
 		await new Promise<void>((resolve) => setImmediate(resolve));
@@ -3017,9 +2755,7 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		const pause = harness.session.acquireQueuedWorkPause();
-		await harness.session.followUp("paused follow-up", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("paused follow-up", undefined, { resumeIfIdle: true });
 		const originalWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
 		let waitCalls = 0;
 		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
@@ -3077,11 +2813,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.followUp("queued before abort");
 		await harness.session.abort();
 
-		await expect(
-			harness.session.followUp("wake after abort", undefined, {
-				resumeIfIdle: true,
-			}),
-		).resolves.toBe(true);
+		await expect(harness.session.followUp("wake after abort", undefined, { resumeIfIdle: true })).resolves.toBe(true);
 		await harness.session.waitForIdle();
 
 		expect(getUserTexts(harness)).toEqual(["queued before abort", "wake after abort"]);
@@ -3103,14 +2835,7 @@ describe("AgentSession queue characterization", () => {
 		const outcome = await Promise.race([
 			waiting,
 			new Promise<{ ok: false; error: Error }>((resolve) =>
-				setTimeout(
-					() =>
-						resolve({
-							ok: false,
-							error: new Error("waitForIdle hung after clearQueue"),
-						}),
-					500,
-				),
+				setTimeout(() => resolve({ ok: false, error: new Error("waitForIdle hung after clearQueue") }), 500),
 			),
 		]);
 		expect(outcome).toEqual({ ok: true });
@@ -3137,9 +2862,7 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		const initialEvent = createDeferred();
 		const chainedOperation = createDeferred();
-		const internals = harness.session as unknown as {
-			_agentEventQueue: Promise<void>;
-		};
+		const internals = harness.session as unknown as { _agentEventQueue: Promise<void> };
 		let eventQueue: Promise<void>;
 		eventQueue = initialEvent.promise.then(() => {
 			internals._agentEventQueue = eventQueue.then(() => chainedOperation.promise);
@@ -3304,20 +3027,13 @@ describe("AgentSession scheduler scenarios", () => {
 		await waitForToolStart;
 		await harness.session.steer("s1");
 		await harness.session.sendCustomMessage(
-			{
-				customType: "queue-test",
-				content: "steer custom",
-				display: true,
-				details: {},
-			},
+			{ customType: "queue-test", content: "steer custom", display: true, details: {} },
 			{ deliverAs: "steer" },
 		);
 		expect(extensionApi).toBeDefined();
 		extensionApi?.sendUserMessage("extension steer", { deliverAs: "steer" });
 		await harness.session.followUp("f1");
-		await harness.session.prompt("/autonomous status", {
-			streamingBehavior: "followUp",
-		});
+		await harness.session.prompt("/autonomous status", { streamingBehavior: "followUp" });
 		await harness.session.followUp("f2");
 		await harness.session.sendCustomMessage(
 			{
@@ -3408,14 +3124,8 @@ describe("AgentSession scheduler scenarios", () => {
 
 		// Phase 1: keyed follow-ups coalesce per key.
 		const preflights: boolean[] = [];
-		await harness.session.prompt("same heartbeat", {
-			streamingBehavior: "followUp",
-			followUpQueueKey: "hb:one",
-		});
-		await harness.session.prompt("same heartbeat", {
-			streamingBehavior: "followUp",
-			followUpQueueKey: "hb:two",
-		});
+		await harness.session.prompt("same heartbeat", { streamingBehavior: "followUp", followUpQueueKey: "hb:one" });
+		await harness.session.prompt("same heartbeat", { streamingBehavior: "followUp", followUpQueueKey: "hb:two" });
 		await harness.session.prompt("same heartbeat", {
 			streamingBehavior: "followUp",
 			followUpQueueKey: "hb:two",
@@ -3423,15 +3133,11 @@ describe("AgentSession scheduler scenarios", () => {
 		});
 		expect(preflights).toEqual([false]);
 		expect(harness.session.getFollowUpMessages()).toEqual(["same heartbeat", "same heartbeat"]);
-		await harness.session.followUp("keep me", undefined, {
-			queueKey: "hb:keep",
-		});
+		await harness.session.followUp("keep me", undefined, { queueKey: "hb:keep" });
 
 		// Phase 2: steering never coalesces.
 		await harness.session.steer("first", undefined, { queueKey: "same-steer" });
-		await harness.session.steer("second", undefined, {
-			queueKey: "same-steer",
-		});
+		await harness.session.steer("second", undefined, { queueKey: "same-steer" });
 		expect(harness.session.getSteeringMessages()).toEqual(["first", "second"]);
 		expect(internals._steeringStopPending).toBe(true);
 		const agentPrompt = agentPromptText("agentmsg_s2_clear", "clear me");
@@ -3506,9 +3212,7 @@ describe("AgentSession scheduler scenarios", () => {
 						if (event.prompt === "direct") return;
 						prepared.push(event.prompt);
 						if (prepared.length === 1) await firstPreparation.promise;
-						return {
-							systemPrompt: `${event.systemPrompt}\nprepared:${event.prompt}`,
-						};
+						return { systemPrompt: `${event.systemPrompt}\nprepared:${event.prompt}` };
 					});
 				},
 				directGate.factory,
@@ -3535,9 +3239,7 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.followUp("ordinary");
 		await harness.session.queueAgentMessagePrompt(removedAgentMessage, "followUp", undefined);
 		await harness.session.queueAgentMessagePrompt(keptAgentMessage, "followUp", undefined);
-		await harness.session.followUp("last anchor", undefined, {
-			queueKey: "heartbeat:one",
-		});
+		await harness.session.followUp("last anchor", undefined, { queueKey: "heartbeat:one" });
 		expect(prepared).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
 
@@ -3564,9 +3266,7 @@ describe("AgentSession scheduler scenarios", () => {
 		// Phase 4: a direct prompt blocks queued work admitted behind it.
 		const direct = harness.session.prompt("direct");
 		await directGate.reached;
-		await harness.session.followUp("late queued", undefined, {
-			resumeIfIdle: true,
-		});
+		await harness.session.followUp("late queued", undefined, { resumeIfIdle: true });
 		expect(getUserTexts(harness)).toEqual(["ordinary", keptAgentMessage]);
 		directGate.release();
 		await direct;
@@ -3594,15 +3294,8 @@ describe("AgentSession scheduler scenarios", () => {
 		const first = harness.session.prompt("first");
 		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
 		await harness.session.followUp("queued for restart");
-		const image = {
-			type: "image" as const,
-			mimeType: "image/png",
-			data: "image-data",
-		};
-		await harness.session.prompt("/goal inspect image", {
-			streamingBehavior: "followUp",
-			images: [image],
-		});
+		const image = { type: "image" as const, mimeType: "image/png", data: "image-data" };
+		await harness.session.prompt("/goal inspect image", { streamingBehavior: "followUp", images: [image] });
 		const agentPrompt = agentPromptText("agentmsg_abort", "survive the abort");
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_abort");
 		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
@@ -3625,14 +3318,9 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(providerCalls).toBe(0);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
 		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ text: "queued for restart" }) }),
 			expect.objectContaining({
-				payload: expect.objectContaining({ text: "queued for restart" }),
-			}),
-			expect.objectContaining({
-				payload: expect.objectContaining({
-					text: "/goal inspect image",
-					images: [image],
-				}),
+				payload: expect.objectContaining({ text: "/goal inspect image", images: [image] }),
 			}),
 			expect.objectContaining({
 				agentMessageId: "agentmsg_abort",
@@ -3733,9 +3421,7 @@ describe("AgentSession scheduler scenarios", () => {
 		const failedPause = harness.session.acquireQueuedWorkPause();
 		const failedId = "agentmsg_failed_command";
 		const failedDelivery = harness.session.waitForAgentMessagePromptDelivery(failedId);
-		const failedCompletion = harness.session.promptAndWait("/refine --local", {
-			agentMessageId: failedId,
-		});
+		const failedCompletion = harness.session.promptAndWait("/refine --local", { agentMessageId: failedId });
 		failedPause.release();
 		await expect(failedDelivery).resolves.toBeUndefined();
 		await expect(failedCompletion).rejects.toThrow("refine execution failed");
@@ -3748,17 +3434,11 @@ describe("AgentSession scheduler scenarios", () => {
 			async (context: { reason: string; turnsSinceLastReview: number }, _signal?: AbortSignal) => {
 				if (reviewer.mock.calls.length === 2) await review2Gate.promise;
 				if (reviewer.mock.calls.length === 3) await review3Gate.promise;
-				return {
-					shouldRefine: true,
-					rationale: "durable lesson",
-					instructions: `lesson ${context.reason}`,
-				};
+				return { shouldRefine: true, rationale: "durable lesson", instructions: `lesson ${context.reason}` };
 			},
 		);
 		const harness = await createAutoRefineHarness({
-			settings: {
-				autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 },
-			},
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
 		harnesses.push(harness);
@@ -3778,13 +3458,7 @@ describe("AgentSession scheduler scenarios", () => {
 				fauxAssistantMessage("first done"),
 				fauxAssistantMessage(
 					refinePlanJson("First auto refine", [
-						{
-							action: "create",
-							kind: "memory",
-							id: "auto_one",
-							title: "One",
-							content: "First lesson.",
-						},
+						{ action: "create", kind: "memory", id: "auto_one", title: "One", content: "First lesson." },
 					]),
 				),
 				fauxAssistantMessage("second done"),
@@ -3794,13 +3468,7 @@ describe("AgentSession scheduler scenarios", () => {
 				},
 				fauxAssistantMessage(
 					refinePlanJson("Second auto refine", [
-						{
-							action: "create",
-							kind: "memory",
-							id: "auto_two",
-							title: "Two",
-							content: "Second lesson.",
-						},
+						{ action: "create", kind: "memory", id: "auto_two", title: "Two", content: "Second lesson." },
 					]),
 				),
 				fauxAssistantMessage("fourth done"),
@@ -3810,10 +3478,7 @@ describe("AgentSession scheduler scenarios", () => {
 			await harness.session.prompt("first");
 			await vi.waitFor(() => expect(memoryIds()).toContain("auto_one"));
 			expect(reviewer).toHaveBeenCalledTimes(1);
-			expect(reviewer.mock.calls[0]![0]).toEqual({
-				reason: "turn_interval",
-				turnsSinceLastReview: 1,
-			});
+			expect(reviewer.mock.calls[0]![0]).toEqual({ reason: "turn_interval", turnsSinceLastReview: 1 });
 
 			// Phase 2: review resolves while busy -> refine defers.
 			await harness.session.prompt("second");
@@ -3837,9 +3502,7 @@ describe("AgentSession scheduler scenarios", () => {
 				.getEntries()
 				.find((entry) => entry.type === "message" && entry.message.role === "user");
 			expect(target).toBeDefined();
-			const navigation = harness.session.navigateTree(target!.id, {
-				summarize: false,
-			});
+			const navigation = harness.session.navigateTree(target!.id, { summarize: false });
 			review3Gate.resolve();
 			await navigation;
 			await harness.session.waitForIdle();

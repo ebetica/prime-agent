@@ -329,7 +329,6 @@ describe("child passivation capability", () => {
 	});
 });
 
-
 describe("ActionStore durable queue ordering", () => {
 	it("persists enqueue before selection and records admission before changing lifecycle", () => {
 		const writes: Array<Array<{ id: string; state: string }>> = [];

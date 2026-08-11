@@ -869,14 +869,25 @@ describe("openai-codex streaming", () => {
 		globalThis.WebSocket = websocket as unknown as typeof WebSocket;
 		global.fetch = vi.fn(async () => new Response(buildSSEPayload({ status: "completed" }), { status: 200 }));
 		const model: Model<"openai-codex-responses"> = {
-			id: "gpt-5.6-sol", name: "GPT", api: "openai-codex-responses", provider: "openai-codex",
-			baseUrl: "https://chatgpt.com/backend-api", reasoning: true, input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 400000, maxTokens: 128000,
+			id: "gpt-5.6-sol",
+			name: "GPT",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
 		};
-		await streamOpenAICodexResponses(model, {
-			systemPrompt: "system",
-			messages: [{ role: "user", content: "x".repeat(300_000), timestamp: 1 }],
-		}, { apiKey: mockToken(), sessionId: "oversized", transport: "websocket" }).result();
+		await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: "system",
+				messages: [{ role: "user", content: "x".repeat(300_000), timestamp: 1 }],
+			},
+			{ apiKey: mockToken(), sessionId: "oversized", transport: "websocket" },
+		).result();
 		expect(websocket).not.toHaveBeenCalled();
 		expect(global.fetch).toHaveBeenCalledTimes(1);
 		expect(getOpenAICodexWebSocketDebugStats("oversized")).toMatchObject({ sseFallbacks: 1 });

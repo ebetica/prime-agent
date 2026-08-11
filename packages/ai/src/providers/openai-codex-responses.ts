@@ -174,8 +174,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const bodyJson = JSON.stringify(body);
 			const requestBytes = new TextEncoder().encode(bodyJson).byteLength;
 			const transport = options?.transport || "auto";
-			const oversizedPlainWebSocket =
-				transport === "websocket" && requestBytes > MAX_PLAIN_WEBSOCKET_REQUEST_BYTES;
+			const oversizedPlainWebSocket = transport === "websocket" && requestBytes > MAX_PLAIN_WEBSOCKET_REQUEST_BYTES;
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(options?.sessionId);
 			if (websocketDisabledForSession || oversizedPlainWebSocket) {
 				recordWebSocketSseFallback(options?.sessionId);
