@@ -145,6 +145,14 @@ const ipythonSchema = Type.Object({
 		description:
 			"Python scratchpad code or `%%bash` shell cells to execute in the agent kernel. Use the target project's own environment for project imports, tests, scripts, CLIs, and dependency checks instead of direct kernel imports.",
 	}),
+	timeout: Type.Optional(
+		Type.Number({
+			minimum: 0,
+			maximum: 86_400,
+			description:
+				"Seconds to wait before a host extension may background a still-running cell. Omit to use the host default.",
+		}),
+	),
 });
 
 const BUSY_KERNEL_WAIT_CHOICE = "Wait and preserve state";

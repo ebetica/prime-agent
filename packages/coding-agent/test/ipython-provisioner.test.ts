@@ -71,6 +71,23 @@ function createBusyKernelContext(
 	return { ctx, setWorkingMessage };
 }
 
+describe("ipython tool parameters", () => {
+	it("offers an optional bounded host background timeout", () => {
+		const tool = createIpythonToolDefinition(process.cwd());
+		const schema = tool.parameters as {
+			required?: string[];
+			properties?: Record<string, { type?: string; minimum?: number; maximum?: number }>;
+		};
+		expect(schema.required).toContain("code");
+		expect(schema.required).not.toContain("timeout");
+		expect(schema.properties?.timeout).toMatchObject({
+			type: "number",
+			minimum: 0,
+			maximum: 86_400,
+		});
+	});
+});
+
 describe("IpythonKernelProvisioner", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-provisioner-"));
