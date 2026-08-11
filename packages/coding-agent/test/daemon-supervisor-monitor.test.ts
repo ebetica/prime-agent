@@ -1487,6 +1487,7 @@ describe("daemon worker supervisor monitoring", () => {
 			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 				descriptorDir,
 				socketPath: "/tmp/supervisor.sock",
+				defaultSessionConfig: {},
 				workers: new Map(),
 				log: vi.fn(),
 			}) as {
