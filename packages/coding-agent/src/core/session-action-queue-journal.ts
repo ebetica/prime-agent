@@ -14,6 +14,12 @@ import type { SessionActionRecoverySnapshot } from "./agent-session.js";
 
 const FILE_NAME = "session-action-queue.json";
 
+export interface SessionActionQueueCheckpoint {
+	formatVersion: 1;
+	queue: SessionActionRecoverySnapshot;
+	admittedActionIds: string[];
+}
+
 export function sessionActionQueuePath(artifactDir: string): string {
 	return join(artifactDir, FILE_NAME);
 }
@@ -24,10 +30,16 @@ export class SessionActionQueueJournal {
 		this.path = sessionActionQueuePath(artifactDir);
 	}
 
-	read(): SessionActionRecoverySnapshot | undefined {
+	read(): SessionActionQueueCheckpoint | undefined {
 		try {
-			const value = JSON.parse(readFileSync(this.path, "utf8")) as SessionActionRecoverySnapshot;
-			if (value.formatVersion !== 1 || !Array.isArray(value.actions)) {
+			const value = JSON.parse(readFileSync(this.path, "utf8")) as SessionActionQueueCheckpoint;
+			if (
+				value.formatVersion !== 1 ||
+				value.queue?.formatVersion !== 1 ||
+				!Array.isArray(value.queue.actions) ||
+				!Array.isArray(value.admittedActionIds) ||
+				!value.admittedActionIds.every((id) => typeof id === "string")
+			) {
 				throw new Error(`Invalid durable session queue: ${this.path}`);
 			}
 			return value;
@@ -37,13 +49,23 @@ export class SessionActionQueueJournal {
 		}
 	}
 
-	write(snapshot: SessionActionRecoverySnapshot): void {
+	write(checkpoint: SessionActionQueueCheckpoint): void {
+		if (checkpoint.queue.actions.length === 0 && checkpoint.admittedActionIds.length === 0) {
+			rmSync(this.path, { force: true });
+			try {
+				const descriptor = openSync(dirname(this.path), "r");
+				try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			return;
+		}
 		mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
 		const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
 		try {
 			const descriptor = openSync(temporary, "w", 0o600);
 			try {
-				writeSync(descriptor, `${JSON.stringify(snapshot)}\n`);
+				writeSync(descriptor, `${JSON.stringify(checkpoint)}\n`);
 				fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);

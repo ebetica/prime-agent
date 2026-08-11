@@ -1334,7 +1334,7 @@ export class AgentSession {
 		cleanupSessionResources(this.sessionManager.getSessionId());
 		const artifactDir = this.sessionManager.getSessionArtifactDir();
 		this._actionQueueJournal = artifactDir ? new SessionActionQueueJournal(artifactDir) : undefined;
-		this._actionStore = new ActionStore<QueuedSessionAction>((actions) => this._persistQueuedSessionActions(actions));
+		this._actionStore = new ActionStore<QueuedSessionAction>((queued, admitted) => this._persistSessionActionState(queued, admitted));
 		this.settingsManager = config.settingsManager;
 		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
@@ -1409,12 +1409,20 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		const durableQueue = this._actionQueueJournal?.read();
-		if (durableQueue?.actions.length) {
-			// The daemon resumes this only after the worker has proved the current
-			// supervisor generation. A stale competing worker may load, but cannot admit.
+		const durableActions = this._actionQueueJournal?.read();
+		if (durableActions?.admittedActionIds.length) {
+			this.sessionManager.appendCustomMessageEntry(
+				"prime-agent.session_actions_interrupted",
+				`Worker replacement interrupted admitted session action${durableActions.admittedActionIds.length === 1 ? "" : "s"}: ${durableActions.admittedActionIds.join(", ")}. The action was not replayed.`,
+				true,
+				{ actionIds: durableActions.admittedActionIds },
+			);
+		}
+		if (durableActions?.queue.actions.length) {
 			this._sessionInputPumpSuspended = true;
-			void this.restoreSessionActions(durableQueue);
+			void this.restoreSessionActions(durableActions.queue);
+		} else if (durableActions) {
+			this._actionQueueJournal?.write({ formatVersion: 1, queue: durableActions.queue, admittedActionIds: [] });
 		}
 		if (this._recoverPlannedRestartContinuationIntents() > 0) {
 			// A prior successor may have acknowledged resume and crashed before the
@@ -6411,8 +6419,15 @@ export class AgentSession {
 		);
 	}
 
-	private _persistQueuedSessionActions(actions: readonly QueuedSessionAction[]): void {
-		this._actionQueueJournal?.write(this._sessionActionRecoverySnapshot(actions));
+	private _persistSessionActionState(
+		queued: readonly QueuedSessionAction[],
+		admitted: readonly QueuedSessionAction[],
+	): void {
+		this._actionQueueJournal?.write({
+			formatVersion: 1,
+			queue: this._sessionActionRecoverySnapshot(queued),
+			admittedActionIds: admitted.map((action) => action.id),
+		});
 	}
 
 	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {

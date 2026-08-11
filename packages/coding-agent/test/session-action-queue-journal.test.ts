@@ -12,12 +12,12 @@ describe("SessionActionQueueJournal", () => {
 		const dir = mkdtempSync(join(tmpdir(), "prime-action-queue-"));
 		dirs.push(dir);
 		const journal = new SessionActionQueueJournal(dir);
-		const queued = { formatVersion: 1 as const, actions: [{ id: "first" }, { id: "second" }] as never[] };
+		const queued = { formatVersion: 1 as const, queue: { formatVersion: 1 as const, actions: [{ id: "first" }, { id: "second" }] as never[] }, admittedActionIds: [] };
 		journal.write(queued);
 		expect(journal.read()).toEqual(queued);
-		journal.write({ formatVersion: 1, actions: [] });
-		expect(journal.read()).toEqual({ formatVersion: 1, actions: [] });
-		expect(readFileSync(sessionActionQueuePath(dir), "utf8")).toMatch(/"actions":\[\]/);
+		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admittedActionIds: ["running"] });
+		expect(journal.read()?.admittedActionIds).toEqual(["running"]);
+		expect(readFileSync(sessionActionQueuePath(dir), "utf8")).toMatch(/running/);
 	});
 
 	it("ignores no queue but rejects a corrupt checkpoint instead of replaying uncertain work", () => {
@@ -25,7 +25,7 @@ describe("SessionActionQueueJournal", () => {
 		dirs.push(dir);
 		const journal = new SessionActionQueueJournal(dir);
 		expect(journal.read()).toBeUndefined();
-		journal.write({ formatVersion: 1, actions: [] });
-		expect(journal.read()?.actions).toEqual([]);
+		journal.write({ formatVersion: 1, queue: { formatVersion: 1, actions: [] }, admittedActionIds: [] });
+		expect(journal.read()).toBeUndefined();
 	});
 });
