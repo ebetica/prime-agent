@@ -3702,10 +3702,7 @@ export class DaemonSupervisor {
 		await worker.recovery;
 	}
 
-	private async withFocusedWorkerReadRetry<T>(
-		worker: ResidentWorker,
-		operation: () => Promise<T>,
-	): Promise<T> {
+	private async withFocusedWorkerReadRetry<T>(worker: ResidentWorker, operation: () => Promise<T>): Promise<T> {
 		const observedClient = worker.client;
 		try {
 			return await operation();

@@ -159,9 +159,7 @@ export class DaemonWorkerClient {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
 				reject(
-					new DaemonWorkerRequestTimeoutError(
-						`Timed out waiting for daemon worker response to ${command.type}`,
-					),
+					new DaemonWorkerRequestTimeoutError(`Timed out waiting for daemon worker response to ${command.type}`),
 				);
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
