@@ -1302,7 +1302,7 @@ export class AgentDaemon {
 		this.summarizer.seed(state);
 		this.recordWorkerRecoveryState(state, "ready");
 		if (!this.options.worker || this.hasAuthenticatedSupervisorConnection()) {
-			runtime.session.resumeQueuedWork();
+			(runtime.session as { resumeQueuedWork?: () => boolean }).resumeQueuedWork?.();
 		}
 		return state;
 	}
