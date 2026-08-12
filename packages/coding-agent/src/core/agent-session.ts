@@ -56,6 +56,7 @@ import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
 	type AgentFamilyCatalogEntry,
+	type AgentFamilyRelationship,
 	type AgentFamilyRosterResult,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
@@ -795,6 +796,52 @@ function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 		return `${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: ${payload.customMessage.details.message}`;
 	}
 	return payload.preview ?? payload.text;
+}
+
+type QueuedAgentMessageInspection = {
+	text: string;
+	customType: typeof AGENT_MESSAGE_CUSTOM_TYPE;
+	from?: {
+		activeSessionId?: string;
+		sessionId?: string;
+		sessionName?: string;
+	};
+	fromRelationship?: AgentFamilyRelationship;
+};
+
+/** Redact and validate the native record instead of trusting its human-readable envelope. */
+function queuedAgentMessageInspection(action: QueuedSessionAction): QueuedAgentMessageInspection | undefined {
+	if (action.payload.kind !== "turn" || !action.payload.customMessage || !action.agentMessageId) return undefined;
+	const message = action.payload.customMessage;
+	if (!isAgentSessionMessage(message) || message.details.id !== action.agentMessageId) return undefined;
+	const details = message.details;
+	const relationship = details.fromRelationship;
+	if (relationship !== undefined && relationship !== "parent" && relationship !== "sibling" && relationship !== "child") {
+		return undefined;
+	}
+	const source: unknown = details.from;
+	if (source !== undefined && source !== null && !isObjectRecord(source)) return undefined;
+	if (
+		isObjectRecord(source) &&
+		[source.activeSessionId, source.sessionId, source.sessionName].some(
+			(value) => value !== undefined && typeof value !== "string",
+		)
+	) {
+		return undefined;
+	}
+	const from = isObjectRecord(source)
+		? {
+				...(typeof source.activeSessionId === "string" ? { activeSessionId: source.activeSessionId } : {}),
+				...(typeof source.sessionId === "string" ? { sessionId: source.sessionId } : {}),
+				...(typeof source.sessionName === "string" ? { sessionName: source.sessionName } : {}),
+			}
+		: undefined;
+	return {
+		text: details.message,
+		customType: AGENT_MESSAGE_CUSTOM_TYPE,
+		...(from && Object.keys(from).length > 0 ? { from } : {}),
+		...(relationship ? { fromRelationship: relationship } : {}),
+	};
 }
 
 function visibleSessionActionProjection(actions: readonly QueuedSessionAction[]): readonly QueuedSessionAction[] {
@@ -6298,14 +6345,33 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
+	getQueuedUserActions(): readonly {
+		id: string;
+		text: string;
+		delivery: "steering" | "followUp";
+		customType?: typeof AGENT_MESSAGE_CUSTOM_TYPE;
+		from?: { activeSessionId?: string; sessionId?: string; sessionName?: string };
+		fromRelationship?: AgentFamilyRelationship;
+	}[] {
 		return visibleSessionActionProjection(this._actionStore.queuedActions())
 			.filter((action) => action.payload.kind === "turn")
-			.map((action) => ({
-				id: action.id,
-				text: queuedAgentMessagePreview(action),
-				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
-			}));
+			.map((action) => {
+				const agentMessage = queuedAgentMessageInspection(action);
+				return {
+					id: action.id,
+					text: agentMessage?.text ?? queuedAgentMessagePreview(action),
+					delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+					...(agentMessage
+						? {
+								customType: agentMessage.customType,
+								...(agentMessage.from ? { from: agentMessage.from } : {}),
+								...(agentMessage.fromRelationship
+									? { fromRelationship: agentMessage.fromRelationship }
+									: {}),
+							}
+						: {}),
+				};
+			});
 	}
 
 	cancelQueuedAction(id: string): boolean {

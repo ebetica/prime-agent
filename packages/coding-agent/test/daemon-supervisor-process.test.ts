@@ -833,6 +833,27 @@ describe("daemon supervisor resident workers", () => {
 				deliveryStatus: "queued",
 			},
 		});
+		const targetConnection = await DaemonAgentConnection.attach(client, target.activeSessionId ?? target.id, {
+			closeClientOnDispose: false,
+			recoverDaemon: async () => {},
+			supportsExtensionUi: false,
+		});
+		const queued = await targetConnection.getQueuedUserActions();
+		expect(queued).toEqual([
+			{
+				id: expect.any(String),
+				text: "hello sibling root",
+				delivery: "steering",
+				customType: "agent_message",
+				from: {
+					activeSessionId: source.activeSessionId ?? source.id,
+					sessionId: source.id,
+					sessionName: "source-root",
+				},
+				fromRelationship: "sibling",
+			},
+		]);
+		await targetConnection.dispose();
 		const shutdown = await client.request({ type: "shutdown" }, 10_000);
 		expect(shutdown.success).toBe(true);
 		client.close();
