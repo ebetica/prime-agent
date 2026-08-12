@@ -124,48 +124,45 @@ export async function withRegistryLease<T>(
 	}
 	const started = Date.now();
 	let lastLog = 0;
-	for (;;) {
-		options.signal?.throwIfAborted();
-		try {
-			linkSync(candidate, stable);
-			unlinkSync(candidate);
-			fsyncDirectory(directory);
-			break;
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST") throw error;
-			const holder = readOwner(stable);
-			ownerState(holder, current, getStart);
-
-			const elapsed = Date.now() - started;
-			if (elapsed - lastLog >= 1000) {
-				lastLog = elapsed;
-				options.onWait?.(
-					`Waiting ${elapsed}ms for RLM registry lease holder pid=${holder?.pid ?? "unknown"} start=${holder?.processStartId ?? "unknown"} machine=${holder?.machineId ?? "unknown"} boot=${holder?.bootId ?? "unknown"}`,
-				);
-			}
-			await pause(options.pollMs ?? 50, options.signal);
-		}
-	}
+	let acquired = false;
 	try {
+		for (;;) {
+			options.signal?.throwIfAborted();
+			try {
+				linkSync(candidate, stable);
+				unlinkSync(candidate);
+				fsyncDirectory(directory);
+				acquired = true;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				const holder = readOwner(stable);
+				ownerState(holder, current, getStart);
+				const elapsed = Date.now() - started;
+				if (elapsed - lastLog >= 1000) {
+					lastLog = elapsed;
+					options.onWait?.(
+						`Waiting ${elapsed}ms for RLM registry lease holder pid=${holder?.pid ?? "unknown"} start=${holder?.processStartId ?? "unknown"} machine=${holder?.machineId ?? "unknown"} boot=${holder?.bootId ?? "unknown"}`,
+					);
+				}
+				await pause(options.pollMs ?? 50, options.signal);
+			}
+		}
 		return await action();
 	} finally {
-		const held = readOwner(stable);
-		// Normal acquisition never reclaims. The supervisor's globally fenced
-		// lifecycle recovery is the only external remover, so a matching token
-		// cannot be replaced between this read and unlink.
-		if (held?.token === token) {
-			try {
-				unlinkSync(stable);
-				fsyncDirectory(directory);
-			} catch {
-				// A lifecycle recovery may have removed the exact claim under its global fence.
+		if (acquired) {
+			const held = readOwner(stable);
+			// External recovery is permitted only under the supervisor's global
+			// admissions fence, so it cannot race this live owner release.
+			if (held?.token === token) {
+				try {
+					unlinkSync(stable);
+					fsyncDirectory(directory);
+				} catch {}
 			}
 		}
 		try {
 			unlinkSync(candidate);
-		} catch {
-			// Candidate cleanup is best effort; unique names prevent interference.
-		}
+		} catch {}
 	}
 }
