@@ -229,7 +229,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
-	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean;
+	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean | Promise<boolean>;
 	/** Release a host-owned child after its detached initial task settles. */
 	releaseRlmSubagentRuntime?: (
 		runtime: RlmSubagentRuntime,

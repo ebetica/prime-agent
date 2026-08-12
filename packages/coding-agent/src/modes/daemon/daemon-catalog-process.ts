@@ -66,14 +66,14 @@ const RLM_CHILD_INTERRUPTED_CUSTOM_TYPE = "prime-agent.rlm_child_interrupted";
  * The registry transition is the durable truth; the parent notice is deduplicated
  * from its own transcript so retries after either append remain idempotent.
  */
-export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
+export async function reconcileInterruptedRlmChild(sessionPath: string): Promise<boolean> {
 	const child = SessionManager.open(sessionPath);
 	const header = child.getHeader();
 	if (!header?.parentSession) return false;
 	const parentPath = resolve(dirname(sessionPath), header.parentSession);
 	const parentSessionId = SessionManager.open(parentPath).getSessionId();
 	const registryPath = join(dirname(dirname(parentPath)), "session-artifacts", parentSessionId, "rlm-subagents.jsonl");
-	return mutateRlmSubagentRegistry(registryPath, (latest) => {
+	return await mutateRlmSubagentRegistry(registryPath, (latest) => {
 		const entry = [...latest.values()].find(
 			(candidate) =>
 				(candidate.status === "running" || candidate.status === "interrupted") &&
@@ -118,7 +118,7 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	const parent = await readSessionInfo(parentPath);
 	if (!parent) return [target];
 	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
-	const latest = readRlmSubagentRegistry(registryPath);
+	const latest = await readRlmSubagentRegistry(registryPath);
 	const siblingPaths = new Set<string>([resolve(target.path)]);
 	for (const entry of latest) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
@@ -294,7 +294,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "mark_interrupted":
-				reconcileInterruptedRlmChild(request.sessionPath);
+				await reconcileInterruptedRlmChild(request.sessionPath);
 				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
 					"prime-agent.worker_recovery",
 					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
