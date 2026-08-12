@@ -579,6 +579,15 @@ describe("daemon supervisor resident workers", () => {
 			success: true,
 			data: { sessions: [], busyClientOwnedSessionCount: 0 },
 		});
+		const deniedSavedList = await otherClient.request({
+			type: "list_saved_sessions",
+			cwd: projectDir,
+			sessionDir,
+			scope: "all",
+		});
+		expect(deniedSavedList).toMatchObject({ success: true, data: { sessions: [] } });
+		const deniedDelete = await otherClient.request({ type: "delete_saved_session", sessionPath: sessionFile });
+		expect(deniedDelete).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
 		const privateSelector = summary.sessionId.slice(-8);
 		const deniedAttach = await otherClient.request({ type: "attach", activeSessionId: privateSelector });
 		expect(deniedAttach).toMatchObject({
@@ -630,6 +639,13 @@ describe("daemon supervisor resident workers", () => {
 			"Client-owned worker descriptor was not removed",
 		);
 		expect((await readSessionInfo(sessionFile))?.state?.status).not.toBe("archived");
+		const otherClientAfterStop = await connectEventually(socketPath);
+		const deniedDeleteAfterStop = await otherClientAfterStop.request({
+			type: "delete_saved_session",
+			sessionPath: sessionFile,
+		});
+		expect(deniedDeleteAfterStop).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
+		otherClientAfterStop.close();
 
 		await client.request({ type: "shutdown" });
 		client.close();
