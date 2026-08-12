@@ -8,19 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import {
-	closeSync,
-	existsSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-	writeSync,
-} from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -101,6 +89,11 @@ import {
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import {
+	mutateRlmSubagentRegistry,
+	type PersistedRlmSubagentRegistryEntry,
+	readRlmSubagentRegistry,
+} from "../../core/rlm-subagent-registry.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -374,25 +367,6 @@ interface BoundSupervisorGenerationClaim {
 }
 
 const RLM_SUBAGENT_REGISTRY_FILE = "rlm-subagents.jsonl";
-
-interface PersistedRlmSubagentRegistryEntry {
-	type: "rlm_subagent";
-	childId: string;
-	sessionName: string;
-	sessionDir: string;
-	sessionFile: string;
-	parentSessionId: string;
-	parentSessionFile?: string;
-	rlmDepth?: number;
-	rlmMaxDepth?: number;
-	rlmParentNodeId?: string;
-	prompt?: string;
-	spawnCode?: string;
-	model?: { provider: string; modelId: string };
-	status: "running" | "completed" | "interrupted" | "deleted";
-	createdAt: number;
-	updatedAt: string;
-}
 
 type PassiveRlmRoot =
 	| { rootParentState: ActiveSessionState; rootInfo?: never }
@@ -891,20 +865,16 @@ export class AgentDaemon {
 		entry: PersistedRlmSubagentRegistryEntry,
 	): boolean {
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
-		if (!path) {
-			return true;
-		}
+		if (!path) return true;
 		try {
-			mkdirSync(dirname(path), { recursive: true });
-			const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-			const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-			const handle = openSync(path, "a");
-			try {
-				writeSync(handle, `${separator}${JSON.stringify(entry)}\n`);
-				fsyncSync(handle);
-			} finally {
-				closeSync(handle);
-			}
+			mutateRlmSubagentRegistry(path, (latest) => {
+				const current = latest.get(entry.childId);
+				const allowed =
+					(entry.status === "running" && !current) ||
+					(entry.status === "completed" && current?.status === "running") ||
+					(entry.status === "interrupted" && (current?.status === "running" || current?.status === "interrupted"));
+				return { result: undefined, ...(allowed ? { entry } : {}) };
+			});
 			return true;
 		} catch (error) {
 			this.log(
@@ -953,84 +923,30 @@ export class AgentDaemon {
 	}
 
 	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void> {
-		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-			(entry) => entry.childId === childId,
-		);
-		if (!latest || latest.status === "deleted") {
-			return;
-		}
-		if (
-			!this.appendRlmSubagentRegistryEntry(parentState, {
-				...latest,
-				status: "deleted",
-				updatedAt: new Date().toISOString(),
-			})
-		) {
-			throw new Error(`Failed to persist deletion for RLM subagent ${childId}`);
-		}
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path) return;
+		mutateRlmSubagentRegistry(path, (latest) => ({
+			result: undefined,
+			...(latest.has(childId) ? { deleteChildId: childId } : {}),
+		}));
 	}
 
 	private readLatestRlmSubagentRegistry(
 		parentState: ActiveSessionState,
-		throwOnReadError = false,
 	): Promise<PersistedRlmSubagentRegistryEntry[]> {
-		return this.readLatestRlmSubagentRegistryPath(
-			this.rlmSubagentRegistryPath(parentState.runtime.session),
-			throwOnReadError,
-		);
+		return this.readLatestRlmSubagentRegistryPath(this.rlmSubagentRegistryPath(parentState.runtime.session));
 	}
 
 	private async readLatestRlmSubagentRegistryPath(
 		path: string | undefined,
-		throwOnReadError = false,
 	): Promise<PersistedRlmSubagentRegistryEntry[]> {
-		if (!path) {
-			return [];
-		}
-		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
-		let lines: string[];
+		if (!path) return [];
 		try {
-			lines = (await readFile(path, "utf8")).split(/\r?\n/);
+			return readRlmSubagentRegistry(path);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				return [];
-			}
 			this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
-			if (throwOnReadError) {
-				throw error;
-			}
-			return [];
+			throw error;
 		}
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				continue;
-			}
-			try {
-				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
-				if (
-					entry.type !== "rlm_subagent" ||
-					typeof entry.childId !== "string" ||
-					typeof entry.sessionName !== "string" ||
-					typeof entry.sessionDir !== "string" ||
-					typeof entry.sessionFile !== "string" ||
-					(entry.status !== "running" &&
-						entry.status !== "completed" &&
-						entry.status !== "interrupted" &&
-						entry.status !== "deleted") ||
-					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
-				) {
-					continue;
-				}
-				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
-			} catch (error) {
-				this.log(
-					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-		return [...latest.values()];
 	}
 
 	private rlmSubagentRegistryPathForEntry(entry: PersistedRlmSubagentRegistryEntry, info: SessionInfo): string {
@@ -2273,7 +2189,7 @@ export class AgentDaemon {
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === childId,
 				);
-				const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
+				const persisted = (await this.readLatestRlmSubagentRegistry(parentState)).find(
 					(entry) => entry.childId === childId,
 				);
 				const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;

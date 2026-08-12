@@ -1,9 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import {
+	mutateRlmSubagentRegistry,
+	type PersistedRlmSubagentRegistryEntry,
+	readRlmSubagentRegistry,
+} from "../../core/rlm-subagent-registry.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
@@ -60,16 +63,6 @@ function deserializeSessionInfo(session: SessionInfoWire): SessionInfo {
 	};
 }
 
-interface SavedRlmSubagentRegistryEntry {
-	type?: unknown;
-	childId?: unknown;
-	sessionName?: unknown;
-	sessionDir?: unknown;
-	sessionFile?: unknown;
-	status?: unknown;
-	updatedAt?: unknown;
-}
-
 const RLM_CHILD_INTERRUPTED_CUSTOM_TYPE = "prime-agent.rlm_child_interrupted";
 
 /**
@@ -89,43 +82,22 @@ export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
 		parent.getSessionId(),
 		"rlm-subagents.jsonl",
 	);
-	let contents: string;
-	try {
-		contents = readFileSync(registryPath, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-		throw error;
-	}
-	const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
-	for (const line of contents.split(/\r?\n/)) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
-			if (entry.type === "rlm_subagent" && typeof entry.childId === "string") latest.set(entry.childId, entry);
-		} catch {
-			// Ignore malformed history, matching the owning worker reader.
-		}
-	}
-	const entry = [...latest.values()].find(
-		(candidate) =>
-			(candidate.status === "running" || candidate.status === "interrupted") &&
-			candidate.sessionFile === sessionPath,
-	);
+	let entry: PersistedRlmSubagentRegistryEntry | undefined;
+	let transitioned = false;
+	mutateRlmSubagentRegistry(registryPath, (latest) => {
+		entry = [...latest.values()].find(
+			(candidate) =>
+				(candidate.status === "running" || candidate.status === "interrupted") &&
+				candidate.sessionFile === sessionPath,
+		);
+		if (!entry || typeof entry.childId !== "string") return { result: undefined };
+		transitioned = entry.status === "running";
+		return transitioned
+			? { result: undefined, entry: { ...entry, status: "interrupted", updatedAt: new Date().toISOString() } }
+			: { result: undefined };
+	});
 	if (!entry || typeof entry.childId !== "string") return false;
-	const transitioned = entry.status === "running";
-	if (transitioned) {
-		const interrupted = { ...entry, status: "interrupted", updatedAt: new Date().toISOString() };
-		const descriptor = openSync(registryPath, "a");
-		try {
-			writeSync(
-				descriptor,
-				`${contents.endsWith("\n") || contents.length === 0 ? "" : "\n"}${JSON.stringify(interrupted)}\n`,
-			);
-			fsyncSync(descriptor);
-		} finally {
-			closeSync(descriptor);
-		}
-	}
+	const reconciledEntry = entry;
 
 	const alreadyNotified = parent
 		.getEntries()
@@ -133,15 +105,16 @@ export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
 			(candidate) =>
 				candidate.type === "custom_message" &&
 				candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
-				(candidate.details as { childId?: unknown } | undefined)?.childId === entry.childId,
+				(candidate.details as { childId?: unknown } | undefined)?.childId === reconciledEntry.childId,
 		);
 	if (!alreadyNotified) {
-		const sessionName = typeof entry.sessionName === "string" ? entry.sessionName : entry.childId;
+		const sessionName =
+			typeof reconciledEntry.sessionName === "string" ? reconciledEntry.sessionName : reconciledEntry.childId;
 		parent.appendCustomMessageEntryWithRollback(
 			RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
-			`RLM child ${sessionName} (${entry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
+			`RLM child ${sessionName} (${reconciledEntry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
 			true,
-			{ childId: entry.childId, sessionName, reason: "worker_interrupted", replayed: false },
+			{ childId: reconciledEntry.childId, sessionName, reason: "worker_interrupted", replayed: false },
 		);
 	}
 	return transitioned;
@@ -155,25 +128,9 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	const parent = await readSessionInfo(parentPath);
 	if (!parent) return [target];
 	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
-	let contents: string;
-	try {
-		contents = await readFile(registryPath, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [target];
-		throw error;
-	}
-	const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
-	for (const line of contents.split(/\r?\n/)) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
-			if (entry.type === "rlm_subagent" && typeof entry.childId === "string") latest.set(entry.childId, entry);
-		} catch {
-			// Ignore malformed registry history just like the owning worker does.
-		}
-	}
+	const latest = readRlmSubagentRegistry(registryPath);
 	const siblingPaths = new Set<string>([resolve(target.path)]);
-	for (const entry of latest.values()) {
+	for (const entry of latest) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
 			siblingPaths.add(resolve(entry.sessionFile));
 	}
