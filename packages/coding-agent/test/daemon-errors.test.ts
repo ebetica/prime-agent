@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { StaleTranscriptGenerationError } from "../src/core/session-manager.js";
 import {
 	AtomicResourceReloadRestartRequiredError,
 	deserializeDaemonError,
@@ -19,5 +20,19 @@ describe("daemon errors", () => {
 		});
 		expect(restored).toBeInstanceOf(AtomicResourceReloadRestartRequiredError);
 		expect(restored.message).toContain("must be restarted");
+	});
+
+	it("round-trips stale transcript generation rejection", () => {
+		const error = new StaleTranscriptGenerationError();
+		const errorInfo = serializeDaemonError(error);
+		expect(errorInfo).toEqual({ code: "stale_transcript_generation" });
+		const restored = deserializeDaemonError({
+			type: "response",
+			command: "get_compaction_summary",
+			success: false,
+			error: error.message,
+			errorInfo,
+		});
+		expect(restored).toBeInstanceOf(StaleTranscriptGenerationError);
 	});
 });

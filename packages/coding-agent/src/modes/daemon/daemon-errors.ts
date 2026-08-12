@@ -2,6 +2,7 @@ import { SessionReloadBusyError } from "../../core/agent-session.js";
 import { MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
+import { StaleTranscriptGenerationError } from "../../core/session-manager.js";
 import type { DaemonErrorInfo, DaemonResponse } from "./daemon-protocol.js";
 
 export class AtomicResourceReloadRestartRequiredError extends Error {
@@ -33,6 +34,9 @@ export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefine
 			activeSessionId: error.activeSessionId,
 		};
 	}
+	if (error instanceof StaleTranscriptGenerationError) {
+		return { code: "stale_transcript_generation" };
+	}
 	return undefined;
 }
 
@@ -52,6 +56,9 @@ export function deserializeDaemonError(response: Extract<DaemonResponse, { succe
 	}
 	if (errorInfo?.code === "session_already_active") {
 		return new SessionAlreadyActiveError(errorInfo.sessionPath, errorInfo.activeSessionId);
+	}
+	if (errorInfo?.code === "stale_transcript_generation") {
+		return new StaleTranscriptGenerationError();
 	}
 	return new Error(response.error);
 }

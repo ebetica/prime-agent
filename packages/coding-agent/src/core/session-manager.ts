@@ -285,6 +285,31 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+/** One finalized message in the selected branch's bounded transcript view. */
+export interface SessionTranscriptRecord {
+	/** Stable ID of the session entry that produced this message. */
+	entryId: string;
+	/** Zero-based structural position in this generation's display order. */
+	ordinal: number;
+	message: AgentMessage;
+}
+
+/**
+ * Display-ordered projection of the model's current bounded context.
+ * Generation changes whenever selection/context reconstruction invalidates ordinals.
+ */
+export interface SessionTranscriptView {
+	generation: string;
+	records: SessionTranscriptRecord[];
+}
+
+export class StaleTranscriptGenerationError extends Error {
+	constructor() {
+		super("Transcript generation is stale");
+		this.name = "StaleTranscriptGenerationError";
+	}
+}
+
 export interface SessionInfo {
 	path: string;
 	id: string;
@@ -594,6 +619,79 @@ export function buildSessionContext(
 	}
 
 	return { messages, thinkingLevel, serviceTier, model };
+}
+
+/** Build the display-ordered, identity-preserving projection of the selected branch. */
+export function buildSessionTranscriptRecords(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionTranscriptRecord[] {
+	const index = byId ?? new Map(entries.map((entry) => [entry.id, entry]));
+	if (leafId === null) return [];
+	let current = leafId ? index.get(leafId) : entries[entries.length - 1];
+	if (!current) return [];
+
+	const path: SessionEntry[] = [];
+	while (current) {
+		path.push(current);
+		current = current.parentId ? index.get(current.parentId) : undefined;
+	}
+	path.reverse();
+
+	let compaction: CompactionEntry | undefined;
+	for (const entry of path) {
+		if (entry.type === "compaction") compaction = entry;
+	}
+
+	const records: Array<Omit<SessionTranscriptRecord, "ordinal">> = [];
+	const appendEntry = (entry: SessionEntry): void => {
+		if (entry.type === "message") {
+			records.push({ entryId: entry.id, message: entry.message });
+		} else if (entry.type === "custom_message") {
+			records.push({
+				entryId: entry.id,
+				message: createCustomMessage(
+					entry.customType,
+					entry.content,
+					entry.display,
+					entry.details,
+					entry.timestamp,
+				),
+			});
+		} else if (entry.type === "branch_summary" && entry.summary) {
+			records.push({
+				entryId: entry.id,
+				message: createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp),
+			});
+		}
+	};
+
+	if (compaction) {
+		const compactionIndex = path.findIndex((entry) => entry.id === compaction.id);
+		let foundFirstKept = false;
+		for (let index = 0; index < compactionIndex; index++) {
+			const entry = path[index];
+			if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+			if (foundFirstKept) appendEntry(entry);
+		}
+		const retainedMessageCount = records.length;
+		records.push({
+			entryId: compaction.id,
+			message: createCompactionSummaryMessage(
+				compaction.summary,
+				compaction.tokensBefore,
+				compaction.timestamp,
+				compaction.customInstructions,
+				retainedMessageCount,
+			),
+		});
+		for (let index = compactionIndex + 1; index < path.length; index++) appendEntry(path[index]);
+	} else {
+		for (const entry of path) appendEntry(entry);
+	}
+
+	return records.map((record, ordinal) => ({ ...record, ordinal }));
 }
 
 /**
@@ -1200,6 +1298,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private transcriptGeneration = randomUUID();
 	private persistListeners = new Set<SessionPersistListener>();
 
 	private constructor(
@@ -1313,6 +1412,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.transcriptGeneration = randomUUID();
 		this.flushed = false;
 
 		if (this.persist) {
@@ -1322,6 +1422,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.transcriptGeneration = randomUUID();
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1561,6 +1662,7 @@ export class SessionManager {
 			customInstructions,
 		};
 		this._appendEntry(entry);
+		this.transcriptGeneration = randomUUID();
 		return entry.id;
 	}
 
@@ -1917,6 +2019,20 @@ export class SessionManager {
 		return buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId);
 	}
 
+	getTranscriptView(): SessionTranscriptView {
+		return {
+			generation: this.transcriptGeneration,
+			records: buildSessionTranscriptRecords(this.fileEntries as SessionEntry[], this.leafId, this.byId),
+		};
+	}
+
+	getCompactionSummary(entryId: string, generation: string): SessionTranscriptRecord | undefined {
+		if (generation !== this.transcriptGeneration) throw new StaleTranscriptGenerationError();
+		return this.getTranscriptView().records.find(
+			(record) => record.entryId === entryId && record.message.role === "compactionSummary",
+		);
+	}
+
 	/**
 	 * Get session header.
 	 */
@@ -2001,6 +2117,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.transcriptGeneration = randomUUID();
 	}
 
 	/**
@@ -2010,6 +2127,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.leafId = null;
+		this.transcriptGeneration = randomUUID();
 	}
 
 	/**
@@ -2033,6 +2151,7 @@ export class SessionManager {
 			fromHook,
 		};
 		this._appendEntry(entry);
+		this.transcriptGeneration = randomUUID();
 		return entry.id;
 	}
 

@@ -84,6 +84,11 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getEntries: () => [],
 			getTree: () => [],
 			buildSessionContext,
+			getTranscriptView: () => ({
+				generation: `${id}-generation`,
+				records: messages.map((message, ordinal) => ({ entryId: `${id}-entry-${ordinal}`, ordinal, message })),
+			}),
+			getCompactionSummary: () => undefined,
 		},
 		buildSessionContext,
 		model: undefined,
@@ -142,6 +147,17 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it("returns the same transcript view shape as daemon connections", async () => {
+		const message = userMessage("hello", 1);
+		const connection = new InProcessAgentConnection(
+			asRuntime(new FakeRuntime(createFakeSession("session-a", [message]).session)),
+		);
+		await expect(connection.getTranscriptView()).resolves.toEqual({
+			generation: "session-a-generation",
+			records: [{ entryId: "session-a-entry-0", ordinal: 0, message }],
+		});
+	});
+
 	it.each([
 		{ accepted: true, promptResult: "pending", expectedError: undefined },
 		{ accepted: false, promptResult: "resolve", expectedError: "Prompt was not accepted by the session." },
