@@ -38,6 +38,7 @@ describe("RLM registry process lease", () => {
 		expect(existsSync(`${registry}.lease`)).toBe(true);
 		abort.abort();
 		await expect(contender).rejects.toBeDefined();
+		expect(readdirSync(join(registry, "..")).filter((name) => name.includes(".candidate."))).toEqual([]);
 		release();
 		await owner;
 		vi.useRealTimers();
