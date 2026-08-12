@@ -130,9 +130,9 @@ export async function withRegistryLease<T>(
 			options.signal?.throwIfAborted();
 			try {
 				linkSync(candidate, stable);
+				acquired = true;
 				unlinkSync(candidate);
 				fsyncDirectory(directory);
-				acquired = true;
 				break;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
