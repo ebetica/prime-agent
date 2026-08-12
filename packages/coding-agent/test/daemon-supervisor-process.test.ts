@@ -567,18 +567,27 @@ describe("daemon supervisor resident workers", () => {
 			error: "Session launch environment does not match its immutable descriptor",
 		});
 
-		const publicList = await client.request({ type: "list" });
+		const publicList = await client.request({ type: "list", all: true, sessionDir });
 		expect(publicList.success).toBe(true);
 		expect(requireSessionList(publicList.success ? publicList.data : undefined)).toEqual([]);
-		const internalList = await client.request({ type: "list", includeClientOwned: true });
+		const internalList = await client.request({ type: "list", all: true, sessionDir, includeClientOwned: true });
 		expect(internalList.success).toBe(true);
 		expect(requireSessionList(internalList.success ? internalList.data : undefined)).toHaveLength(1);
 		const otherClient = await connectEventually(socketPath);
-		const deniedList = await otherClient.request({ type: "list", includeClientOwned: true });
+		const deniedList = await otherClient.request({ type: "list", all: true, sessionDir, includeClientOwned: true });
 		expect(deniedList).toMatchObject({
 			success: true,
 			data: { sessions: [], busyClientOwnedSessionCount: 0 },
 		});
+		const deniedSavedList = await otherClient.request({
+			type: "list_saved_sessions",
+			cwd: projectDir,
+			sessionDir,
+			scope: "all",
+		});
+		expect(deniedSavedList).toMatchObject({ success: true, data: { sessions: [] } });
+		const deniedDelete = await otherClient.request({ type: "delete_saved_session", sessionPath: sessionFile });
+		expect(deniedDelete).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
 		const privateSelector = summary.sessionId.slice(-8);
 		const deniedAttach = await otherClient.request({ type: "attach", activeSessionId: privateSelector });
 		expect(deniedAttach).toMatchObject({
@@ -630,6 +639,20 @@ describe("daemon supervisor resident workers", () => {
 			"Client-owned worker descriptor was not removed",
 		);
 		expect((await readSessionInfo(sessionFile))?.state?.status).not.toBe("archived");
+		const otherClientAfterStop = await connectEventually(socketPath);
+		const deniedDeleteAfterStop = await otherClientAfterStop.request({
+			type: "delete_saved_session",
+			sessionPath: sessionFile,
+		});
+		expect(deniedDeleteAfterStop).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
+		const deniedReopenAfterStop = await otherClientAfterStop.request({
+			type: "create",
+			sessionPath: sessionFile,
+			lifecycle: "client_owned",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(deniedReopenAfterStop).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
+		otherClientAfterStop.close();
 
 		await client.request({ type: "shutdown" });
 		client.close();

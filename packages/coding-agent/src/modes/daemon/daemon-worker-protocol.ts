@@ -6,6 +6,7 @@ import type {
 } from "../../core/agent-messages.js";
 import type { AgentSessionResourceConfig } from "../../core/agent-session-config.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
+import type { SessionSummary } from "./daemon-session-list.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
@@ -139,6 +140,8 @@ export interface DaemonWorkerDescriptor {
 	archiveOnStop?: boolean;
 	lastFailureAt?: string;
 	lastError?: string;
+	/** Last authenticated worker summaries, retained across process loss until recovery publishes replacements. */
+	lastSessionSummaries?: SessionSummary[];
 }
 
 export function isDaemonWorkerProcess(environment: NodeJS.ProcessEnv = process.env): boolean {

@@ -2247,7 +2247,7 @@ export class AgentDaemon {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+						candidate.runtime.metadata.parentSessionId === parentState.runtime.session.sessionId &&
 						candidate.runtime.metadata.rlmChildId === childId &&
 						candidate.runtime.session === session,
 				);
@@ -2284,7 +2284,7 @@ export class AgentDaemon {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+						candidate.runtime.metadata.parentSessionId === parentState.runtime.session.sessionId &&
 						candidate.runtime.metadata.rlmChildId === options.id &&
 						candidate.runtime.session === runtime.session,
 				);
@@ -2299,7 +2299,7 @@ export class AgentDaemon {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+						candidate.runtime.metadata.parentSessionId === parentState.runtime.session.sessionId &&
 						candidate.runtime.metadata.rlmChildId === childId,
 				);
 				const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
@@ -4151,6 +4151,7 @@ export class AgentDaemon {
 					const childState = [...this.sessions.values()].find(
 						(candidate) =>
 							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.parentSessionId === state.runtime.session.sessionId &&
 							candidate.runtime.metadata.rlmChildId === command.childId,
 					);
 					return (

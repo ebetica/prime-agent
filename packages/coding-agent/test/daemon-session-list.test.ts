@@ -56,6 +56,31 @@ describe("buildSessionList", () => {
 		]);
 	});
 
+	it("reports truthful own, descendant, terminal, and durable inactive execution states", () => {
+		const errorMessage = [{ role: "assistant", content: [], stopReason: "error" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({ activeSessionId: "streaming", isStreaming: true }),
+				makeState({ activeSessionId: "descendant", hasRunningRlmChildren: true }),
+				makeState({ activeSessionId: "error", messages: errorMessage }),
+			],
+			[
+				makeSessionInfo({
+					path: "/tmp/completed.jsonl",
+					id: "completed",
+					agentStatus: { summary: "Done", taskState: "completed", basedOnMessageCount: 2 },
+				}),
+			],
+		);
+
+		expect(entries.map((entry) => [entry.id, entry.executionStatus, entry.executionReason])).toEqual([
+			["completed", "completed", "completed"],
+			["streaming", "running", "streaming"],
+			["descendant", "active-descendant", "active-descendant"],
+			["error", "provider-error", "provider-error"],
+		]);
+	});
+
 	it("uses the stable session header time for active rows without a saved catalog entry", () => {
 		const state = makeState({ activeSessionId: "active", sessionFile: "/tmp/active.jsonl" });
 		const first = summaryForActiveSession(state);
@@ -446,12 +471,24 @@ describe("buildSessionList", () => {
 			[makeState({ activeSessionId: "live", sessionFile: livePath, rlmDepth: 2 })],
 			[
 				makeSessionInfo({ path: livePath, id: "live", rlmDepth: 99 }),
-				makeSessionInfo({ path: savedPath, id: "saved", rlmDepth: 3 }),
+				makeSessionInfo({
+					path: savedPath,
+					id: "saved",
+					rlmDepth: 3,
+					parentSessionId: "parent-session",
+					rlmChildId: "sub-child",
+					rlmParentNodeId: "sub-parent",
+				}),
 			],
 		);
 
 		expect(entries.find((entry) => entry.activeSessionId === "live")?.rlmDepth).toBe(2);
-		expect(entries.find((entry) => entry.sessionFile === savedPath)?.rlmDepth).toBe(3);
+		expect(entries.find((entry) => entry.sessionFile === savedPath)).toMatchObject({
+			rlmDepth: 3,
+			parentSessionId: "parent-session",
+			rlmChildId: "sub-child",
+			rlmParentNodeId: "sub-parent",
+		});
 	});
 });
 
@@ -773,6 +810,9 @@ function makeSessionInfo(overrides: Pick<SessionInfo, "path" | "id"> & Partial<S
 		name: overrides.name,
 		state: overrides.state,
 		parentSessionPath: overrides.parentSessionPath,
+		parentSessionId: overrides.parentSessionId,
+		rlmChildId: overrides.rlmChildId,
+		rlmParentNodeId: overrides.rlmParentNodeId,
 		rlmDepth: overrides.rlmDepth ?? 0,
 		created: new Date("2026-05-01T00:00:00.000Z"),
 		modified: new Date("2026-05-02T00:00:00.000Z"),
@@ -780,6 +820,7 @@ function makeSessionInfo(overrides: Pick<SessionInfo, "path" | "id"> & Partial<S
 		firstMessage: "hello",
 		allMessagesText: "hello world",
 		agentStatus: overrides.agentStatus,
+		lastAssistantStopReason: overrides.lastAssistantStopReason,
 	};
 }
 

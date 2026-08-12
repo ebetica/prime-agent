@@ -172,6 +172,7 @@ const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
+const OWNED_SESSION_CLAIMS_FILE_NAME = "owned-session-claims.json";
 const WORKER_STARTUP_GATE_FD = 3;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
@@ -483,6 +484,8 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 			(typeof descriptor.pendingResourceReload === "object" &&
 				typeof descriptor.pendingResourceReload.transactionId === "string" &&
 				isAgentSessionResourceConfig(descriptor.pendingResourceReload.resources))) &&
+		(descriptor.lastSessionSummaries === undefined ||
+			(Array.isArray(descriptor.lastSessionSummaries) && descriptor.lastSessionSummaries.every(isSessionSummary))) &&
 		descriptor.createCommand !== undefined &&
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
@@ -669,6 +672,8 @@ export class DaemonSupervisor {
 	private readonly compactCatchupInProgress = new Set<string>();
 	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
 	private readonly pendingSessionNames = new Set<string>();
+	/** Durable path ownership retained after disposable client-owned workers stop. */
+	private readonly ownedSessionClaims = new Map<string, string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
@@ -719,6 +724,7 @@ export class DaemonSupervisor {
 			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
 			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
+			this.loadOwnedSessionClaims();
 			this.loadWorkerDescriptors();
 			const workersToAdopt = [...this.workers.values()];
 
@@ -1070,7 +1076,9 @@ export class DaemonSupervisor {
 				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
-					summaries: new Map(),
+					summaries: new Map(
+						(descriptor.lastSessionSummaries ?? []).map((summary) => [summary.activeSessionId ?? summary.id, summary]),
+					),
 					snapshotCache: new Map(),
 					transcriptCaches: new Map(),
 					snapshotGenerations: new Map(),
@@ -2095,6 +2103,7 @@ export class DaemonSupervisor {
 				return this.forwardToWorker(match.worker, command);
 			}
 			case "rename_saved_session": {
+				this.assertSavedSessionAccessibleToClient(client, command.sessionPath);
 				const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());
 				return await this.withSessionNameReservation(target, async () => {
 					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
@@ -2111,6 +2120,7 @@ export class DaemonSupervisor {
 			}
 			case "delete_saved_session":
 				if (!command.activeSessionId) {
+					this.assertSavedSessionAccessibleToClient(client, command.sessionPath);
 					const active = this.findWorkerBySessionFile(command.sessionPath);
 					if (active) {
 						throw new Error("Cannot delete the currently active session");
@@ -2265,13 +2275,14 @@ export class DaemonSupervisor {
 		);
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
-		const active = [...this.workers.values()]
-			.filter(
-				(worker) =>
-					this.isVisibleWorker(worker) ||
-					(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
-			)
-			.flatMap((worker) => [...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)));
+		const listedWorkers = [...this.workers.values()].filter(
+			(worker) =>
+				this.isVisibleWorker(worker) ||
+				(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
+		);
+		const active = listedWorkers.flatMap((worker) =>
+			[...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)),
+		);
 		const busyClientOwnedSessionCount = clientOwnedWorkers
 			.flatMap((worker) => [...worker.summaries.values()])
 			.filter(isSessionSummaryBusy).length;
@@ -2283,7 +2294,18 @@ export class DaemonSupervisor {
 			return success(command.id, "list", data);
 		}
 		const sessionDir = command.sessionDir ?? this.defaultSessionConfig.sessionDir;
-		const saved = await this.catalog.list(command.cwd ? resolve(command.cwd) : undefined, sessionDir);
+		const hiddenSessionFiles = new Set(
+			[...this.workers.values()]
+				.filter((worker) => !listedWorkers.includes(worker))
+				.flatMap((worker) =>
+					[...worker.summaries.values()].flatMap((summary) =>
+						summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [],
+					),
+				),
+		);
+		const saved = (await this.catalog.list(command.cwd ? resolve(command.cwd) : undefined, sessionDir)).filter(
+			(session) => !hiddenSessionFiles.has(canonicalSessionPath(session.path)),
+		);
 		return success(command.id, "list", { ...data, sessions: mergeSessionLists(active, saved) });
 	}
 
@@ -2303,6 +2325,7 @@ export class DaemonSupervisor {
 			cwd = resolve(command.cwd);
 			sessionDir = command.sessionDir;
 		}
+		const isVisible = (session: SessionInfo): boolean => this.isSavedSessionAccessibleToClient(client, session.path);
 		const callbacks = command.id
 			? {
 					onProgress: (loaded: number, total: number) =>
@@ -2314,21 +2337,31 @@ export class DaemonSupervisor {
 							loaded,
 							total,
 						}),
-					onSession: (session: SessionInfo) =>
+					onSession: (session: SessionInfo) => {
+						if (!isVisible(session)) return;
 						this.write(client, {
 							id: command.id,
 							type: "session_list_item",
 							command: "list_saved_sessions",
 							...(activeSessionId ? { activeSessionId } : {}),
 							session: serializeSavedSessionInfo(session),
-						}),
+						});
+					},
 				}
 			: undefined;
 		const saved = await this.catalog.list(command.scope === "current" ? cwd : undefined, sessionDir, callbacks);
-		return success(command.id, "list_saved_sessions", { sessions: saved.map(serializeSavedSessionInfo) });
+		return success(command.id, "list_saved_sessions", {
+			sessions: saved.filter(isVisible).map(serializeSavedSessionInfo),
+		});
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		if (command.sessionPath) {
+			const claimedOwner = this.ownedSessionClaims.get(canonicalSessionPath(command.sessionPath));
+			if (claimedOwner !== undefined && claimedOwner !== clientId) {
+				throw new Error(`Session not found: ${command.sessionPath}`);
+			}
+		}
 		let createCommand = command;
 		if (command.name !== undefined) {
 			const normalizedName = command.name.trim();
@@ -2429,6 +2462,7 @@ export class DaemonSupervisor {
 			throw error;
 		}
 		worker.promotedOwnerClientId = clientId;
+		if (worker.descriptor.sessionFile) this.deleteOwnedSessionClaim(worker.descriptor.sessionFile);
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
@@ -2554,6 +2588,7 @@ export class DaemonSupervisor {
 				lifecycle: "starting",
 				createCommand: { ...createCommand, id: undefined },
 				consecutiveFailures: existing?.descriptor.consecutiveFailures ?? 0,
+				lastSessionSummaries: existing?.descriptor.lastSessionSummaries,
 			};
 			worker = existing ?? {
 				descriptor,
@@ -2572,6 +2607,7 @@ export class DaemonSupervisor {
 			worker.launchEnv = launchEnv;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
+			if (ownerClientId && createCommand.sessionPath) this.setOwnedSessionClaim(createCommand.sessionPath, ownerClientId);
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
 		} catch (error) {
@@ -3324,6 +3360,7 @@ export class DaemonSupervisor {
 		const response = await worker.client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		worker.descriptor.lastSessionSummaries = summaries.map(({ streamingMessage: _streaming, diagnostics: _diagnostics, ...summary }) => summary);
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
@@ -3543,8 +3580,17 @@ export class DaemonSupervisor {
 
 	private publicSummary(worker: ResidentWorker, summary: SessionSummary): SessionSummary {
 		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const workerGeneration = createHash("sha256")
+			.update(`${worker.descriptor.workerId}:${worker.descriptor.processStartId ?? worker.descriptor.pid}`)
+			.digest("hex")
+			.slice(0, 16);
+		const interrupted = worker.descriptor.lifecycle !== "ready";
 		return {
 			...summary,
+			...(interrupted
+				? { executionStatus: "worker-interrupted" as const, executionReason: "worker-interrupted" as const }
+				: {}),
+			workerGeneration,
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
 			workerState: worker.descriptor.lifecycle,
@@ -3574,6 +3620,50 @@ export class DaemonSupervisor {
 
 	private findWorkerForClient(client: DaemonSocketClient, selector: string): Promise<WorkerMatch> {
 		return this.findWorker(selector, (worker) => this.isWorkerAccessibleToClient(client, worker));
+	}
+
+	private ownedSessionClaimsPath(): string {
+		return join(this.descriptorDir, OWNED_SESSION_CLAIMS_FILE_NAME);
+	}
+
+	private loadOwnedSessionClaims(): void {
+		try {
+			const value: unknown = JSON.parse(readFileSync(this.ownedSessionClaimsPath(), "utf8"));
+			if (!value || typeof value !== "object" || Array.isArray(value)) return;
+			for (const [path, owner] of Object.entries(value)) {
+				if (typeof owner === "string") this.ownedSessionClaims.set(canonicalSessionPath(path), owner);
+			}
+		} catch {
+			// No claims is the normal first-start case; malformed data fails closed only for known descriptors below.
+		}
+	}
+
+	private persistOwnedSessionClaims(): void {
+		const path = this.ownedSessionClaimsPath();
+		const temp = `${path}.${process.pid}.tmp`;
+		writeFileSync(temp, `${JSON.stringify(Object.fromEntries(this.ownedSessionClaims))}\n`, { mode: 0o600 });
+		renameSync(temp, path);
+	}
+
+	private setOwnedSessionClaim(sessionPath: string, ownerClientId: string): void {
+		this.ownedSessionClaims.set(canonicalSessionPath(sessionPath), ownerClientId);
+		this.persistOwnedSessionClaims();
+	}
+
+	private deleteOwnedSessionClaim(sessionPath: string): void {
+		if (!this.ownedSessionClaims.delete(canonicalSessionPath(sessionPath))) return;
+		this.persistOwnedSessionClaims();
+	}
+
+	private isSavedSessionAccessibleToClient(client: DaemonSocketClient, sessionPath: string): boolean {
+		const owner = this.ownedSessionClaims.get(canonicalSessionPath(sessionPath));
+		return owner === undefined || owner === this.protocolClientId(client);
+	}
+
+	private assertSavedSessionAccessibleToClient(client: DaemonSocketClient, sessionPath: string): void {
+		if (!this.isSavedSessionAccessibleToClient(client, sessionPath)) {
+			throw new Error(`Session not found: ${sessionPath}`);
+		}
 	}
 
 	private isWorkerAccessibleToClient(client: DaemonSocketClient, worker: ResidentWorker): boolean {

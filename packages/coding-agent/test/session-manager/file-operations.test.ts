@@ -200,17 +200,50 @@ describe("session tree metadata", () => {
 			if (!parentFile) throw new Error("Missing parent session file");
 
 			const child = SessionManager.create(tempDir, tempDir);
-			child.newSession({ parentSession: parentFile });
+			child.newSession({
+				parentSession: parentFile,
+				parentSessionId: parent.getSessionId(),
+				rlmChildId: "sub-child",
+				rlmParentNodeId: "sub-parent",
+			});
 			child.flushNow();
 			const childFile = child.getSessionFile();
 			if (!childFile) throw new Error("Missing child session file");
 
 			const header = JSON.parse(readFileSync(childFile, "utf8").split("\n")[0] ?? "{}");
-			expect(header).toMatchObject({ parentSession: parentFile, rlmDepth: 3 });
-			expect(await readSessionInfo(childFile)).toMatchObject({
-				parentSessionPath: parentFile,
+			expect(header).toMatchObject({
+				parentSession: parentFile,
+				parentSessionId: parent.getSessionId(),
+				rlmChildId: "sub-child",
+				rlmParentNodeId: "sub-parent",
 				rlmDepth: 3,
 			});
+			expect(await readSessionInfo(childFile)).toMatchObject({
+				parentSessionPath: parentFile,
+				parentSessionId: parent.getSessionId(),
+				rlmChildId: "sub-child",
+				rlmParentNodeId: "sub-parent",
+				rlmDepth: 3,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects forged durable parent and child identities", () => {
+		const tempDir = join(tmpdir(), `session-parent-auth-test-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const parent = SessionManager.create(tempDir, tempDir);
+			parent.newSession();
+			parent.flushNow();
+			const parentFile = parent.getSessionFile();
+			if (!parentFile) throw new Error("Missing parent session file");
+
+			const child = SessionManager.create(tempDir, tempDir);
+			expect(() =>
+				child.newSession({ parentSession: parentFile, parentSessionId: "forged", rlmChildId: "sub-child" }),
+			).toThrow("Parent session identity does not match");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

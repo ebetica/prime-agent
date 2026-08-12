@@ -20,6 +20,22 @@ export type SessionLifecycle = "draft" | "live" | "archived";
 // "working" so the view never sees an unlabeled idle session.
 export type SessionActivity = "working" | "idle";
 export type SessionRosterStatus = "running" | "idle" | "inactive";
+export type SessionExecutionStatus =
+	| "running"
+	| "idle"
+	| "completed"
+	| "provider-error"
+	| "worker-interrupted"
+	| "active-descendant";
+export type SessionExecutionReason =
+	| "streaming"
+	| "tool"
+	| "waiting"
+	| "needs-input"
+	| "completed"
+	| "provider-error"
+	| "worker-interrupted"
+	| "active-descendant";
 
 // Upper bound on the spawn-code source carried in a session summary. Generous
 // enough for real spawn cells while keeping the daemon wire payload bounded.
@@ -79,6 +95,11 @@ export interface SessionSummary {
 	taskState?: AgentTaskState;
 	/** Resident session-host process state, populated by the global supervisor. */
 	workerState?: "starting" | "ready" | "recovering" | "failed";
+	/** Truthful execution state for the last reported worker generation. */
+	executionStatus?: SessionExecutionStatus;
+	executionReason?: SessionExecutionReason;
+	/** Opaque worker process generation that produced executionStatus. */
+	workerGeneration?: string;
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
 	workerPid?: number;
 }
@@ -232,6 +253,7 @@ export function summaryForActiveSession(
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
+		...executionForActiveSession(activeSession),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
@@ -268,6 +290,44 @@ export function summaryForActiveSession(
 		summary: activeSession.summaryState?.summary,
 		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
+}
+
+function executionForActiveSession(
+	activeSession: ActiveSessionState,
+): Pick<SessionSummary, "executionStatus" | "executionReason"> {
+	const session = activeSession.runtime.session;
+	if (session.isStreaming || session.isBashRunning || session.unfinishedActionCount > 0) {
+		return {
+			executionStatus: "running",
+			executionReason:
+				session.isBashRunning || session.state.pendingToolCalls.size > 0 || session.unfinishedActionCount > 0
+					? "tool"
+					: "streaming",
+		};
+	}
+	if (session.hasRunningRlmChildren()) {
+		return { executionStatus: "active-descendant", executionReason: "active-descendant" };
+	}
+	const last = session.messages.at(-1);
+	if (last?.role === "assistant" && last.stopReason === "error") {
+		return { executionStatus: "provider-error", executionReason: "provider-error" };
+	}
+	const taskState = isSummaryCurrent(activeSession) ? activeSession.summaryState?.taskState : undefined;
+	if (taskState === "completed") return { executionStatus: "completed", executionReason: "completed" };
+	if (taskState === "needs_input") return { executionStatus: "idle", executionReason: "needs-input" };
+	return { executionStatus: "idle", executionReason: "waiting" };
+}
+
+function executionForInactiveSession(
+	session: SessionInfo,
+): Pick<SessionSummary, "executionStatus" | "executionReason"> {
+	if (session.lastAssistantStopReason === "error") {
+		return { executionStatus: "provider-error", executionReason: "provider-error" };
+	}
+	const taskState = session.agentStatus?.basedOnMessageCount === session.messageCount ? session.agentStatus.taskState : undefined;
+	if (taskState === "completed") return { executionStatus: "completed", executionReason: "completed" };
+	if (taskState === "needs_input") return { executionStatus: "idle", executionReason: "needs-input" };
+	return { executionStatus: "idle", executionReason: "waiting" };
 }
 
 function latestMessageActivityAt(messages: readonly AgentMessage[]): string | undefined {
@@ -313,11 +373,15 @@ export function summaryForInactiveSession(
 		messageCount: session.messageCount,
 		unfinishedActionCount: 0,
 		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		...executionForInactiveSession(session),
 		created: session.created.toISOString(),
 		modified: session.modified.toISOString(),
 		lastActivityAt: session.modified.toISOString(),
 		firstMessage: session.firstMessage,
+		parentSessionId: session.parentSessionId,
 		parentSessionPath: session.parentSessionPath,
+		rlmChildId: session.rlmChildId,
+		rlmParentNodeId: session.rlmParentNodeId,
 		rlmDepth: session.rlmDepth,
 		// Carry the persisted recap/verdict so an off-daemon session keeps its
 		// agents-view bucket (e.g. Completed) instead of defaulting to Needs Input.

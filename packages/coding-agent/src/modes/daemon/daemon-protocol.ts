@@ -988,6 +988,9 @@ export interface DaemonSavedSessionInfo {
 	name?: string;
 	state?: AgentConnectionSavedSessionState;
 	parentSessionPath?: string;
+	parentSessionId?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 	rlmDepth?: number;
 	created: string;
 	modified: string;

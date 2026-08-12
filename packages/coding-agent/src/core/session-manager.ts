@@ -79,6 +79,12 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/** Stable parent identity read from parentSession when this header was created. */
+	parentSessionId?: string;
+	/** Stable RLM registry identity for this child lifecycle. */
+	rlmChildId?: string;
+	/** Stable registry identity of the parent node for nested RLM children. */
+	rlmParentNodeId?: string;
 	/** RLM spawn depth. Optional for backward compatibility. Forks preserve the source depth. */
 	rlmDepth?: number;
 	git?: GitContext;
@@ -87,6 +93,10 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	/** Expected parent id; authenticated against the parent session header before persistence. */
+	parentSessionId?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 	/** Explicit RLM spawn depth. An explicitly undefined value suppresses parent derivation. */
 	rlmDepth?: number;
 }
@@ -296,6 +306,11 @@ export interface SessionInfo {
 	state?: SessionState;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
+	/** Stable parent identity authenticated from the parent header at creation. */
+	parentSessionId?: string;
+	/** Stable RLM child lifecycle identity. */
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 	/** Resolved RLM spawn depth. */
 	rlmDepth: number;
 	created: Date;
@@ -305,6 +320,8 @@ export interface SessionInfo {
 	allMessagesText: string;
 	/** Latest persisted recap/verdict, so off-daemon sessions keep their status. */
 	agentStatus?: AgentStatus;
+	/** Stop reason of the latest assistant message, for durable provider-error projection. */
+	lastAssistantStopReason?: string;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -1027,6 +1044,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let name: string | undefined;
 		let state: SessionState | undefined;
 		let agentStatus: AgentStatus | undefined;
+		let lastAssistantStopReason: string | undefined;
 		let lastActivityTime: number | undefined;
 
 		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
@@ -1090,6 +1108,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			messageCount++;
 
 			const message = (entry as SessionMessageEntry).message;
+			if (message.role === "assistant") lastAssistantStopReason = message.stopReason;
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
 
@@ -1115,6 +1134,9 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			name,
 			state,
 			parentSessionPath,
+			parentSessionId: typeof header.parentSessionId === "string" ? header.parentSessionId : undefined,
+			rlmChildId: typeof header.rlmChildId === "string" ? header.rlmChildId : undefined,
+			rlmParentNodeId: typeof header.rlmParentNodeId === "string" ? header.rlmParentNodeId : undefined,
 			rlmDepth,
 			created: new Date(header.timestamp),
 			modified,
@@ -1122,6 +1144,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText,
 			agentStatus,
+			lastAssistantStopReason,
 		};
 	} catch {
 		return null;
@@ -1270,12 +1293,21 @@ export class SessionManager {
 		let sessionFile: string | undefined;
 		const hasExplicitRlmDepth = options !== undefined && Object.hasOwn(options, "rlmDepth");
 		let parentHeader: Partial<SessionHeader> | undefined;
-		if (options?.parentSession && !hasExplicitRlmDepth) {
+		if (options?.parentSession) {
 			try {
 				parentHeader = readSessionHeader(options.parentSession);
 			} catch {
-				// Legacy-invalid or unavailable parents leave the child depth unknown.
+				// Legacy-invalid or unavailable parents leave ancestry unknown unless
+				// the caller requires an authenticated parent identity.
 			}
+		}
+		const authenticatedParentSessionId =
+			typeof parentHeader?.id === "string" && parentHeader.id.length > 0 ? parentHeader.id : undefined;
+		if (options?.parentSessionId !== undefined && authenticatedParentSessionId !== options.parentSessionId) {
+			throw new Error(`Parent session identity does not match ${options.parentSession ?? "the requested parent"}`);
+		}
+		if ((options?.rlmChildId || options?.rlmParentNodeId) && !authenticatedParentSessionId) {
+			throw new Error("RLM child identity requires an authenticated parent session");
 		}
 		if (this.persist) {
 			if (options?.id) {
@@ -1305,6 +1337,9 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			parentSessionId: authenticatedParentSessionId,
+			rlmChildId: options?.rlmChildId,
+			rlmParentNodeId: options?.rlmParentNodeId,
 			rlmDepth,
 			git,
 		};

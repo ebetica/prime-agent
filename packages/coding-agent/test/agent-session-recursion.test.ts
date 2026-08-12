@@ -413,7 +413,7 @@ describe("AgentSession rlm recursion", () => {
 		const root = createSession({ depth: 2, maxDepth: 4 });
 		const result = await root.runRlmChild("persist my tree position");
 		if (!result.session_dir) throw new Error("Missing child session directory");
-		const child = root.getRlmChildSession(basename(result.session_dir));
+		const child = root.getRlmChildSession(result.rlm_child_id);
 		if (!child?.sessionFile || !root.sessionFile) throw new Error("Missing persisted session paths");
 
 		const header = JSON.parse(readFileSync(child.sessionFile, "utf8").split("\n")[0] ?? "{}");
@@ -427,7 +427,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!result.session_dir) {
 			throw new Error("Missing child session directory");
 		}
-		const childId = basename(result.session_dir);
+		const childId = result.rlm_child_id;
 		const childSession = root.getRlmChildSession(childId);
 		if (!childSession) {
 			throw new Error("Missing retained child session");
@@ -690,7 +690,7 @@ describe("AgentSession rlm recursion", () => {
 
 		const result = await root.runRlmChild("summarize shard 1");
 
-		expect(result.rlm_child_id).toBe(basename(result.session_dir));
+		expect(result.rlm_child_id).toMatch(/^sub-[0-9a-f-]{36}$/);
 		expect(result.session_dir).not.toBeNull();
 		expect(basename(result.session_dir!)).toMatch(/^sub-/);
 		expect(dirname(result.session_dir!)).toBe(root.sessionManager.getSessionArtifactDir());
@@ -1470,7 +1470,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!result.session_dir) {
 			throw new Error("Missing child session directory");
 		}
-		daemonChildId = basename(result.session_dir);
+		daemonChildId = result.rlm_child_id;
 		await waitFor(() => root.getRlmChildSession(daemonChildId)?.getLastAssistantText() !== undefined);
 
 		expect(root.getRlmChildSession(daemonChildId)?.getLastAssistantText()).toBe("child answer: retained worker");
@@ -1522,7 +1522,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
-	it("lists passive daemon children using their nonresident registry outcomes", async () => {
+	it("lists and deletes passive daemon children after parent active-id churn", async () => {
 		const deleteRlmSubagentRuntime = vi.fn(async () => {});
 		const root = createSession({
 			agentMessageController: {
@@ -1541,7 +1541,8 @@ describe("AgentSession rlm recursion", () => {
 						cwd: tempDir,
 						isStreaming: false,
 						unfinishedActionCount: 0,
-						parentActiveSessionId: "parent-active",
+						parentActiveSessionId: "stale-parent-active",
+						parentSessionId: "parent-session",
 						rlmChildId: `${name}-child`,
 						rlmChildRegistryStatus: registryStatus,
 						sessionDir: join(tempDir, `${name}-child`),
@@ -1655,7 +1656,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!result.session_dir) {
 			throw new Error("Missing child session directory");
 		}
-		const childId = basename(result.session_dir);
+		const childId = result.rlm_child_id;
 		const child = root.getRlmChildSession(childId);
 		if (!child) {
 			throw new Error("Missing retained child session");
@@ -2809,7 +2810,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!nestedResult.session_dir) {
 			throw new Error("Missing nested child session directory");
 		}
-		const nestedId = basename(nestedResult.session_dir);
+		const nestedId = nestedResult.rlm_child_id;
 		const nestedSession = parentSession.getRlmChildSession(nestedId);
 		if (!nestedSession) {
 			throw new Error("Missing retained nested child session");
