@@ -142,6 +142,7 @@ export function mutateRlmSubagentRegistry<T>(
 		result: T;
 		entry?: PersistedRlmSubagentRegistryEntry;
 		deleteChildId?: string;
+		afterWrite?: () => void;
 	},
 ): T {
 	return withRegistryLock(path, () => {
@@ -151,6 +152,7 @@ export function mutateRlmSubagentRegistry<T>(
 		if (change.entry) latest.set(change.entry.childId, change.entry);
 		if (change.deleteChildId) latest.delete(change.deleteChildId);
 		if (loaded.compact || change.entry || change.deleteChildId) writeCompact(path, [...latest.values()]);
+		change.afterWrite?.();
 		return change.result;
 	});
 }

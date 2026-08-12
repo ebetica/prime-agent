@@ -2,11 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import {
-	mutateRlmSubagentRegistry,
-	type PersistedRlmSubagentRegistryEntry,
-	readRlmSubagentRegistry,
-} from "../../core/rlm-subagent-registry.js";
+import { mutateRlmSubagentRegistry, readRlmSubagentRegistry } from "../../core/rlm-subagent-registry.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
@@ -82,42 +78,40 @@ export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
 		parent.getSessionId(),
 		"rlm-subagents.jsonl",
 	);
-	let entry: PersistedRlmSubagentRegistryEntry | undefined;
-	let transitioned = false;
-	mutateRlmSubagentRegistry(registryPath, (latest) => {
-		entry = [...latest.values()].find(
+	return mutateRlmSubagentRegistry(registryPath, (latest) => {
+		const entry = [...latest.values()].find(
 			(candidate) =>
 				(candidate.status === "running" || candidate.status === "interrupted") &&
 				candidate.sessionFile === sessionPath,
 		);
-		if (!entry || typeof entry.childId !== "string") return { result: undefined };
-		transitioned = entry.status === "running";
-		return transitioned
-			? { result: undefined, entry: { ...entry, status: "interrupted", updatedAt: new Date().toISOString() } }
-			: { result: undefined };
+		if (!entry) return { result: false };
+		const transitioned = entry.status === "running";
+		const reconciledEntry = transitioned
+			? { ...entry, status: "interrupted" as const, updatedAt: new Date().toISOString() }
+			: entry;
+		return {
+			result: transitioned,
+			...(transitioned ? { entry: reconciledEntry } : {}),
+			afterWrite: () => {
+				const alreadyNotified = parent
+					.getEntries()
+					.some(
+						(candidate) =>
+							candidate.type === "custom_message" &&
+							candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
+							(candidate.details as { childId?: unknown } | undefined)?.childId === reconciledEntry.childId,
+					);
+				if (alreadyNotified) return;
+				const sessionName = reconciledEntry.sessionName;
+				parent.appendCustomMessageEntryWithRollback(
+					RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
+					`RLM child ${sessionName} (${reconciledEntry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
+					true,
+					{ childId: reconciledEntry.childId, sessionName, reason: "worker_interrupted", replayed: false },
+				);
+			},
+		};
 	});
-	if (!entry || typeof entry.childId !== "string") return false;
-	const reconciledEntry = entry;
-
-	const alreadyNotified = parent
-		.getEntries()
-		.some(
-			(candidate) =>
-				candidate.type === "custom_message" &&
-				candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
-				(candidate.details as { childId?: unknown } | undefined)?.childId === reconciledEntry.childId,
-		);
-	if (!alreadyNotified) {
-		const sessionName =
-			typeof reconciledEntry.sessionName === "string" ? reconciledEntry.sessionName : reconciledEntry.childId;
-		parent.appendCustomMessageEntryWithRollback(
-			RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
-			`RLM child ${sessionName} (${reconciledEntry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
-			true,
-			{ childId: reconciledEntry.childId, sessionName, reason: "worker_interrupted", replayed: false },
-		);
-	}
-	return transitioned;
 }
 
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
