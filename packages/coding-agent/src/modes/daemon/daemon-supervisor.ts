@@ -274,6 +274,7 @@ interface ResidentWorker {
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
+	pendingRecovery?: NonNullable<DaemonCreateCommand["workerRecovery"]>;
 }
 
 interface SnapshotDuplicateValidation {
@@ -2150,6 +2151,7 @@ export class DaemonSupervisor {
 			ownerClientId || existing?.descriptor.ownerClientId ? (command.launchEnv ?? existing?.launchEnv) : undefined;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
+			...(existing?.pendingRecovery ? { workerRecovery: existing.pendingRecovery } : {}),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
 		};
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
@@ -2302,6 +2304,18 @@ export class DaemonSupervisor {
 				throw new Error(`Session worker ${workerId} recovery was cancelled`);
 			}
 			await this.assertRecoveryAllowed();
+			if (worker.pendingRecovery) {
+				const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
+				for (const record of journal.getLatest())
+					journal.record({
+						activeSessionId: record.activeSessionId,
+						sessionId: record.sessionId,
+						...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
+						busy: false,
+						operation: "recovery_hold",
+					});
+				worker.pendingRecovery = undefined;
+			}
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.descriptor.lastError = undefined;
@@ -2889,25 +2903,18 @@ export class DaemonSupervisor {
 
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
-		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
-		}
+		if (killWorkerProcess) signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) {
-						continue;
-					}
-					const { pid } = orphan;
+					if (!isOrphanProcessIdentityCurrent(orphan)) continue;
 					try {
-						process.kill(-pid, "SIGKILL");
+						process.kill(-orphan.pid, "SIGKILL");
 					} catch {
 						try {
-							process.kill(pid, "SIGKILL");
-						} catch {
-							// The detached resource may already have exited.
-						}
+							process.kill(orphan.pid, "SIGKILL");
+						} catch {}
 					}
 				}
 				clearOrphanProcessJournal(orphanProcessJournalPath);
@@ -2918,53 +2925,44 @@ export class DaemonSupervisor {
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);
-		if (uncertain.length === 0) {
-			return;
-		}
-		const interruptedSessions = new Map<
-			string,
-			{ activeSessionId: string; sessionFile: string; operations: Set<string> }
-		>();
+		if (uncertain.length === 0) return;
+		const interrupted = new Map<string, { activeSessionId: string; sessionFile: string; operations: Set<string> }>();
 		for (const record of uncertain) {
 			const sessionFile =
 				record.sessionFile ??
 				(record.activeSessionId === worker.descriptor.rootActiveSessionId
 					? worker.descriptor.sessionFile
 					: undefined);
-			if (!sessionFile) {
-				continue;
-			}
+			if (!sessionFile) continue;
 			const key = `${record.activeSessionId}\0${sessionFile}`;
-			let interrupted = interruptedSessions.get(key);
-			if (!interrupted) {
-				interrupted = { activeSessionId: record.activeSessionId, sessionFile, operations: new Set() };
-				interruptedSessions.set(key, interrupted);
-			}
-			interrupted.operations.add(record.operation);
-		}
-		await this.assertRecoveryAllowed();
-		await Promise.all(
-			[...interruptedSessions.values()].map((interrupted) =>
-				this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
-					...interrupted.operations,
-				]),
-			),
-		);
-		await this.assertRecoveryAllowed();
-		for (const record of latest) {
-			journal.record({
+			const current = interrupted.get(key) ?? {
 				activeSessionId: record.activeSessionId,
-				sessionId: record.sessionId,
-				...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
-				busy: false,
-				operation: "recovery_hold",
-			});
+				sessionFile,
+				operations: new Set<string>(),
+			};
+			current.operations.add(record.operation);
+			interrupted.set(key, current);
 		}
-		this.log(
-			`Recovered worker ${worker.descriptor.workerId} without replaying uncertain operations: ${uncertain
-				.map((record) => record.operation)
-				.join(", ")}`,
-		);
+		const generation = createHash("sha256")
+			.update(worker.descriptor.workerId)
+			.update("\0")
+			.update(
+				JSON.stringify(
+					uncertain
+						.map((record) => [record.activeSessionId, record.sessionId, record.sessionFile, record.operation])
+						.sort(),
+				),
+			)
+			.digest("hex");
+		worker.pendingRecovery = {
+			version: 1,
+			generation,
+			interrupted: [...interrupted.values()].slice(0, 256).map((value) => ({
+				activeSessionId: value.activeSessionId,
+				sessionFile: value.sessionFile,
+				operations: [...value.operations].slice(0, 32),
+			})),
+		};
 	}
 
 	private refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {

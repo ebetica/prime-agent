@@ -129,6 +129,7 @@ import {
 	resolveActiveSessionState,
 } from "./active-session-state.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
+import { reconcileInterruptedRlmChild } from "./daemon-catalog-process.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
@@ -1220,6 +1221,48 @@ export class AgentDaemon {
 		if (this.cronStore.registerSessionArtifact(session.sessionId, artifactDir)) {
 			this.cronStore.recoverSessionArtifact(session.sessionId);
 			this.cronScheduler.wake();
+		}
+	}
+
+	private async applyWorkerRecovery(
+		command: Extract<DaemonCommand, { type: "create" }>,
+		root: ActiveSessionState,
+	): Promise<void> {
+		const recovery = command.workerRecovery;
+		if (!recovery) return;
+		if (recovery.version !== 1 || recovery.interrupted.length > 256)
+			throw new Error("Unsupported or oversized worker recovery payload");
+		const rootFile = root.runtime.session.sessionFile;
+		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
+		const rootPath = resolve(rootFile);
+		for (const item of recovery.interrupted) {
+			const sessionFile = resolve(item.sessionFile);
+			let cursor = sessionFile;
+			let owned = cursor === rootPath;
+			for (let depth = 0; !owned && depth < 256; depth++) {
+				const header = SessionManager.open(cursor).getHeader();
+				if (!header?.parentSession) break;
+				cursor = resolve(dirname(cursor), header.parentSession);
+				owned = cursor === rootPath;
+			}
+			if (item.operations.length > 32 || !owned) throw new Error("Worker recovery target is outside its owned root");
+			await reconcileInterruptedRlmChild(sessionFile);
+			const target = SessionManager.open(sessionFile);
+			const exists = target
+				.getEntries()
+				.some(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "prime-agent.worker_recovery" &&
+						(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
+				);
+			if (!exists)
+				target.appendCustomMessageEntryWithRollback(
+					"prime-agent.worker_recovery",
+					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+					false,
+					{ generation: recovery.generation, activeSessionId: item.activeSessionId, operations: item.operations },
+				);
 		}
 	}
 
@@ -3463,6 +3506,7 @@ export class AgentDaemon {
 
 			case "create": {
 				const state = await this.createRuntime(command);
+				await this.applyWorkerRecovery(command, state);
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
 

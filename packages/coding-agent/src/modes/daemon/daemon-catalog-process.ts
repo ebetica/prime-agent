@@ -294,18 +294,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "mark_interrupted":
-				await reconcileInterruptedRlmChild(request.sessionPath);
-				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
-					"prime-agent.worker_recovery",
-					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
-					false,
-					{
-						activeSessionId: request.activeSessionId,
-						operations: request.operations,
-					},
+				throw new Error(
+					"Catalog interruption mutation is unsupported; recovery is owned by the replacement worker",
 				);
-				sendCatalogMessage({ type: "response", id: request.id, success: true });
-				return;
 			case "shutdown":
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));

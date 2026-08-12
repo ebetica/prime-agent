@@ -8,8 +8,26 @@
  */
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { type RegistryLeaseOptions, withRegistryLease } from "./rlm-registry-lease.js";
+import { dirname, resolve } from "node:path";
+
+const registryQueues = new Map<string, Promise<void>>();
+async function withRegistryOwner<T>(path: string, action: () => T | Promise<T>): Promise<T> {
+	const key = resolve(path);
+	const previous = registryQueues.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const current = new Promise<void>((resolveRelease) => {
+		release = resolveRelease;
+	});
+	const tail = previous.then(() => current);
+	registryQueues.set(key, tail);
+	await previous;
+	try {
+		return await action();
+	} finally {
+		release();
+		if (registryQueues.get(key) === tail) registryQueues.delete(key);
+	}
+}
 
 export interface PersistedRlmSubagentRegistryEntry {
 	type: "rlm_subagent";
@@ -99,19 +117,12 @@ function writeCompact(path: string, entries: readonly PersistedRlmSubagentRegist
 	}
 }
 
-export async function readRlmSubagentRegistry(
-	path: string,
-	options?: RegistryLeaseOptions,
-): Promise<PersistedRlmSubagentRegistryEntry[]> {
-	return withRegistryLease(
-		path,
-		() => {
-			const loaded = loadLatest(path);
-			if (loaded.compact) writeCompact(path, loaded.entries);
-			return loaded.entries;
-		},
-		options,
-	);
+export async function readRlmSubagentRegistry(path: string): Promise<PersistedRlmSubagentRegistryEntry[]> {
+	return withRegistryOwner(path, () => {
+		const loaded = loadLatest(path);
+		if (loaded.compact) writeCompact(path, loaded.entries);
+		return loaded.entries;
+	});
 }
 
 export async function mutateRlmSubagentRegistry<T>(
@@ -123,7 +134,7 @@ export async function mutateRlmSubagentRegistry<T>(
 		afterWrite?: () => void;
 	},
 ): Promise<T> {
-	return withRegistryLease(path, () => {
+	return withRegistryOwner(path, () => {
 		const loaded = loadLatest(path);
 		const latest = new Map(loaded.entries.map((entry) => [entry.childId, entry]));
 		const change = mutation(latest);
