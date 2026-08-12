@@ -21,6 +21,7 @@ import type { RefinementResult } from "../../core/refinement/index.js";
 import type { RlmMaxDepthStatus, SetRlmMaxDepthResult } from "../../core/rlm-max-depth.js";
 import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionTranscriptRecord, SessionTranscriptView } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 
 /**
@@ -266,6 +267,9 @@ export interface AgentConnectionSessionContext {
 	serviceTier: ServiceTier;
 	model: { provider: string; modelId: string } | null;
 }
+
+export type AgentConnectionTranscriptRecord = SessionTranscriptRecord;
+export type AgentConnectionTranscriptView = SessionTranscriptView;
 
 export type AgentConnectionReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -650,6 +654,8 @@ export interface AgentConnection {
 	getState(): Promise<AgentConnectionState>;
 	getInitialSnapshot(): Promise<AgentConnectionSnapshot>;
 	getMessages(): Promise<AgentMessage[]>;
+	getTranscriptView(): Promise<AgentConnectionTranscriptView>;
+	getCompactionSummary(entryId: string, generation: string): Promise<AgentConnectionTranscriptRecord | undefined>;
 	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;

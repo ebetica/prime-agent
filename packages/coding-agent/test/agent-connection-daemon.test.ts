@@ -3,6 +3,7 @@ import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
+import { StaleTranscriptGenerationError } from "../src/core/session-manager.js";
 import {
 	DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 	DaemonAgentConnection,
@@ -157,6 +158,33 @@ class FakeDaemonClient {
 					success: true,
 					data: { messages: [{ role: "user", content: "current prompt", timestamp: 4 }] },
 				};
+			case "get_transcript_view":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						generation: "generation-1",
+						records: [
+							{
+								entryId: "entry-1",
+								ordinal: 0,
+								message: { role: "user", content: "current prompt", timestamp: 4 },
+							},
+						],
+					},
+				};
+			case "get_compaction_summary":
+				if (command.generation === "stale") {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Transcript generation is stale",
+						errorInfo: { code: "stale_transcript_generation" },
+					};
+				}
+				return { type: "response", command: command.type, success: true, data: { record: undefined } };
 			case "get_resource_snapshot":
 				return {
 					type: "response",
@@ -1598,6 +1626,27 @@ describe("DaemonAgentConnection", () => {
 		});
 		await expect(connection.getMessages()).resolves.toEqual(messages);
 		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach"]);
+	});
+
+	it("round-trips transcript view records through daemon commands", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		await expect(connection.getTranscriptView()).resolves.toEqual({
+			generation: "generation-1",
+			records: [
+				{ entryId: "entry-1", ordinal: 0, message: { role: "user", content: "current prompt", timestamp: 4 } },
+			],
+		});
+		await expect(connection.getCompactionSummary("summary-1", "generation-1")).resolves.toBeUndefined();
+		await expect(connection.getCompactionSummary("summary-1", "stale")).rejects.toBeInstanceOf(
+			StaleTranscriptGenerationError,
+		);
+		expect(fakeClient.requests.slice(-3).map((request) => request.type)).toEqual([
+			"get_transcript_view",
+			"get_compaction_summary",
+			"get_compaction_summary",
+		]);
 	});
 
 	it("preserves the in-flight assistant message when refreshing a stale snapshot", async () => {

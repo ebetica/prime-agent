@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
-import { type CustomEntry, SessionManager } from "../../src/core/session-manager.js";
+import { type CustomEntry, SessionManager, StaleTranscriptGenerationError } from "../../src/core/session-manager.js";
 import { assistantMsg, userMsg } from "../utilities.js";
 
 describe("SessionManager append and tree traversal", () => {
@@ -544,5 +544,37 @@ describe("createBranchedSession", () => {
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps transcript entry IDs across append and reload", () => {
+		const tempDir = join(tmpdir(), `session-transcript-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, tempDir);
+			const first = session.appendMessage(userMsg("first"));
+			const second = session.appendMessage(assistantMsg("second"));
+			const generation = session.getTranscriptView().generation;
+			const third = session.appendMessage(userMsg("third"));
+			expect(session.getTranscriptView()).toMatchObject({
+				generation,
+				records: [{ entryId: first }, { entryId: second }, { entryId: third }],
+			});
+			const reopened = SessionManager.open(session.getSessionFile()!);
+			expect(reopened.getTranscriptView().records.map((record) => record.entryId)).toEqual([first, second, third]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rotates transcript generation on branch selection and rejects stale summary lookup", () => {
+		const session = SessionManager.inMemory();
+		const first = session.appendMessage(userMsg("first"));
+		const retained = session.appendMessage(userMsg("retained"));
+		const summary = session.appendCompaction("summary", retained, 100);
+		const generation = session.getTranscriptView().generation;
+		expect(session.getCompactionSummary(summary, generation)?.entryId).toBe(summary);
+		session.branch(first);
+		expect(session.getTranscriptView().generation).not.toBe(generation);
+		expect(() => session.getCompactionSummary(summary, generation)).toThrow(StaleTranscriptGenerationError);
 	});
 });

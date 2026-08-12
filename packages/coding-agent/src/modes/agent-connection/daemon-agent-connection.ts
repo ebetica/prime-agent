@@ -81,6 +81,8 @@ import type {
 	AgentConnectionState,
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
+	AgentConnectionTranscriptRecord,
+	AgentConnectionTranscriptView,
 	AgentConnectionUserMessage,
 } from "./types.js";
 import { AgentConnectionPromptAdmissionError } from "./types.js";
@@ -428,6 +430,26 @@ export class DaemonAgentConnection implements AgentConnection {
 			activeSessionId: this.activeSessionId,
 		});
 		return data.messages;
+	}
+
+	async getTranscriptView(): Promise<AgentConnectionTranscriptView> {
+		return this.requestData<AgentConnectionTranscriptView>({
+			type: "get_transcript_view",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async getCompactionSummary(
+		entryId: string,
+		generation: string,
+	): Promise<AgentConnectionTranscriptRecord | undefined> {
+		const data = await this.requestData<{ record?: AgentConnectionTranscriptRecord }>({
+			type: "get_compaction_summary",
+			activeSessionId: this.activeSessionId,
+			entryId,
+			generation,
+		});
+		return data.record;
 	}
 
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
@@ -2105,6 +2127,8 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_state":
 		case "get_connection_state":
 		case "get_messages":
+		case "get_transcript_view":
+		case "get_compaction_summary":
 		case "get_session_stats":
 		case "get_commands":
 		case "get_resource_snapshot":

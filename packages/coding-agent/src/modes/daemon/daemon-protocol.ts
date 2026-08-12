@@ -62,8 +62,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 17 adds authenticated, durable planned-restart handoffs.
 // Revision 18 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 19 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 19;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-19-6afea788a5fb";
+// Revision 20 adds stable, generation-scoped transcript view commands.
+export const DAEMON_SCHEMA_REVISION = 20;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-20-2683a9d6869a";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -609,6 +610,14 @@ export type DaemonCommand =
 	| { id?: string; type: "get_state"; activeSessionId: string }
 	| { id?: string; type: "get_connection_state"; activeSessionId: string }
 	| { id?: string; type: "get_messages"; activeSessionId: string }
+	| { id?: string; type: "get_transcript_view"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "get_compaction_summary";
+			activeSessionId: string;
+			entryId: string;
+			generation: string;
+	  }
 	| { id?: string; type: "get_session_stats"; activeSessionId: string }
 	| { id?: string; type: "get_context_tree"; activeSessionId: string }
 	| { id?: string; type: "get_commands"; activeSessionId: string }
@@ -760,6 +769,7 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const TRANSCRIPT_VIEW_COMMAND = { minProtocol: 7, minSchemaRevision: 20 } as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
@@ -845,6 +855,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_state: LEGACY_DAEMON_COMMAND,
 	get_connection_state: LEGACY_DAEMON_COMMAND,
 	get_messages: LEGACY_DAEMON_COMMAND,
+	get_transcript_view: TRANSCRIPT_VIEW_COMMAND,
+	get_compaction_summary: TRANSCRIPT_VIEW_COMMAND,
 	get_session_stats: LEGACY_DAEMON_COMMAND,
 	get_context_tree: LEGACY_DAEMON_COMMAND,
 	get_commands: LEGACY_DAEMON_COMMAND,
@@ -945,6 +957,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "stale_transcript_generation" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
@@ -1205,6 +1218,8 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_state",
 	"get_connection_state",
 	"get_messages",
+	"get_transcript_view",
+	"get_compaction_summary",
 	"get_session_stats",
 	"get_context_tree",
 	"get_commands",

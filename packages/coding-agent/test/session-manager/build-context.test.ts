@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	type BranchSummaryEntry,
 	buildSessionContext,
+	buildSessionTranscriptRecords,
 	type CompactionEntry,
 	type ModelChangeEntry,
 	type ServiceTierChangeEntry,
@@ -292,8 +293,33 @@ describe("buildSessionContext", () => {
 				msg("2", "missing", "assistant", "orphan"), // parent doesn't exist
 			];
 			const ctx = buildSessionContext(entries, "2");
-			// Should only get the orphan since parent chain is broken
 			expect(ctx.messages).toHaveLength(1);
+		});
+	});
+
+	describe("transcript records", () => {
+		it("places compaction after retained records in structural order", () => {
+			const entries: SessionEntry[] = [
+				msg("discarded", null, "user", "old"),
+				msg("kept-user", "discarded", "user", "kept"),
+				msg("kept-assistant", "kept-user", "assistant", "answer"),
+				compaction("summary", "kept-assistant", "summary", "kept-user"),
+				msg("after", "summary", "user", "after"),
+			];
+			const records = buildSessionTranscriptRecords(entries, "after");
+			expect(records.map((record) => record.entryId)).toEqual(["kept-user", "kept-assistant", "summary", "after"]);
+			expect(records[2].message).toMatchObject({ role: "compactionSummary", retainedMessageCount: 2 });
+		});
+
+		it("does not sort equal timestamps", () => {
+			const entries: SessionEntry[] = [
+				msg("parent", null, "user", "first"),
+				msg("child", "parent", "user", "second"),
+			];
+			expect(buildSessionTranscriptRecords(entries, "child").map((record) => record.entryId)).toEqual([
+				"parent",
+				"child",
+			]);
 		});
 	});
 });

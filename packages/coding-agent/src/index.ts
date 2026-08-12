@@ -186,6 +186,7 @@ export { SessionImportFileNotFoundError } from "./core/session-import-errors.js"
 export {
 	type BranchSummaryEntry,
 	buildSessionContext,
+	buildSessionTranscriptRecords,
 	type CompactionEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -207,6 +208,9 @@ export {
 	type SessionState,
 	type SessionStateEntry,
 	type SessionStateStatus,
+	type SessionTranscriptRecord,
+	type SessionTranscriptView,
+	StaleTranscriptGenerationError,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.js";
 export type { SessionStats } from "./core/session-stats.js";
@@ -284,6 +288,8 @@ export {
 	type AgentConnectionSessionEvent,
 	type AgentConnectionSlashCommand,
 	type AgentConnectionState,
+	type AgentConnectionTranscriptRecord,
+	type AgentConnectionTranscriptView,
 	DaemonAgentConnection,
 	InProcessAgentConnection,
 } from "./modes/agent-connection/index.js";

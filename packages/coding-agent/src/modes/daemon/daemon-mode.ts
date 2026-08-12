@@ -289,6 +289,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_state",
 	"get_connection_state",
 	"get_messages",
+	"get_transcript_view",
+	"get_compaction_summary",
 	"get_session_stats",
 	"get_context_tree",
 	"get_commands",
@@ -4203,6 +4205,18 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_messages", {
 					messages: state.runtime.session.messages,
+				});
+			}
+
+			case "get_transcript_view": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_transcript_view", state.runtime.session.sessionManager.getTranscriptView());
+			}
+
+			case "get_compaction_summary": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_compaction_summary", {
+					record: state.runtime.session.sessionManager.getCompactionSummary(command.entryId, command.generation),
 				});
 			}
 

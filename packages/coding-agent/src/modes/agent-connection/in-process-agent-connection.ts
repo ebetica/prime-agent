@@ -62,6 +62,8 @@ import type {
 	AgentConnectionState,
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
+	AgentConnectionTranscriptRecord,
+	AgentConnectionTranscriptView,
 	AgentConnectionUserMessage,
 } from "./types.js";
 
@@ -129,6 +131,17 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getMessages(): Promise<AgentMessage[]> {
 		return this.session.state.messages;
+	}
+
+	async getTranscriptView(): Promise<AgentConnectionTranscriptView> {
+		return this.session.sessionManager.getTranscriptView();
+	}
+
+	async getCompactionSummary(
+		entryId: string,
+		generation: string,
+	): Promise<AgentConnectionTranscriptRecord | undefined> {
+		return this.session.sessionManager.getCompactionSummary(entryId, generation);
 	}
 
 	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
