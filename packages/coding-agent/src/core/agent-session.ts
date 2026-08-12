@@ -9504,24 +9504,25 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
-		// A child can finish concurrently while the parent is (or has) torn down; don't
-		// resurrect the map (it would never be disposed), just drop the child now.
-		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) {
-			return false;
-		}
-		if (this._subagentRuntimeHost?.completeRlmSubagentRuntime?.(childId, session) === false) {
-			return false;
-		}
-		if (this._disposed || this._disposing) {
-			void session.disposeAsync().catch(() => undefined);
-			return false;
-		}
-		this._rlmChildSessions.set(childId, session);
-		if (unsubscribe) {
-			this._rlmChildUnsubscribes.set(childId, unsubscribe);
-		}
-		return true;
+	registerRlmChildSession(
+		childId: string,
+		session: AgentSession,
+		unsubscribe?: () => void,
+	): boolean | Promise<boolean> {
+		const retain = (): boolean => {
+			if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) return false;
+			if (this._disposed || this._disposing) {
+				void session.disposeAsync().catch(() => undefined);
+				return false;
+			}
+			this._rlmChildSessions.set(childId, session);
+			if (unsubscribe) this._rlmChildUnsubscribes.set(childId, unsubscribe);
+			return true;
+		};
+		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) return false;
+		const completion = this._subagentRuntimeHost?.completeRlmSubagentRuntime?.(childId, session);
+		if (completion instanceof Promise) return completion.then((completed) => completed !== false && retain());
+		return completion !== false && retain();
 	}
 
 	/** Stop retaining an idle daemon child without deleting its durable registry row. */
@@ -9931,7 +9932,7 @@ export class AgentSession {
 						}),
 					);
 				}
-				if (!this.registerRlmChildSession(run.id, child)) {
+				if (!(await this.registerRlmChildSession(run.id, child))) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
