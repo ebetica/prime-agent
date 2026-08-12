@@ -48,6 +48,7 @@ import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
+import { CoalescedWorkerRefresh } from "./coalesced-worker-refresh.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
@@ -610,6 +611,7 @@ export class DaemonSupervisor {
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
 	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
+	private readonly workerSummaryRefreshes = new CoalescedWorkerRefresh<ResidentWorker>();
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -2965,7 +2967,13 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+	private refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
+		return this.workerSummaryRefreshes.request(worker, recovery, (needsRecoveryCheck) =>
+			this.refreshWorkerSummariesNow(worker, needsRecoveryCheck),
+		);
+	}
+
+	private async refreshWorkerSummariesNow(worker: ResidentWorker, recovery = false): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
