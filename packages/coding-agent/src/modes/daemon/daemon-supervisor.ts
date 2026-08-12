@@ -2356,6 +2356,12 @@ export class DaemonSupervisor {
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+		if (command.sessionPath) {
+			const claimedOwner = this.ownedSessionClaims.get(canonicalSessionPath(command.sessionPath));
+			if (claimedOwner !== undefined && claimedOwner !== clientId) {
+				throw new Error(`Session not found: ${command.sessionPath}`);
+			}
+		}
 		let createCommand = command;
 		if (command.name !== undefined) {
 			const normalizedName = command.name.trim();

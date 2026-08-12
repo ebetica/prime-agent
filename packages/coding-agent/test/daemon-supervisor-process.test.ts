@@ -645,6 +645,13 @@ describe("daemon supervisor resident workers", () => {
 			sessionPath: sessionFile,
 		});
 		expect(deniedDeleteAfterStop).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
+		const deniedReopenAfterStop = await otherClientAfterStop.request({
+			type: "create",
+			sessionPath: sessionFile,
+			lifecycle: "client_owned",
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(deniedReopenAfterStop).toMatchObject({ success: false, error: `Session not found: ${sessionFile}` });
 		otherClientAfterStop.close();
 
 		await client.request({ type: "shutdown" });
