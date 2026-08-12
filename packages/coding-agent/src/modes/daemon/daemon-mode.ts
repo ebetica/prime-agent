@@ -389,7 +389,7 @@ interface PersistedRlmSubagentRegistryEntry {
 	prompt?: string;
 	spawnCode?: string;
 	model?: { provider: string; modelId: string };
-	status: "running" | "completed" | "deleted";
+	status: "running" | "completed" | "interrupted" | "deleted";
 	createdAt: number;
 	updatedAt: string;
 }
@@ -1014,7 +1014,10 @@ export class AgentDaemon {
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
-					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
+					(entry.status !== "running" &&
+						entry.status !== "completed" &&
+						entry.status !== "interrupted" &&
+						entry.status !== "deleted") ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
 					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
 				) {
@@ -2220,7 +2223,7 @@ export class AgentDaemon {
 						candidate.runtime.session === session,
 				);
 				if (!state?.runtime.session.sessionFile) return false;
-				if (state.runtime.metadata.rehydratedCompleted) return true;
+				if (state.runtime.metadata.rehydratedTerminalStatus) return true;
 				const metadata = state.runtime.metadata;
 				const model = session.model;
 				return this.recordRlmSubagentRegistryEntry(parentState, {
@@ -2769,7 +2772,7 @@ export class AgentDaemon {
 							: {}),
 						rlmChildId: entry.childId,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
-						rehydratedCompleted: true,
+						rehydratedTerminalStatus: entry.status === "interrupted" ? "interrupted" : "completed",
 						...(entry.prompt ? { prompt: entry.prompt } : {}),
 						...(entry.spawnCode ? { spawnCode: entry.spawnCode } : {}),
 						sessionDir: entry.sessionDir,
@@ -2789,6 +2792,7 @@ export class AgentDaemon {
 			);
 			// The session transcript is authoritative for mutable metadata such as a
 			// later user-assigned name; the registry value is only the spawn snapshot.
+			runtime.session._persistedRlmTerminalStatus = entry.status === "interrupted" ? "interrupted" : "completed";
 			if (!parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session)) {
 				await this.closeSession(state, "replaced");
 				throw new RuntimeOpenCancelledError();
