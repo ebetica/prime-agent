@@ -71,13 +71,8 @@ export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
 	const header = child.getHeader();
 	if (!header?.parentSession) return false;
 	const parentPath = resolve(dirname(sessionPath), header.parentSession);
-	const parent = SessionManager.open(parentPath);
-	const registryPath = join(
-		dirname(dirname(parentPath)),
-		"session-artifacts",
-		parent.getSessionId(),
-		"rlm-subagents.jsonl",
-	);
+	const parentSessionId = SessionManager.open(parentPath).getSessionId();
+	const registryPath = join(dirname(dirname(parentPath)), "session-artifacts", parentSessionId, "rlm-subagents.jsonl");
 	return mutateRlmSubagentRegistry(registryPath, (latest) => {
 		const entry = [...latest.values()].find(
 			(candidate) =>
@@ -93,6 +88,7 @@ export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
 			result: transitioned,
 			...(transitioned ? { entry: reconciledEntry } : {}),
 			afterWrite: () => {
+				const parent = SessionManager.open(parentPath);
 				const alreadyNotified = parent
 					.getEntries()
 					.some(
