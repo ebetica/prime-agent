@@ -22,6 +22,7 @@ import {
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { reconcileInterruptedRlmChild } from "../src/modes/daemon/daemon-catalog-process.js";
 import {
 	AgentDaemon,
 	cancelPendingExtensionUiRequests,
@@ -42,7 +43,7 @@ import {
 	type DaemonOutbound,
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
-import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { buildRlmChildSnapshots, type SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon mode helpers", () => {
@@ -5649,6 +5650,54 @@ describe("daemon mode helpers", () => {
 			});
 			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
 			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionManager.getSessionFile()).toBe(siblingSessionFile);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("hydrates recovered interrupted children without completing them or duplicating the notice", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-interrupted-rlm-hydration-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const entry = JSON.parse(readFileSync(registryPath, "utf8").trim()) as Record<string, unknown>;
+			writeFileSync(registryPath, `${JSON.stringify({ ...entry, status: "running" })}\n`);
+
+			expect(reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(true);
+			expect(reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(false);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				findPassiveRlmSubagent(target: string): Promise<unknown>;
+				hydratePassiveRlmSubagent(passive: unknown): Promise<ActiveSessionState>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const passive = await internals.findPassiveRlmSubagent(fixture.childId);
+			expect(passive).toBeDefined();
+			const firstHydration = await internals.hydratePassiveRlmSubagent(passive);
+			const secondHydration = await internals.hydratePassiveRlmSubagent(passive);
+			expect(secondHydration).toBe(firstHydration);
+			expect(firstHydration.runtime.session._persistedRlmTerminalStatus).toBe("interrupted");
+			expect(firstHydration.runtime.metadata.rehydratedTerminalStatus).toBe("interrupted");
+			Object.assign(firstHydration.runtime.session, {
+				_contextTokensForCurrentMessages: () => 0,
+				getCurrentRecap: () => undefined,
+			});
+			const parentState = [
+				...(fixture.daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.values(),
+			].find((state) => state.runtime.metadata.kind === "top-level");
+			if (!parentState) throw new Error("Missing hydrated parent");
+			parentState.runtime.session.getRlmChildRunStatus = () => undefined;
+			expect(buildRlmChildSnapshots(parentState.activeSessionId, [parentState, firstHydration])).toContainEqual(
+				expect.objectContaining({ id: fixture.childId, status: "error" }),
+			);
+			const notices = SessionManager.open(fixture.parentSessionFile)
+				.getEntries()
+				.filter(
+					(candidate) =>
+						candidate.type === "custom_message" && candidate.customType === "prime-agent.rlm_child_interrupted",
+				);
+			expect(notices).toHaveLength(1);
+			expect(readFileSync(registryPath, "utf8")).not.toContain('"status":"completed"');
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
