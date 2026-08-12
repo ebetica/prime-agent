@@ -158,6 +158,95 @@ describe("ENG-4531 agent message UI", () => {
 		});
 	});
 
+	it("inspects native queued agent messages with only redacted authored provenance", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.acquireQueuedWorkPause();
+		const payload = {
+			...createPayload("Inspect the authored body."),
+			fromRelationship: "sibling" as const,
+			from: {
+				activeSessionId: "planner-active",
+				sessionId: "planner-session",
+				sessionName: "Planner",
+				clientId: "must-not-leak",
+				runtimeKind: "subagent" as const,
+			},
+		};
+		await harness.session.followUp("ordinary follow-up");
+		await harness.session.queueAgentMessagePrompt(
+			createAgentSessionMessagePrompt(payload),
+			"followUp",
+			createAgentSessionMessage(payload),
+		);
+
+		const inspected = harness.session.getQueuedUserActions();
+		expect(inspected[0]).toEqual({
+			id: expect.any(String),
+			text: "ordinary follow-up",
+			delivery: "followUp",
+		});
+		expect(inspected[1]).toEqual({
+			id: expect.any(String),
+			text: "Inspect the authored body.",
+			delivery: "followUp",
+			customType: "agent_message",
+			from: {
+				activeSessionId: "planner-active",
+				sessionId: "planner-session",
+				sessionName: "Planner",
+			},
+			fromRelationship: "sibling",
+		});
+	});
+
+	it("promotes an inspected action as the same durable native agent message", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pause = harness.session.acquireQueuedWorkPause();
+		const payload = { ...createPayload("Promote this record."), fromRelationship: "parent" as const };
+		const message = createAgentSessionMessage(payload);
+		harness.setResponses([fauxAssistantMessage("Promoted once.")]);
+		await harness.session.queueAgentMessagePrompt(message.content as string, "followUp", message);
+		const actionId = harness.session.getQueuedUserActions()[0]?.id;
+		expect(actionId).toEqual(expect.any(String));
+		expect(actionId).not.toBe(payload.id);
+
+		pause.release();
+		await harness.session.waitForIdle();
+
+		const promoted = harness.session.messages.filter(
+			(candidate) => candidate.role === "custom" && candidate.customType === "agent_message",
+		);
+		expect(promoted).toHaveLength(1);
+		expect(promoted[0]).toMatchObject({
+			role: "custom",
+			customType: "agent_message",
+			details: { id: payload.id, message: "Promote this record.", fromRelationship: "parent" },
+		});
+		expect(getUserTexts(harness)).toEqual([]);
+	});
+
+	it("fails malformed agent-message queue records closed to the plain inspection shape", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const malformed = createAgentSessionMessage(createPayload("Do not trust this sender."));
+		(malformed.details as unknown as Record<string, unknown>).fromRelationship = "operator";
+		(malformed.details as unknown as Record<string, unknown>).from = {
+			activeSessionId: 42,
+			clientId: "spoofed-client",
+		};
+		await harness.session.queueAgentMessagePrompt(malformed.content as string, "followUp", malformed);
+
+		expect(harness.session.getQueuedUserActions()).toEqual([
+			{
+				id: expect.any(String),
+				text: "Agent message received: Do not trust this sender.",
+				delivery: "followUp",
+			},
+		]);
+	});
+
 	it("does not add a second queue label to agent message previews", () => {
 		expect(formatQueuedMessagePreview("Agent message received: Use shard seven.", "Follow-up")).toBe(
 			"Agent message received: Use shard seven.",

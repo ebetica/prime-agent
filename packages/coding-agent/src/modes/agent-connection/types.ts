@@ -532,6 +532,15 @@ export interface AgentConnectionQueuedUserAction {
 	id: string;
 	text: string;
 	delivery: "steering" | "followUp";
+	/** Present only for a validated native agent-message queue record. */
+	customType?: "agent_message";
+	/** Redacted sender identity; other custom-message details never cross this boundary. */
+	from?: {
+		activeSessionId?: string;
+		sessionId?: string;
+		sessionName?: string;
+	};
+	fromRelationship?: "parent" | "sibling" | "child";
 }
 
 export interface AgentConnectionHeartbeat {
