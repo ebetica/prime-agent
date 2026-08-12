@@ -567,14 +567,14 @@ describe("daemon supervisor resident workers", () => {
 			error: "Session launch environment does not match its immutable descriptor",
 		});
 
-		const publicList = await client.request({ type: "list" });
+		const publicList = await client.request({ type: "list", all: true, sessionDir });
 		expect(publicList.success).toBe(true);
 		expect(requireSessionList(publicList.success ? publicList.data : undefined)).toEqual([]);
-		const internalList = await client.request({ type: "list", includeClientOwned: true });
+		const internalList = await client.request({ type: "list", all: true, sessionDir, includeClientOwned: true });
 		expect(internalList.success).toBe(true);
 		expect(requireSessionList(internalList.success ? internalList.data : undefined)).toHaveLength(1);
 		const otherClient = await connectEventually(socketPath);
-		const deniedList = await otherClient.request({ type: "list", includeClientOwned: true });
+		const deniedList = await otherClient.request({ type: "list", all: true, sessionDir, includeClientOwned: true });
 		expect(deniedList).toMatchObject({
 			success: true,
 			data: { sessions: [], busyClientOwnedSessionCount: 0 },

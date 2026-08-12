@@ -58,6 +58,9 @@ export interface AgentConnectionSessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	parentSessionId?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 	rlmDepth?: number;
 	git?: {
 		repoUrl?: string;
@@ -121,6 +124,9 @@ export interface AgentConnectionSavedSessionInfo {
 	name?: string;
 	state?: AgentConnectionSavedSessionState;
 	parentSessionPath?: string;
+	parentSessionId?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 	rlmDepth?: number;
 	created: Date;
 	modified: Date;

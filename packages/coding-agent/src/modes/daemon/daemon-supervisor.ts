@@ -483,6 +483,8 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 			(typeof descriptor.pendingResourceReload === "object" &&
 				typeof descriptor.pendingResourceReload.transactionId === "string" &&
 				isAgentSessionResourceConfig(descriptor.pendingResourceReload.resources))) &&
+		(descriptor.lastSessionSummaries === undefined ||
+			(Array.isArray(descriptor.lastSessionSummaries) && descriptor.lastSessionSummaries.every(isSessionSummary))) &&
 		descriptor.createCommand !== undefined &&
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
@@ -1070,7 +1072,9 @@ export class DaemonSupervisor {
 				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
-					summaries: new Map(),
+					summaries: new Map(
+						(descriptor.lastSessionSummaries ?? []).map((summary) => [summary.activeSessionId ?? summary.id, summary]),
+					),
 					snapshotCache: new Map(),
 					transcriptCaches: new Map(),
 					snapshotGenerations: new Map(),
@@ -2265,13 +2269,14 @@ export class DaemonSupervisor {
 		);
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
-		const active = [...this.workers.values()]
-			.filter(
-				(worker) =>
-					this.isVisibleWorker(worker) ||
-					(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
-			)
-			.flatMap((worker) => [...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)));
+		const listedWorkers = [...this.workers.values()].filter(
+			(worker) =>
+				this.isVisibleWorker(worker) ||
+				(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
+		);
+		const active = listedWorkers.flatMap((worker) =>
+			[...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)),
+		);
 		const busyClientOwnedSessionCount = clientOwnedWorkers
 			.flatMap((worker) => [...worker.summaries.values()])
 			.filter(isSessionSummaryBusy).length;
@@ -2283,7 +2288,18 @@ export class DaemonSupervisor {
 			return success(command.id, "list", data);
 		}
 		const sessionDir = command.sessionDir ?? this.defaultSessionConfig.sessionDir;
-		const saved = await this.catalog.list(command.cwd ? resolve(command.cwd) : undefined, sessionDir);
+		const hiddenSessionFiles = new Set(
+			[...this.workers.values()]
+				.filter((worker) => !listedWorkers.includes(worker))
+				.flatMap((worker) =>
+					[...worker.summaries.values()].flatMap((summary) =>
+						summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [],
+					),
+				),
+		);
+		const saved = (await this.catalog.list(command.cwd ? resolve(command.cwd) : undefined, sessionDir)).filter(
+			(session) => !hiddenSessionFiles.has(canonicalSessionPath(session.path)),
+		);
 		return success(command.id, "list", { ...data, sessions: mergeSessionLists(active, saved) });
 	}
 
@@ -2554,6 +2570,7 @@ export class DaemonSupervisor {
 				lifecycle: "starting",
 				createCommand: { ...createCommand, id: undefined },
 				consecutiveFailures: existing?.descriptor.consecutiveFailures ?? 0,
+				lastSessionSummaries: existing?.descriptor.lastSessionSummaries,
 			};
 			worker = existing ?? {
 				descriptor,
@@ -3324,6 +3341,7 @@ export class DaemonSupervisor {
 		const response = await worker.client.request({ type: "list" }, 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
+		worker.descriptor.lastSessionSummaries = summaries.map(({ streamingMessage: _streaming, diagnostics: _diagnostics, ...summary }) => summary);
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
@@ -3543,8 +3561,17 @@ export class DaemonSupervisor {
 
 	private publicSummary(worker: ResidentWorker, summary: SessionSummary): SessionSummary {
 		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const workerGeneration = createHash("sha256")
+			.update(`${worker.descriptor.workerId}:${worker.descriptor.processStartId ?? worker.descriptor.pid}`)
+			.digest("hex")
+			.slice(0, 16);
+		const interrupted = worker.descriptor.lifecycle !== "ready";
 		return {
 			...summary,
+			...(interrupted
+				? { executionStatus: "worker-interrupted" as const, executionReason: "worker-interrupted" as const }
+				: {}),
+			workerGeneration,
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
 			workerState: worker.descriptor.lifecycle,

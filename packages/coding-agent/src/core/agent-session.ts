@@ -9534,14 +9534,14 @@ export class AgentSession {
 
 	private _buildRlmSubagentList(listedAgents?: AgentSessionMessageListResult): RlmListSubagentsResult {
 		const daemonChildren = new Map<string, AgentSessionMessageAgentSummary>();
+		const parentSessionId = listedAgents?.current?.sessionId;
 		const parentActiveSessionId = listedAgents?.current?.activeSessionId;
-		if (parentActiveSessionId) {
-			for (const agent of listedAgents.agents) {
-				if (
-					agent.runtimeKind === "subagent" &&
-					agent.parentActiveSessionId === parentActiveSessionId &&
-					agent.rlmChildId
-				) {
+		if (parentSessionId || parentActiveSessionId) {
+			for (const agent of listedAgents?.agents ?? []) {
+				const belongsToParent = agent.parentSessionId
+					? agent.parentSessionId === parentSessionId
+					: agent.parentActiveSessionId === parentActiveSessionId;
+				if (agent.runtimeKind === "subagent" && belongsToParent && agent.rlmChildId) {
 					daemonChildren.set(agent.rlmChildId, agent);
 				}
 			}
@@ -9710,10 +9710,9 @@ export class AgentSession {
 				if (passiveMatches.length > 0) {
 					throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 				}
-				const parentActiveSessionId = listedAgents?.current?.activeSessionId;
+				const parentSessionId = listedAgents?.current?.sessionId;
 				const daemonChild = listedAgents?.agents.find(
-					(agent) =>
-						agent.rlmChildId === subagent.rlm_child_id && agent.parentActiveSessionId === parentActiveSessionId,
+					(agent) => agent.rlmChildId === subagent.rlm_child_id && agent.parentSessionId === parentSessionId,
 				);
 				const resolvedSubagent = daemonChild
 					? {
@@ -10082,7 +10081,8 @@ export class AgentSession {
 		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
 
 		const childSessionDir = this._createChildRlmSessionDir();
-		const childNodeId = basename(childSessionDir);
+		// Lifecycle identity is independent from the short, human-readable artifact directory slug.
+		const childNodeId = `sub-${randomUUID()}`;
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		const startedAt = Date.now();
