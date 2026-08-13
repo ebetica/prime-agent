@@ -1159,7 +1159,11 @@ export class AgentSession {
 		queuedCount: 0,
 		steering: [],
 		followUps: [],
+		queuedUserActions: [],
 	};
+	private _activeRunInstanceId?: string;
+	private readonly _stoppedRunInstances = new Map<string, Promise<void>>();
+	private _userBashCompletion?: Promise<void>;
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -3413,6 +3417,10 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
+		if (event.type === "agent_start") {
+			this._activeRunInstanceId = randomUUID();
+			this._emitQueueUpdate();
+		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
 				if (
@@ -3428,6 +3436,8 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
+			this._activeRunInstanceId = undefined;
+			this._emitQueueUpdate();
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -6576,12 +6586,58 @@ export class AgentSession {
 
 	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
 		return visibleSessionActionProjection(this._actionStore.queuedActions())
-			.filter((action) => action.payload.kind === "turn")
+			.filter(
+				(action) => action.payload.kind === "turn" && (action.source === "interactive" || action.source === "rpc"),
+			)
 			.map((action) => ({
 				id: action.id,
 				text: queuedAgentMessagePreview(action),
 				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
 			}));
+	}
+
+	async withdrawQueuedUserActions(
+		ids: readonly string[],
+	): Promise<readonly { id: string; text: string; delivery: "steering" | "followUp" }[]> {
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			const requested = new Set(ids);
+			const descriptors = this.getQueuedUserActions().filter((item) => requested.has(item.id));
+			if (descriptors.length === 0) return [];
+			const descriptorIds = new Set(descriptors.map((item) => item.id));
+			const error = new Error("Queued operator message was withdrawn before delivery.");
+			const removed = this._cancelSessionActions((action) => descriptorIds.has(action.id), error);
+			const removedIds = new Set(removed.map((action) => action.id));
+			const withdrawn = descriptors.filter((item) => removedIds.has(item.id));
+			if (withdrawn.length > 0) this._emitQueueUpdate();
+			return withdrawn;
+		} finally {
+			fence.release();
+			this.resumeQueuedWork();
+		}
+	}
+
+	async stopActiveRun(expectedRunInstanceId: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
+		const previous = this._stoppedRunInstances.get(expectedRunInstanceId);
+		if (previous) {
+			await previous;
+			return { status: "already_stopped" };
+		}
+		if (this._activeRunInstanceId !== expectedRunInstanceId) return { status: "stale" };
+		// Invalidate the compare token before admitting abort, so a retry cannot hit a replacement.
+		this._activeRunInstanceId = undefined;
+		this._emitQueueUpdate();
+		const completion = (async () => {
+			await this.abort();
+			await this._userBashCompletion;
+		})();
+		this._stoppedRunInstances.set(expectedRunInstanceId, completion);
+		while (this._stoppedRunInstances.size > 128) {
+			const oldest = this._stoppedRunInstances.keys().next().value;
+			if (oldest !== undefined) this._stoppedRunInstances.delete(oldest);
+		}
+		await completion;
+		return { status: "stopped" };
 	}
 
 	cancelQueuedAction(id: string): boolean {
@@ -6703,10 +6759,13 @@ export class AgentSession {
 				: activeState === "preparing" || activeState === "committing" || activeState === "running"
 					? activeState
 					: undefined;
+		const queuedUserActions = this.getQueuedUserActions();
 		return {
 			queuedCount: steering.length + followUps.length,
 			steering,
 			followUps,
+			queuedUserActions,
+			...(this._activeRunInstanceId ? { activeRunInstanceId: this._activeRunInstanceId } : {}),
 			...(active && phase
 				? {
 						active: {
@@ -11326,6 +11385,12 @@ export class AgentSession {
 		// slip through during the user_bash extension dispatch below.
 		this._userBashRunning = true;
 		this._userBashAbortRequested = false;
+		if (!this._activeRunInstanceId) this._activeRunInstanceId = randomUUID();
+		this._emitQueueUpdate();
+		let settleUserBash!: () => void;
+		this._userBashCompletion = new Promise<void>((resolve) => {
+			settleUserBash = resolve;
+		});
 		// Echoed on bash_start/bash_end so the requesting client can tell its own
 		// run apart from other clients' runs broadcast on the same session.
 		const identity = {
@@ -11342,6 +11407,10 @@ export class AgentSession {
 			);
 		} finally {
 			this._userBashRunning = false;
+			settleUserBash();
+			this._userBashCompletion = undefined;
+			this._activeRunInstanceId = undefined;
+			this._emitQueueUpdate();
 		}
 		// Emitted after the slot is released so clients never observe a bash_end
 		// while the session still rejects new commands as already running.

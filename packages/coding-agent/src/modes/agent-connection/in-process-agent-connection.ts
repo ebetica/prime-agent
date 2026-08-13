@@ -210,6 +210,14 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.cancelQueuedAction(id);
 	}
 
+	async withdrawQueuedActions(ids: readonly string[]): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		return this.session.withdrawQueuedUserActions(ids);
+	}
+
+	async stopActiveRun(expectedRunInstanceId: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
+		return this.session.stopActiveRun(expectedRunInstanceId);
+	}
+
 	async clearQueue(): Promise<AgentConnectionQueueState> {
 		return this.session.clearQueue();
 	}
