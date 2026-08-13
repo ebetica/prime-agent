@@ -7,7 +7,16 @@
  * removes its row, so both storage and steady-state operations are O(live).
  */
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 
 const registryQueues = new Map<string, Promise<void>>();
@@ -99,6 +108,7 @@ function loadLatest(path: string): { entries: PersistedRlmSubagentRegistryEntry[
 
 function writeCompact(path: string, entries: readonly PersistedRlmSubagentRegistryEntry[]): void {
 	const directory = dirname(path);
+	mkdirSync(directory, { recursive: true });
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	const descriptor = openSync(temporary, "wx", 0o600);
 	try {

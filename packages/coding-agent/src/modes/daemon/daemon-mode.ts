@@ -152,7 +152,7 @@ import {
 	resolveActiveSessionState,
 } from "./active-session-state.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
-import { reconcileInterruptedRlmChild } from "./daemon-catalog-process.js";
+import { appendInterruptedToolResults, reconcileInterruptedRlmChild } from "./daemon-catalog-process.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
@@ -1310,8 +1310,9 @@ export class AgentDaemon {
 				owned = cursor === rootPath;
 			}
 			if (!owned) throw new Error("Worker recovery target is outside its owned root");
-			await reconcileInterruptedRlmChild(sessionFile);
 			const target = SessionManager.open(sessionFile);
+			appendInterruptedToolResults(target);
+			await reconcileInterruptedRlmChild(sessionFile);
 			const exists = target
 				.getEntries()
 				.some(
