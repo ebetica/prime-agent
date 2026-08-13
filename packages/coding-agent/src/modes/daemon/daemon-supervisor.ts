@@ -2685,6 +2685,13 @@ export class DaemonSupervisor {
 			}
 			await this.assertRecoveryAllowed();
 			if (worker.pendingRecovery) {
+				if (worker.descriptor.createCommand.workerRecovery) {
+					const { workerRecovery: _recovery, ...acknowledgedCreateCommand } = worker.descriptor.createCommand;
+					worker.descriptor.createCommand = acknowledgedCreateCommand;
+					// Persist the no-replay boundary before acknowledging journal facts. A crash
+					// before this point safely retries idempotently; after it cannot replay them.
+					this.persistWorker(worker);
+				}
 				const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 				for (const record of journal.getLatest())
 					journal.record({
@@ -2695,10 +2702,6 @@ export class DaemonSupervisor {
 						operation: "recovery_hold",
 					});
 				worker.pendingRecovery = undefined;
-				if (worker.descriptor.createCommand.workerRecovery) {
-					const { workerRecovery: _recovery, ...acknowledgedCreateCommand } = worker.descriptor.createCommand;
-					worker.descriptor.createCommand = acknowledgedCreateCommand;
-				}
 			}
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
