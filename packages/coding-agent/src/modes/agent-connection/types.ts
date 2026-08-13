@@ -543,7 +543,6 @@ export interface AgentConnectionQueuedUserAction {
 	delivery: "steering" | "followUp";
 }
 
-
 export interface AgentConnectionHeartbeat {
 	job: AgentCronJob;
 	sessionName?: string;

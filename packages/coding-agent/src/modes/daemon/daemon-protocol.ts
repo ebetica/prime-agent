@@ -60,18 +60,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-// Revision 17 adds daemon-side atomic idle admission for resource reloads.
-export const DAEMON_SCHEMA_REVISION = 17;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-atomic-reload";
-// Revision 14 adds daemon-side atomic idle admission for resource reloads.
-// Revision 15 adds stable queued-user-action identities and atomic cancellation.
-// Revision 16 adds transactional live resource-config replacement.
-// Revision 17 adds authenticated, durable planned-restart handoffs.
-// Revision 18 adds crash-safe completion proof and handoff acknowledgement/cancellation.
-// Revision 19 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 19;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-19-6afea788a5fb";
-
+// Revision 17 adds daemon-side atomic idle admission for reloads.
+// Revision 18 adds stable queued-user-action identities and atomic cancellation.
+// Revision 19 adds transactional live resource-config replacement.
+// Revision 20 adds authenticated, durable planned-restart handoffs.
+// Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
+// Revision 22 preserves immutable worker launch environment across planned restarts.
+export const DAEMON_SCHEMA_REVISION = 22;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-eb48ac5a9731";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -111,13 +107,11 @@ export type DaemonServerCapability =
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
 	| "queue_message_mutation"
-	| "atomic_reload";
 	| "atomic_reload"
 	| "atomic_resource_reload"
 	| "queued_action_cancellation"
 	| "planned_restart_handoff"
 	| "planned_restart_handoff_lifecycle";
-
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -641,7 +635,6 @@ export type DaemonCommand =
 	  }
 	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
 	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
-
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -673,7 +666,7 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string; ifIdle?: boolean }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
@@ -937,9 +930,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
 	if (carriesTelemetryPolicy) {
 		return [TELEMETRY_POLICY_COMMAND, compatibility];
+	}
 	if (command.type === "prepare_update_restart" && command.handoffRequestId !== undefined) {
 		return [PLANNED_RESTART_HANDOFF_COMMAND, compatibility];
-
 	}
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		return [PROMPT_ADMISSION_CANCELLATION_COMMAND, compatibility];

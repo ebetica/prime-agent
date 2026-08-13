@@ -43,7 +43,6 @@ export function mergeAgentSessionResourceConfig(
 	return merged;
 }
 
-
 export interface AgentSessionRuntimeConfig {
 	cwd?: string;
 	agentDir?: string;

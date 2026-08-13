@@ -234,7 +234,6 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"mutate_queued_message",
 	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
-
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
@@ -661,9 +660,7 @@ export class DaemonSupervisor {
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private preparedLaunchEnvironments = new Map<string, Record<string, string>>();
-
 	private readonly resourceReloadTails = new Map<string, Promise<void>>();
-
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
@@ -2356,15 +2353,12 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
-			if (activeMatches.length === 1) {
 				return this.reuseWorkerForCreate(
 					activeMatches[0]!.worker,
 					ownerClientId,
 					command.sessionPath,
 					command.launchEnv,
 				);
-
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2376,10 +2370,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
-				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
-			if (existing) {
 				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, createCommand.launchEnv);
-
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -3819,7 +3810,6 @@ export class DaemonSupervisor {
 				throw new Error(`Unknown active session: ${command.activeSessionId}`);
 			}
 			this.assertTelemetryAttachAllowed(ownedWorker, command.telemetryDisabled);
-			ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
 			if (command.launchEnv !== undefined) {
 				const digest = launchEnvironmentDigest(command.launchEnv);
 				if (ownedWorker.descriptor.launchEnvDigest && ownedWorker.descriptor.launchEnvDigest !== digest) {
@@ -3834,7 +3824,6 @@ export class DaemonSupervisor {
 					throw new Error("Session launch environment is immutable");
 				}
 			}
-
 			if (!ownedWorker.client || ownedWorker.descriptor.lifecycle !== "ready") {
 				if (!ownedWorker.launchEnv) {
 					throw new Error("Client-owned session recovery requires the owning client environment");
@@ -3865,7 +3854,6 @@ export class DaemonSupervisor {
 				throw new Error("Session launch environment is immutable");
 			}
 		}
-
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {

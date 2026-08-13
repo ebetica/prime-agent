@@ -936,6 +936,7 @@ export interface PreparedSessionReload {
 
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	onlyIfIdle?: boolean;
 }
 
 interface ToolDefinitionEntry {
@@ -6386,6 +6387,8 @@ export class AgentSession {
 		this.resumeQueuedWork();
 		this._emitQueueUpdate();
 		return "applied";
+	}
+
 	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
 		return visibleSessionActionProjection(this._actionStore.queuedActions())
 			.filter((action) => action.payload.kind === "turn")
@@ -6407,7 +6410,6 @@ export class AgentSession {
 		if (removed.length === 0) return false;
 		this._emitQueueUpdate();
 		return true;
-
 	}
 
 	get queuedActionCount(): number {

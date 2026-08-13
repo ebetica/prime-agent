@@ -719,6 +719,8 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			telemetryDisabled: true,
 		});
+	});
+
 	it("requires daemon capability before sending an idle-only reload", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");

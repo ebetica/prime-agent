@@ -298,7 +298,6 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"mutate_queued_message",
 	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
-
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
@@ -4268,6 +4267,8 @@ export class AgentDaemon {
 					command.mutation,
 				);
 				return success(command.id, "mutate_queued_message", { status });
+			}
+
 			case "get_queued_user_actions": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_queued_user_actions", state.runtime.session.getQueuedUserActions());
@@ -4280,7 +4281,6 @@ export class AgentDaemon {
 					"cancel_queued_action",
 					state.runtime.session.cancelQueuedAction(command.actionId),
 				);
-
 			}
 
 			case "clear_queue": {
@@ -4375,6 +4375,7 @@ export class AgentDaemon {
 				}
 				await session.setModel(model, {
 					waitForExtensions: !(session.isStreaming || session.isCompacting),
+					onlyIfIdle: command.ifIdle === true,
 				});
 				return success(command.id, "set_model", model);
 			}

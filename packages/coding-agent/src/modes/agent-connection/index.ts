@@ -30,7 +30,6 @@ export type {
 	AgentConnectionPromptOptions,
 	AgentConnectionQueuedMessageMutationStatus,
 	AgentConnectionQueuedUserAction,
-
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReplayInfo,
