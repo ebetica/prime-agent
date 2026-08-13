@@ -127,10 +127,13 @@ function writeCompact(path: string, entries: readonly PersistedRlmSubagentRegist
 	}
 }
 
-export async function readRlmSubagentRegistry(path: string): Promise<PersistedRlmSubagentRegistryEntry[]> {
+export async function readRlmSubagentRegistry(
+	path: string,
+	options: { compact?: boolean } = {},
+): Promise<PersistedRlmSubagentRegistryEntry[]> {
 	return withRegistryOwner(path, () => {
 		const loaded = loadLatest(path);
-		if (loaded.compact) writeCompact(path, loaded.entries);
+		if (options.compact !== false && loaded.compact) writeCompact(path, loaded.entries);
 		return loaded.entries;
 	});
 }

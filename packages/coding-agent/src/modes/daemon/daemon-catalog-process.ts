@@ -161,7 +161,7 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	const parent = await readSessionInfo(parentPath);
 	if (!parent) return [target];
 	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
-	const latest = await readRlmSubagentRegistry(registryPath);
+	const latest = await readRlmSubagentRegistry(registryPath, { compact: false });
 	const siblingPaths = new Set<string>([resolve(target.path)]);
 	for (const entry of latest) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")

@@ -2695,6 +2695,10 @@ export class DaemonSupervisor {
 						operation: "recovery_hold",
 					});
 				worker.pendingRecovery = undefined;
+				if (worker.descriptor.createCommand.workerRecovery) {
+					const { workerRecovery: _recovery, ...acknowledgedCreateCommand } = worker.descriptor.createCommand;
+					worker.descriptor.createCommand = acknowledgedCreateCommand;
+				}
 			}
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
@@ -3373,13 +3377,16 @@ export class DaemonSupervisor {
 				),
 			)
 			.digest("hex");
+		if (interrupted.size > 256 || [...interrupted.values()].some((value) => value.operations.size > 32)) {
+			throw new Error("Worker recovery facts exceed the bounded replacement payload");
+		}
 		worker.pendingRecovery = {
 			version: 1,
 			generation,
-			interrupted: [...interrupted.values()].slice(0, 256).map((value) => ({
+			interrupted: [...interrupted.values()].map((value) => ({
 				activeSessionId: value.activeSessionId,
 				sessionFile: value.sessionFile,
-				operations: [...value.operations].slice(0, 32),
+				operations: [...value.operations],
 			})),
 		};
 	}
