@@ -1274,12 +1274,32 @@ export class AgentDaemon {
 	): Promise<void> {
 		const recovery = command.workerRecovery;
 		if (!recovery) return;
-		if (recovery.version !== 1 || recovery.interrupted.length > 256)
-			throw new Error("Unsupported or oversized worker recovery payload");
+		if (
+			recovery.version !== 1 ||
+			!/^[0-9a-f]{64}$/.test(recovery.generation) ||
+			!Array.isArray(recovery.interrupted) ||
+			recovery.interrupted.length > 256
+		)
+			throw new Error("Unsupported or malformed worker recovery payload");
 		const rootFile = root.runtime.session.sessionFile;
 		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
 		const rootPath = resolve(rootFile);
 		for (const item of recovery.interrupted) {
+			if (
+				typeof item.activeSessionId !== "string" ||
+				item.activeSessionId.length === 0 ||
+				item.activeSessionId.length > 256 ||
+				typeof item.sessionFile !== "string" ||
+				item.sessionFile.length === 0 ||
+				item.sessionFile.length > 4096 ||
+				!Array.isArray(item.operations) ||
+				item.operations.length > 32 ||
+				item.operations.some(
+					(operation) => typeof operation !== "string" || operation.length === 0 || operation.length > 256,
+				)
+			) {
+				throw new Error("Malformed worker recovery target");
+			}
 			const sessionFile = resolve(item.sessionFile);
 			let cursor = sessionFile;
 			let owned = cursor === rootPath;
@@ -1289,7 +1309,7 @@ export class AgentDaemon {
 				cursor = resolve(dirname(cursor), header.parentSession);
 				owned = cursor === rootPath;
 			}
-			if (item.operations.length > 32 || !owned) throw new Error("Worker recovery target is outside its owned root");
+			if (!owned) throw new Error("Worker recovery target is outside its owned root");
 			await reconcileInterruptedRlmChild(sessionFile);
 			const target = SessionManager.open(sessionFile);
 			const exists = target
