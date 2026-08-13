@@ -66,8 +66,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 adds authenticated, durable planned-restart handoffs.
 // Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 22 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-eb48ac5a9731";
+// Revision 23 adds conditional run stop and atomic ID-addressed queue withdrawal.
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-3782503c912b";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -111,7 +112,9 @@ export type DaemonServerCapability =
 	| "atomic_resource_reload"
 	| "queued_action_cancellation"
 	| "planned_restart_handoff"
-	| "planned_restart_handoff_lifecycle";
+	| "planned_restart_handoff_lifecycle"
+	| "atomic_stop"
+	| "atomic_queue_withdrawal";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -160,6 +163,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"queued_action_cancellation",
 	"planned_restart_handoff",
 	"planned_restart_handoff_lifecycle",
+	"atomic_stop",
+	"atomic_queue_withdrawal",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -598,6 +603,12 @@ export type DaemonCommand =
 	| { id?: string; type: "abort"; activeSessionId: string }
 	| {
 			id?: string;
+			type: "stop_active_run";
+			activeSessionId: string;
+			expectedRunInstanceId: string;
+	  }
+	| {
+			id?: string;
 			type: "start_side_question";
 			activeSessionId: string;
 			sideQuestionId: string;
@@ -641,6 +652,7 @@ export type DaemonCommand =
 	  }
 	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
 	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
+	| { id?: string; type: "withdraw_queued_actions"; activeSessionId: string; actionIds: string[] }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -849,6 +861,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	stop_active_run: { minProtocol: 7, minSchemaRevision: 23, capability: "atomic_stop" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -871,6 +884,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
 	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
 	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
+	withdraw_queued_actions: { minProtocol: 7, minSchemaRevision: 23, capability: "atomic_queue_withdrawal" },
 
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,

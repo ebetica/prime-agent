@@ -19,10 +19,19 @@ export type QueuedMessageMutation =
 	| { type: "replace"; text: string; images?: ImageContent[]; lane: QueuedMessageLane };
 export type QueuedMessageMutationStatus = "applied" | "rejected" | "invalid";
 
+export interface QueuedUserActionDescriptor {
+	id: string;
+	text: string;
+	delivery: "steering" | "followUp";
+}
+
 export interface SessionActionSnapshot {
 	queuedCount: number;
 	steering: readonly string[];
 	followUps: readonly string[];
+	/** Authoritative FIFO projection for atomic ID-addressed withdrawal. */
+	queuedUserActions?: readonly QueuedUserActionDescriptor[];
+	activeRunInstanceId?: string;
 	active?: {
 		kind: "turn" | "session_command";
 		phase: "preparing" | "committing" | "running";

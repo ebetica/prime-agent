@@ -4056,6 +4056,15 @@ export class AgentDaemon {
 				return success(command.id, "abort");
 			}
 
+			case "stop_active_run": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"stop_active_run",
+					await state.runtime.session.stopActiveRun(command.expectedRunInstanceId),
+				);
+			}
+
 			case "start_side_question": {
 				const state = this.getSessionState(command.activeSessionId);
 				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
@@ -4282,6 +4291,13 @@ export class AgentDaemon {
 					"cancel_queued_action",
 					state.runtime.session.cancelQueuedAction(command.actionId),
 				);
+			}
+
+			case "withdraw_queued_actions": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "withdraw_queued_actions", {
+					withdrawn: await state.runtime.session.withdrawQueuedUserActions(command.actionIds),
+				});
 			}
 
 			case "clear_queue": {

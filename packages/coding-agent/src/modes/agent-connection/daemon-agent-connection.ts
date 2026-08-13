@@ -572,6 +572,29 @@ export class DaemonAgentConnection implements AgentConnection {
 			actionId: id,
 		});
 	}
+
+	async withdrawQueuedActions(ids: readonly string[]): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		if (!this.client.supportsServerCapability("atomic_queue_withdrawal")) {
+			throw new DaemonCapabilityUnavailableError("withdraw_queued_actions", "atomic_queue_withdrawal");
+		}
+		const data = await this.requestData<{ withdrawn: AgentConnectionQueuedUserAction[] }>({
+			type: "withdraw_queued_actions",
+			activeSessionId: this.activeSessionId,
+			actionIds: [...ids],
+		});
+		return data.withdrawn;
+	}
+
+	async stopActiveRun(expectedRunInstanceId: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
+		if (!this.client.supportsServerCapability("atomic_stop")) {
+			throw new DaemonCapabilityUnavailableError("stop_active_run", "atomic_stop");
+		}
+		return this.requestData({
+			type: "stop_active_run",
+			activeSessionId: this.activeSessionId,
+			expectedRunInstanceId,
+		});
+	}
 	async clearQueue(): Promise<AgentConnectionQueueState> {
 		return this.requestData<AgentConnectionQueueState>({
 			type: "clear_queue",

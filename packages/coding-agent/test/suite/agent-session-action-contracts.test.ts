@@ -111,4 +111,33 @@ describe("AgentSession action contracts", () => {
 		expect(inputHandlerRuns).toBe(0);
 		expect(extensionCommandRuns).toBe(0);
 	});
+
+	it("withdraws queued operator messages atomically by stable identity", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+		await harness.session.prompt("same", { streamingBehavior: "followUp" });
+		await harness.session.prompt("same", { streamingBehavior: "followUp" });
+		await harness.session.prompt("keep", { streamingBehavior: "followUp" });
+		const queued = harness.session.getSessionActionSnapshot().queuedUserActions!;
+		expect(queued.map((item) => item.text)).toEqual(["same", "same", "keep"]);
+
+		const withdrawn = await harness.session.withdrawQueuedUserActions([queued[1].id]);
+		expect(withdrawn).toEqual([queued[1]]);
+		expect(harness.session.getSessionActionSnapshot().queuedUserActions).toEqual([queued[0], queued[2]]);
+		expect(await harness.session.withdrawQueuedUserActions([queued[1].id])).toEqual([]);
+	});
+
+	it("makes matched stop retryable without aborting a replacement run", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as { _activeRunInstanceId?: string; abort(): Promise<void> };
+		internals._activeRunInstanceId = "run-a";
+		internals.abort = async () => {};
+		const run = harness.session.getSessionActionSnapshot().activeRunInstanceId;
+		expect(run).toBe("run-a");
+		expect(await harness.session.stopActiveRun(run!)).toEqual({ status: "stopped" });
+		expect(await harness.session.stopActiveRun(run!)).toEqual({ status: "already_stopped" });
+		expect(await harness.session.stopActiveRun("not-the-run")).toEqual({ status: "stale" });
+	});
 });
