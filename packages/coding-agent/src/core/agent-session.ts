@@ -10122,7 +10122,12 @@ export class AgentSession {
 	}
 
 	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
+		const scoped =
+			this._scopedModels.length > 0
+				? new Set(this._scopedModels.map(({ model }) => `${model.provider}/${model.id}`.toLowerCase()))
+				: undefined;
 		return (await this._modelRegistry.getExecutableModels()).filter((model) => {
+			if (scoped && !scoped.has(`${model.provider}/${model.id}`.toLowerCase())) return false;
 			const status = this._modelRegistry.getProviderAuthStatus(model.provider);
 			return status.source !== "stale" && status.label !== "expired";
 		});
