@@ -77,6 +77,18 @@ function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = 
 	return createHarness({ ...options, persistSession: true });
 }
 
+function userTextsFromAgent(harness: Harness): string[] {
+	return harness.session.agent.state.messages
+		.filter((message) => message.role === "user")
+		.flatMap((message) =>
+			typeof message.content === "string"
+				? [message.content]
+				: message.content
+						.filter((part): part is { type: "text"; text: string } => part.type === "text")
+						.map((part) => part.text),
+		);
+}
+
 function agentPromptText(id: string, body: string): string {
 	return `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${id}\n\n${body}`;
 }
@@ -372,32 +384,41 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it.each([
-		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort() },
+		// An ordinary abort settles to idle and the backlog resumes in order, so the
+		// queued follow-up is delivered rather than left waiting for another prompt.
+		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort(), resumes: true },
+		// A restart abort must leave it queued: the manifest carries queued input
+		// across the replacement instead of starting a turn during teardown.
 		{
 			name: "abortForUpdateRestart",
 			abort: (harness: Harness) => harness.session.abortForUpdateRestart(),
+			resumes: false,
 		},
-	])("cancels scheduled post-compaction continuation at $name without dropping queued input", async ({ abort }) => {
-		vi.useFakeTimers();
-		const harness = await createAutoRefineHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as AutoRefineInternals;
-		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+	])(
+		"cancels scheduled post-compaction continuation at $name without dropping queued input",
+		async ({ abort, resumes }) => {
+			vi.useFakeTimers();
+			const harness = await createAutoRefineHarness();
+			harnesses.push(harness);
+			const internals = harness.session as unknown as AutoRefineInternals;
+			const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 
-		try {
-			internals._schedulePostCompactionContinue();
-			await harness.session.followUp("queued across abort");
+			try {
+				internals._schedulePostCompactionContinue();
+				await harness.session.followUp("queued across abort");
 
-			abort(harness);
-			await vi.advanceTimersByTimeAsync(100);
+				abort(harness);
+				await vi.advanceTimersByTimeAsync(100);
 
-			expect(continueAgent).not.toHaveBeenCalled();
-			expect(internals._postCompactionContinuationScheduled).toBe(false);
-			expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
+				expect(continueAgent).not.toHaveBeenCalled();
+				expect(internals._postCompactionContinuationScheduled).toBe(false);
+				expect(harness.session.getFollowUpMessages()).toEqual(resumes ? [] : ["queued across abort"]);
+				expect(userTextsFromAgent(harness)).toEqual(resumes ? ["queued across abort"] : []);
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
 		vi.useFakeTimers();

@@ -5489,14 +5489,24 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
+		this._assertSessionActionAdmissionOpen();
+		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
+			throw new Error("Cannot admit a session action while queued session input is suspended.");
+		}
+	}
+
+	/**
+	 * The admission checks that also bind internal admission. Restoring queued work
+	 * and promoting it once the agent reaches idle both run while the input pump is
+	 * still suspended by an abort, so the suspended-pump gate above belongs to the
+	 * public and direct-turn entry points alone.
+	 */
+	private _assertSessionActionAdmissionOpen(): void {
 		if (this._resourceReloadInProgress) {
 			throw new Error("Cannot admit a session action while resources are reloading.");
 		}
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
-		}
-		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
-			throw new Error("Cannot admit a session action while queued session input is suspended.");
 		}
 	}
 
@@ -5513,7 +5523,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		this._assertSessionActionAdmissionAvailable();
+		this._assertSessionActionAdmissionOpen();
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
