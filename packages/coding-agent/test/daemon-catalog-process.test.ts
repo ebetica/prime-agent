@@ -129,11 +129,11 @@ describe("daemon catalog selector resolution", () => {
 			return { parent, child, registry };
 		}
 
-		it("appends one interrupted terminal transition and one truthful parent notice", () => {
+		it("appends one interrupted terminal transition and one truthful parent notice", async () => {
 			const { parent, child, registry } = fixture("running");
 
-			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(true);
-			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
+			expect(await reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(true);
+			expect(await reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
 
 			const rows = readFileSync(registry, "utf8")
 				.trim()
@@ -152,10 +152,10 @@ describe("daemon catalog selector resolution", () => {
 			});
 		});
 
-		it("does not rewrite a genuinely completed child", () => {
+		it("does not rewrite a genuinely completed child", async () => {
 			const { child, registry } = fixture("completed");
 			const before = readFileSync(registry, "utf8");
-			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
+			expect(await reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
 			expect(readFileSync(registry, "utf8")).toBe(before);
 		});
 	});

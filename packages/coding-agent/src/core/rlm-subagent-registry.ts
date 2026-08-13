@@ -7,18 +7,27 @@
  * removes its row, so both storage and steady-state operations are O(live).
  */
 import { randomUUID } from "node:crypto";
-import {
-	closeSync,
-	existsSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	writeFileSync,
-} from "node:fs";
-import { dirname } from "node:path";
-import { lockSync } from "proper-lockfile";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+const registryQueues = new Map<string, Promise<void>>();
+async function withRegistryOwner<T>(path: string, action: () => T | Promise<T>): Promise<T> {
+	const key = resolve(path);
+	const previous = registryQueues.get(key) ?? Promise.resolve();
+	let release!: () => void;
+	const current = new Promise<void>((resolveRelease) => {
+		release = resolveRelease;
+	});
+	const tail = previous.then(() => current);
+	registryQueues.set(key, tail);
+	await previous;
+	try {
+		return await action();
+	} finally {
+		release();
+		if (registryQueues.get(key) === tail) registryQueues.delete(key);
+	}
+}
 
 export interface PersistedRlmSubagentRegistryEntry {
 	type: "rlm_subagent";
@@ -108,49 +117,31 @@ function writeCompact(path: string, entries: readonly PersistedRlmSubagentRegist
 	}
 }
 
-function withRegistryLock<T>(path: string, action: () => T): T {
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	let release: (() => void) | undefined;
-	for (let attempt = 0; attempt < 100; attempt++) {
-		try {
-			release = lockSync(path, { realpath: false, lockfilePath: `${path}.lock`, stale: 30_000 });
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === 99) throw error;
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-		}
-	}
-	if (!release) throw new Error(`Could not coordinate RLM subagent registry: ${path}`);
-	try {
-		return action();
-	} finally {
-		release();
-	}
-}
-
-export function readRlmSubagentRegistry(path: string): PersistedRlmSubagentRegistryEntry[] {
-	return withRegistryLock(path, () => {
+export async function readRlmSubagentRegistry(path: string): Promise<PersistedRlmSubagentRegistryEntry[]> {
+	return withRegistryOwner(path, () => {
 		const loaded = loadLatest(path);
 		if (loaded.compact) writeCompact(path, loaded.entries);
 		return loaded.entries;
 	});
 }
 
-export function mutateRlmSubagentRegistry<T>(
+export async function mutateRlmSubagentRegistry<T>(
 	path: string,
 	mutation: (latest: ReadonlyMap<string, PersistedRlmSubagentRegistryEntry>) => {
 		result: T;
 		entry?: PersistedRlmSubagentRegistryEntry;
 		deleteChildId?: string;
+		afterWrite?: () => void;
 	},
-): T {
-	return withRegistryLock(path, () => {
+): Promise<T> {
+	return withRegistryOwner(path, () => {
 		const loaded = loadLatest(path);
 		const latest = new Map(loaded.entries.map((entry) => [entry.childId, entry]));
 		const change = mutation(latest);
 		if (change.entry) latest.set(change.entry.childId, change.entry);
 		if (change.deleteChildId) latest.delete(change.deleteChildId);
 		if (loaded.compact || change.entry || change.deleteChildId) writeCompact(path, [...latest.values()]);
+		change.afterWrite?.();
 		return change.result;
 	});
 }

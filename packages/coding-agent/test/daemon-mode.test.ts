@@ -797,7 +797,7 @@ describe("daemon mode helpers", () => {
 			);
 			if (!childState?.runtime.session.sessionFile) throw new Error("Missing child state");
 			const host = internals.createSubagentRuntimeHost(parentState);
-			expect(host.completeRlmSubagentRuntime?.("child-1", childRuntime.session)).toBe(true);
+			expect(await host.completeRlmSubagentRuntime?.("child-1", childRuntime.session)).toBe(true);
 			await (
 				daemon as unknown as { closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void> }
 			).closeSession(childState, "shutdown");
@@ -5663,8 +5663,8 @@ describe("daemon mode helpers", () => {
 			const entry = JSON.parse(readFileSync(registryPath, "utf8").trim()) as Record<string, unknown>;
 			writeFileSync(registryPath, `${JSON.stringify({ ...entry, status: "running" })}\n`);
 
-			expect(reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(true);
-			expect(reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(false);
+			expect(await reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(true);
+			expect(await reconcileInterruptedRlmChild(fixture.childSessionFile)).toBe(false);
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
 				findPassiveRlmSubagent(target: string): Promise<unknown>;

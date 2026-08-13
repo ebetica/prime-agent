@@ -35,7 +35,7 @@ afterEach(() => {
 });
 
 describe("RLM subagent registry", () => {
-	it("compacts legacy history to one retained latest row and prunes deletion", () => {
+	it("compacts legacy history to one retained latest row and prunes deletion", async () => {
 		const path = registry();
 		writeFileSync(
 			path,
@@ -43,17 +43,17 @@ describe("RLM subagent registry", () => {
 				.map((value) => JSON.stringify(value))
 				.join("\n")}\n`,
 		);
-		expect(readRlmSubagentRegistry(path)).toEqual([entry("kept", "interrupted")]);
+		expect(await readRlmSubagentRegistry(path)).toEqual([entry("kept", "interrupted")]);
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
-		mutateRlmSubagentRegistry(path, (latest) => ({
+		await mutateRlmSubagentRegistry(path, (latest) => ({
 			result: undefined,
 			deleteChildId: latest.has("kept") ? "kept" : undefined,
 		}));
-		expect(readRlmSubagentRegistry(path)).toEqual([]);
+		expect(await readRlmSubagentRegistry(path)).toEqual([]);
 		expect(readFileSync(path, "utf8")).toBe("");
 	});
 
-	it("migrates 100k historical transitions once, leaving subsequent work O(live)", () => {
+	it("migrates 100k historical transitions once, leaving subsequent work O(live)", async () => {
 		const path = registry();
 		const rows: string[] = [];
 		for (let i = 0; i < 50_000; i++) {
@@ -62,20 +62,20 @@ describe("RLM subagent registry", () => {
 		}
 		rows.push(JSON.stringify(entry("live", "running")));
 		writeFileSync(path, `${rows.join("\n")}\n`);
-		expect(readRlmSubagentRegistry(path).map((value) => value.childId)).toEqual(["live"]);
+		expect((await readRlmSubagentRegistry(path)).map((value) => value.childId)).toEqual(["live"]);
 		const compactBytes = readFileSync(path).byteLength;
 		expect(compactBytes).toBeLessThan(1_000);
-		mutateRlmSubagentRegistry(path, (latest) => ({
+		await mutateRlmSubagentRegistry(path, (latest) => ({
 			result: undefined,
 			entry: { ...latest.get("live")!, status: "interrupted", updatedAt: "interrupted" },
 		}));
 		expect(readFileSync(path).byteLength).toBeLessThan(1_000);
-		expect(readRlmSubagentRegistry(path)[0]?.status).toBe("interrupted");
+		expect((await readRlmSubagentRegistry(path))[0]?.status).toBe("interrupted");
 	});
 
-	it("fails closed on malformed non-tail rows", () => {
+	it("fails closed on malformed non-tail rows", async () => {
 		const path = registry();
 		writeFileSync(path, `${JSON.stringify(entry("live", "running"))}\nnot json\n`);
-		expect(() => readRlmSubagentRegistry(path)).toThrow("Malformed RLM subagent registry row 2");
+		await expect(readRlmSubagentRegistry(path)).rejects.toThrow("Malformed RLM subagent registry row 2");
 	});
 });

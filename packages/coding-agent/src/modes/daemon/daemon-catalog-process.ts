@@ -3,11 +3,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
-import {
-	mutateRlmSubagentRegistry,
-	type PersistedRlmSubagentRegistryEntry,
-	readRlmSubagentRegistry,
-} from "../../core/rlm-subagent-registry.js";
+import { mutateRlmSubagentRegistry, readRlmSubagentRegistry } from "../../core/rlm-subagent-registry.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
@@ -71,54 +67,48 @@ const RLM_CHILD_INTERRUPTED_CUSTOM_TYPE = "prime-agent.rlm_child_interrupted";
  * The registry transition is the durable truth; the parent notice is deduplicated
  * from its own transcript so retries after either append remain idempotent.
  */
-export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
+export async function reconcileInterruptedRlmChild(sessionPath: string): Promise<boolean> {
 	const child = SessionManager.open(sessionPath);
 	const header = child.getHeader();
 	if (!header?.parentSession) return false;
 	const parentPath = resolve(dirname(sessionPath), header.parentSession);
-	const parent = SessionManager.open(parentPath);
-	const registryPath = join(
-		dirname(dirname(parentPath)),
-		"session-artifacts",
-		parent.getSessionId(),
-		"rlm-subagents.jsonl",
-	);
-	let entry: PersistedRlmSubagentRegistryEntry | undefined;
-	let transitioned = false;
-	mutateRlmSubagentRegistry(registryPath, (latest) => {
-		entry = [...latest.values()].find(
+	const parentSessionId = SessionManager.open(parentPath).getSessionId();
+	const registryPath = join(dirname(dirname(parentPath)), "session-artifacts", parentSessionId, "rlm-subagents.jsonl");
+	return await mutateRlmSubagentRegistry(registryPath, (latest) => {
+		const entry = [...latest.values()].find(
 			(candidate) =>
 				(candidate.status === "running" || candidate.status === "interrupted") &&
 				candidate.sessionFile === sessionPath,
 		);
-		if (!entry || typeof entry.childId !== "string") return { result: undefined };
-		transitioned = entry.status === "running";
-		return transitioned
-			? { result: undefined, entry: { ...entry, status: "interrupted", updatedAt: new Date().toISOString() } }
-			: { result: undefined };
+		if (!entry) return { result: false };
+		const transitioned = entry.status === "running";
+		const reconciledEntry = transitioned
+			? { ...entry, status: "interrupted" as const, updatedAt: new Date().toISOString() }
+			: entry;
+		return {
+			result: transitioned,
+			...(transitioned ? { entry: reconciledEntry } : {}),
+			afterWrite: () => {
+				const parent = SessionManager.open(parentPath);
+				const alreadyNotified = parent
+					.getEntries()
+					.some(
+						(candidate) =>
+							candidate.type === "custom_message" &&
+							candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
+							(candidate.details as { childId?: unknown } | undefined)?.childId === reconciledEntry.childId,
+					);
+				if (alreadyNotified) return;
+				const sessionName = reconciledEntry.sessionName;
+				parent.appendCustomMessageEntryWithRollback(
+					RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
+					`RLM child ${sessionName} (${reconciledEntry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
+					true,
+					{ childId: reconciledEntry.childId, sessionName, reason: "worker_interrupted", replayed: false },
+				);
+			},
+		};
 	});
-	if (!entry || typeof entry.childId !== "string") return false;
-	const reconciledEntry = entry;
-
-	const alreadyNotified = parent
-		.getEntries()
-		.some(
-			(candidate) =>
-				candidate.type === "custom_message" &&
-				candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
-				(candidate.details as { childId?: unknown } | undefined)?.childId === reconciledEntry.childId,
-		);
-	if (!alreadyNotified) {
-		const sessionName =
-			typeof reconciledEntry.sessionName === "string" ? reconciledEntry.sessionName : reconciledEntry.childId;
-		parent.appendCustomMessageEntryWithRollback(
-			RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
-			`RLM child ${sessionName} (${reconciledEntry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
-			true,
-			{ childId: reconciledEntry.childId, sessionName, reason: "worker_interrupted", replayed: false },
-		);
-	}
-	return transitioned;
 }
 
 const INTERRUPTED_TOOL_RESULT =
@@ -171,7 +161,7 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	const parent = await readSessionInfo(parentPath);
 	if (!parent) return [target];
 	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
-	const latest = readRlmSubagentRegistry(registryPath);
+	const latest = await readRlmSubagentRegistry(registryPath);
 	const siblingPaths = new Set<string>([resolve(target.path)]);
 	for (const entry of latest) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
@@ -346,27 +336,11 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
-<<<<<<< HEAD
-			case "mark_interrupted": {
-				const sessionManager = SessionManager.open(request.sessionPath);
-				appendInterruptedToolResults(sessionManager);
-				sessionManager.appendCustomMessageEntry(
-=======
 			case "mark_interrupted":
-				reconcileInterruptedRlmChild(request.sessionPath);
-				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
->>>>>>> a5bccfca (fix(coding-agent): reconcile crashed RLM children)
-					"prime-agent.worker_recovery",
-					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
-					false,
-					{
-						activeSessionId: request.activeSessionId,
-						operations: request.operations,
-					},
+				throw new Error(
+					"Catalog interruption mutation is unsupported; recovery is owned by the replacement worker",
 				);
-				sendCatalogMessage({ type: "response", id: request.id, success: true });
-				return;
-			}
+
 			case "shutdown":
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));
