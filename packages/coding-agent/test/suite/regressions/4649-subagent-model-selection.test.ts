@@ -55,6 +55,58 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("constrains RLM discovery and explicit overrides to a nonempty model scope", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "allowed-child" }, { id: "catalog-only" }],
+		});
+		try {
+			harness.session.setScopedModels([{ model: harness.getModel("allowed-child")! }]);
+			await expect(harness.session.findRlmModels("", 20)).resolves.toMatchObject({
+				models: [{ selector: `${provider}/allowed-child` }],
+			});
+			await expect(
+				harness.session.runRlmChild("reject the catalog-only model", {
+					model: `${provider}/catalog-only`,
+				}),
+			).rejects.toThrow("is unavailable, unauthenticated, or expired");
+
+			harness.setResponses([fauxAssistantMessage("allowed answer")]);
+			await expect(
+				harness.session.runRlmChild("use the allowed model", {
+					model: `${provider}/allowed-child`,
+				}),
+			).resolves.toMatchObject({ model: `${provider}/allowed-child` });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("preserves parent-model inheritance and an exact parent override outside scope", async () => {
+		const harness = await createHarness({
+			provider,
+			models: [{ id: "parent-model" }, { id: "allowed-child" }],
+		});
+		try {
+			harness.session.setScopedModels([{ model: harness.getModel("allowed-child")! }]);
+			harness.setResponses([
+				fauxAssistantMessage("inherited answer"),
+				fauxAssistantMessage("explicit parent answer"),
+			]);
+
+			await expect(harness.session.runRlmChild("inherit parent")).resolves.toMatchObject({
+				model: `${provider}/parent-model`,
+			});
+			await expect(
+				harness.session.runRlmChild("select exact parent", {
+					model: `${provider}/parent-model`,
+				}),
+			).resolves.toMatchObject({ model: `${provider}/parent-model` });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("omits providers whose credentials are marked expired", async () => {
 		const harness = await createHarness({ provider, models: [{ id: "parent-model" }, { id: "child-model" }] });
 		try {
