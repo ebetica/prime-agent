@@ -393,8 +393,10 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
-	const status = runStatus ?? (session.isSessionActive ? "running" : "done");
-	const isActive = status === "running" || session.isSessionActive;
+	const durableTerminal = session._persistedRlmTerminalStatus;
+	const status =
+		runStatus ?? (durableTerminal === "completed" ? "done" : durableTerminal === "interrupted" ? "error" : "running");
+	const isActive = status === "running";
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,

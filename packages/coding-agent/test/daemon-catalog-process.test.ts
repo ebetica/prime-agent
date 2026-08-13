@@ -1,11 +1,16 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import {
+<<<<<<< HEAD
 	appendInterruptedToolResults,
 	listSavedSessionSiblings,
+=======
+	listSavedSessionSiblings,
+	reconcileInterruptedRlmChild,
+>>>>>>> a5bccfca (fix(coding-agent): reconcile crashed RLM children)
 	resolveCatalogSessionMatch,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 
@@ -95,6 +100,64 @@ describe("daemon catalog selector resolution", () => {
 		];
 
 		expect(() => resolveCatalogSessionMatch(sessions, "target")).toThrow('Ambiguous session selector "target"');
+	});
+	describe("interrupted RLM reconciliation", () => {
+		function fixture(status: "running" | "completed") {
+			const root = mkdtempSync(join(tmpdir(), "prime-catalog-interrupted-"));
+			const sessionDir = join(root, "sessions");
+			const parent = SessionManager.create(root, sessionDir);
+			parent.newSession();
+			parent.appendSessionInfo("parent");
+			const childDir = join(root, "child");
+			const child = SessionManager.create(root, childDir);
+			child.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+			child.appendSessionInfo("child");
+			const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
+			mkdirSync(dirname(registry), { recursive: true });
+			writeFileSync(
+				registry,
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "sub-crashed",
+					sessionName: "child",
+					sessionDir: childDir,
+					sessionFile: child.getSessionFile(),
+					status,
+					updatedAt: new Date(0).toISOString(),
+				})}\n`,
+			);
+			return { parent, child, registry };
+		}
+
+		it("appends one interrupted terminal transition and one truthful parent notice", () => {
+			const { parent, child, registry } = fixture("running");
+
+			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(true);
+			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
+
+			const rows = readFileSync(registry, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { status: string });
+			expect(rows.map((row) => row.status)).toEqual(["running", "interrupted"]);
+			const notices = SessionManager.open(parent.getSessionFile()!)
+				.getEntries()
+				.filter(
+					(entry) => entry.type === "custom_message" && entry.customType === "prime-agent.rlm_child_interrupted",
+				);
+			expect(notices).toHaveLength(1);
+			expect(notices[0]).toMatchObject({
+				content: expect.stringContaining("Uncertain work was not replayed"),
+				details: { childId: "sub-crashed", reason: "worker_interrupted", replayed: false },
+			});
+		});
+
+		it("does not rewrite a genuinely completed child", () => {
+			const { child, registry } = fixture("completed");
+			const before = readFileSync(registry, "utf8");
+			expect(reconcileInterruptedRlmChild(child.getSessionFile()!)).toBe(false);
+			expect(readFileSync(registry, "utf8")).toBe(before);
+		});
 	});
 });
 

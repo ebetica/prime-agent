@@ -62,8 +62,8 @@ export interface AgentSessionRuntimeMetadata {
 	parentSessionFile?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
-	/** Runtime restored from an already-persisted completed registry entry. */
-	rehydratedCompleted?: boolean;
+	/** Runtime restored from an already-persisted terminal registry entry. */
+	rehydratedTerminalStatus?: "completed" | "interrupted";
 	prompt?: string;
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;

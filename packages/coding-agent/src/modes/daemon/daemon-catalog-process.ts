@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -63,8 +64,88 @@ function deserializeSessionInfo(session: SessionInfoWire): SessionInfo {
 interface SavedRlmSubagentRegistryEntry {
 	type?: unknown;
 	childId?: unknown;
+	sessionName?: unknown;
+	sessionDir?: unknown;
 	sessionFile?: unknown;
 	status?: unknown;
+	updatedAt?: unknown;
+}
+
+const RLM_CHILD_INTERRUPTED_CUSTOM_TYPE = "prime-agent.rlm_child_interrupted";
+
+/**
+ * Reconcile a child whose worker journal proves an in-flight operation was lost.
+ * The registry transition is the durable truth; the parent notice is deduplicated
+ * from its own transcript so retries after either append remain idempotent.
+ */
+export function reconcileInterruptedRlmChild(sessionPath: string): boolean {
+	const child = SessionManager.open(sessionPath);
+	const header = child.getHeader();
+	if (!header?.parentSession) return false;
+	const parentPath = resolve(dirname(sessionPath), header.parentSession);
+	const parent = SessionManager.open(parentPath);
+	const registryPath = join(
+		dirname(dirname(parentPath)),
+		"session-artifacts",
+		parent.getSessionId(),
+		"rlm-subagents.jsonl",
+	);
+	let contents: string;
+	try {
+		contents = readFileSync(registryPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
+	for (const line of contents.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		try {
+			const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
+			if (entry.type === "rlm_subagent" && typeof entry.childId === "string") latest.set(entry.childId, entry);
+		} catch {
+			// Ignore malformed history, matching the owning worker reader.
+		}
+	}
+	const entry = [...latest.values()].find(
+		(candidate) =>
+			(candidate.status === "running" || candidate.status === "interrupted") &&
+			candidate.sessionFile === sessionPath,
+	);
+	if (!entry || typeof entry.childId !== "string") return false;
+	const transitioned = entry.status === "running";
+	if (transitioned) {
+		const interrupted = { ...entry, status: "interrupted", updatedAt: new Date().toISOString() };
+		const descriptor = openSync(registryPath, "a");
+		try {
+			writeSync(
+				descriptor,
+				`${contents.endsWith("\n") || contents.length === 0 ? "" : "\n"}${JSON.stringify(interrupted)}\n`,
+			);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+	}
+
+	const alreadyNotified = parent
+		.getEntries()
+		.some(
+			(candidate) =>
+				candidate.type === "custom_message" &&
+				candidate.customType === RLM_CHILD_INTERRUPTED_CUSTOM_TYPE &&
+				(candidate.details as { childId?: unknown } | undefined)?.childId === entry.childId,
+		);
+	if (!alreadyNotified) {
+		const sessionName = typeof entry.sessionName === "string" ? entry.sessionName : entry.childId;
+		parent.appendCustomMessageEntryWithRollback(
+			RLM_CHILD_INTERRUPTED_CUSTOM_TYPE,
+			`RLM child ${sessionName} (${entry.childId}) was interrupted when its isolated worker stopped. Uncertain work was not replayed; inspect external side effects before continuing.`,
+			true,
+			{ childId: entry.childId, sessionName, reason: "worker_interrupted", replayed: false },
+		);
+	}
+	return transitioned;
 }
 
 const INTERRUPTED_TOOL_RESULT =
@@ -308,10 +389,16 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
+<<<<<<< HEAD
 			case "mark_interrupted": {
 				const sessionManager = SessionManager.open(request.sessionPath);
 				appendInterruptedToolResults(sessionManager);
 				sessionManager.appendCustomMessageEntry(
+=======
+			case "mark_interrupted":
+				reconcileInterruptedRlmChild(request.sessionPath);
+				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
+>>>>>>> a5bccfca (fix(coding-agent): reconcile crashed RLM children)
 					"prime-agent.worker_recovery",
 					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 					false,
