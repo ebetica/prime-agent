@@ -62,8 +62,10 @@ import type {
 	AgentConnectionQueuedMessageLane,
 	AgentConnectionQueuedMessageMutation,
 	AgentConnectionQueuedMessageMutationStatus,
+	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
+	AgentConnectionReloadOptions,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSavedSessionScope,
@@ -74,6 +76,7 @@ import type {
 	AgentConnectionSessionTreeFlatNode,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
+	AgentConnectionSetModelOptions,
 	AgentConnectionSideQuestionEvent,
 	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
@@ -549,6 +552,26 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.status;
 	}
 
+	async getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]> {
+		if (!this.client.supportsServerCapability("queued_action_cancellation")) {
+			throw new DaemonCapabilityUnavailableError("get_queued_user_actions", "queued_action_cancellation");
+		}
+		return this.requestData<AgentConnectionQueuedUserAction[]>({
+			type: "get_queued_user_actions",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async cancelQueuedAction(id: string): Promise<boolean> {
+		if (!this.client.supportsServerCapability("queued_action_cancellation")) {
+			throw new DaemonCapabilityUnavailableError("cancel_queued_action", "queued_action_cancellation");
+		}
+		return this.requestData<boolean>({
+			type: "cancel_queued_action",
+			activeSessionId: this.activeSessionId,
+			actionId: id,
+		});
+	}
 	async clearQueue(): Promise<AgentConnectionQueueState> {
 		return this.requestData<AgentConnectionQueueState>({
 			type: "clear_queue",
@@ -985,12 +1008,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
+	async setModel(
+		provider: string,
+		modelId: string,
+		options: AgentConnectionSetModelOptions = {},
+	): Promise<AgentConnectionModel> {
 		return this.requestData<AgentConnectionModel>({
 			type: "set_model",
 			activeSessionId: this.activeSessionId,
 			provider,
 			modelId,
+			ifIdle: options.ifIdle === true,
 		});
 	}
 
@@ -1088,8 +1116,21 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "abort_retry", activeSessionId: this.activeSessionId });
 	}
 
-	async reload(): Promise<void> {
-		await this.requestOk({ type: "reload", activeSessionId: this.activeSessionId });
+	async reload(options: AgentConnectionReloadOptions = {}): Promise<void> {
+		if (options.ifIdle && !this.client.supportsServerCapability("atomic_reload")) {
+			throw new DaemonCapabilityUnavailableError("reload", "atomic_reload");
+		}
+		const { ifIdle, ...resources } = options;
+		const replacesResources = Object.keys(resources).length > 0;
+		if (replacesResources && !this.client.supportsServerCapability("atomic_resource_reload")) {
+			throw new DaemonCapabilityUnavailableError("reload", "atomic_resource_reload");
+		}
+		await this.requestOk({
+			type: "reload",
+			activeSessionId: this.activeSessionId,
+			ifIdle,
+			...(replacesResources ? { resources } : {}),
+		});
 	}
 
 	async newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }> {

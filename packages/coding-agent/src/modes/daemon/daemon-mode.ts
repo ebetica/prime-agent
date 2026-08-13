@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
@@ -76,8 +77,18 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import {
+	type AgentSession,
+	type PreparedSessionReload,
+	type PromptOptions,
+	rlmChildLabel,
+} from "../../core/agent-session.js";
+import {
+	type AgentSessionResourceConfig,
+	type AgentSessionRuntimeConfig,
+	isAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
 	type AgentSessionRuntimeMetadata,
@@ -155,6 +166,8 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPlannedRestartBlocker,
+	type DaemonPlannedRestartHandoff,
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
@@ -164,6 +177,8 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
+	isDaemonRestartLaunchEnvKey,
+	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -252,6 +267,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"follow_up",
 	"restore_next_turn",
 	"restore_actions",
+	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -281,6 +297,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",
 	"get_queue",
 	"mutate_queued_message",
+	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
@@ -328,6 +345,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
+	"register_planned_restart_handoff",
+	"cancel_planned_restart_handoff",
+	"acknowledge_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -435,6 +455,8 @@ export class AgentDaemon {
 		deadline?: ReturnType<typeof setTimeout>;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		strict: boolean;
+		handoff?: DaemonPlannedRestartHandoff;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
 			state: ActiveSessionState;
@@ -445,6 +467,14 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly pendingResourceReloads = new Map<
+		string,
+		{
+			activeSessionId: string;
+			prepared: PreparedSessionReload;
+			rollbackRuntimeConfig: () => void;
+		}
+	>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -1194,6 +1224,7 @@ export class AgentDaemon {
 		runtime: AgentSessionRuntime,
 		name?: string,
 		clientEnv?: Record<string, string>,
+		launchEnv?: Record<string, string>,
 		onStateCreated?: (state: ActiveSessionState) => void,
 		runtimeOpenGuard?: RuntimeOpenGuard,
 		onStateBound?: (state: ActiveSessionState) => void,
@@ -1216,6 +1247,7 @@ export class AgentDaemon {
 			eventGeneration: createActiveSessionId(),
 			lastEventSequence: 0,
 			clientEnv,
+			launchEnv: launchEnv === undefined ? undefined : { ...launchEnv },
 		};
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
@@ -1523,6 +1555,7 @@ export class AgentDaemon {
 				runtime,
 				command.name,
 				clientEnv,
+				command.launchEnv,
 				(state) => {
 					stateRef = state;
 				},
@@ -2381,6 +2414,7 @@ export class AgentDaemon {
 			runtime,
 			undefined,
 			parentState.clientEnv,
+			parentState.launchEnv,
 			(state) => {
 				stateRef = state;
 			},
@@ -2780,6 +2814,7 @@ export class AgentDaemon {
 				runtime,
 				undefined,
 				hydrationEnv,
+				parentState.launchEnv,
 				(createdState) => {
 					stateRef = createdState;
 				},
@@ -3384,8 +3419,40 @@ export class AgentDaemon {
 					this.writeWorkerSuccess(client, command, receipt);
 					return;
 				}
+				case "worker_list_resource_reloads":
+					this.writeWorkerSuccess(client, command, {
+						transactions: [...this.pendingResourceReloads.entries()].map(([transactionId, pending]) => ({
+							transactionId,
+							activeSessionId: pending.activeSessionId,
+							resources: pending.prepared.resources,
+						})),
+					});
+					return;
+				case "worker_commit_resource_reload": {
+					const pending = this.pendingResourceReloads.get(command.transactionId);
+					if (!pending) throw new Error("Unknown resource reload transaction");
+					pending.prepared.commit();
+					this.pendingResourceReloads.delete(command.transactionId);
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
+				case "worker_rollback_resource_reload": {
+					const pending = this.pendingResourceReloads.get(command.transactionId);
+					if (!pending) {
+						this.writeWorkerSuccess(client, command);
+						return;
+					}
+					pending.rollbackRuntimeConfig();
+					try {
+						await pending.prepared.rollback();
+					} finally {
+						this.pendingResourceReloads.delete(command.transactionId);
+					}
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
 				case "worker_prepare_update": {
-					const transaction = this.beginUpdateRestartTransaction(client);
+					const transaction = this.beginUpdateRestartTransaction(client, command.strict === true, command.handoff);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
 					this.writeWorkerSuccess(client, command, manifest);
 					return;
@@ -3415,6 +3482,15 @@ export class AgentDaemon {
 					if (!this.supervisorClaims.has(client)) {
 						setImmediate(() => void this.shutdown(0));
 					}
+					return;
+				}
+				case "worker_restore_planned_restart_handoff": {
+					const state = this.getSessionState(command.activeSessionId);
+					if (state.runtime.session.sessionId !== command.sessionId) {
+						throw new Error("Planned restart target session identity does not match");
+					}
+					const status = state.runtime.session.admitPlannedRestartContinuation(command.actionId, command.message);
+					this.writeWorkerSuccess(client, command, { status });
 					return;
 				}
 				case "worker_cancel_update": {
@@ -4193,6 +4269,20 @@ export class AgentDaemon {
 				return success(command.id, "mutate_queued_message", { status });
 			}
 
+			case "get_queued_user_actions": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_queued_user_actions", state.runtime.session.getQueuedUserActions());
+			}
+
+			case "cancel_queued_action": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"cancel_queued_action",
+					state.runtime.session.cancelQueuedAction(command.actionId),
+				);
+			}
+
 			case "clear_queue": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "clear_queue", state.runtime.session.clearQueue());
@@ -4285,6 +4375,7 @@ export class AgentDaemon {
 				}
 				await session.setModel(model, {
 					waitForExtensions: !(session.isStreaming || session.isCompacting),
+					onlyIfIdle: command.ifIdle === true,
 				});
 				return success(command.id, "set_model", model);
 			}
@@ -4391,8 +4482,39 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				// Reload re-evaluates extension modules, which capture client env
 				// (e.g. herdr pane identity) synchronously at load.
-				await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
-				return success(command.id, "reload");
+				if (command.resources === undefined) {
+					await withClientEnv(state.clientEnv, () => state.runtime.session.reload({ onlyIfIdle: command.ifIdle }));
+					return success(command.id, "reload");
+				}
+				if (!isAgentSessionResourceConfig(command.resources)) {
+					throw new Error("Invalid resource reload configuration");
+				}
+				const prepared = await withClientEnv(state.clientEnv, () =>
+					state.runtime.session.prepareReload({ onlyIfIdle: command.ifIdle, ...command.resources }),
+				);
+				const rollbackRuntimeConfig = state.runtime.replaceRuntimeResources(
+					prepared.resources as AgentSessionResourceConfig,
+				);
+				if (this.options.worker) {
+					const transactionId = randomUUID();
+					this.pendingResourceReloads.set(transactionId, {
+						activeSessionId: state.activeSessionId,
+						prepared,
+						rollbackRuntimeConfig,
+					});
+					return success(command.id, "reload", {
+						transactionId,
+						resources: prepared.resources,
+					});
+				}
+				try {
+					prepared.commit();
+					return success(command.id, "reload", { resources: prepared.resources });
+				} catch (error) {
+					rollbackRuntimeConfig();
+					await prepared.rollback();
+					throw error;
+				}
 			}
 
 			case "new_session": {
@@ -4533,7 +4655,16 @@ export class AgentDaemon {
 				return success(command.id, "extension_ui_response");
 			}
 
+			case "register_planned_restart_handoff":
+			case "cancel_planned_restart_handoff":
+			case "acknowledge_planned_restart_handoff":
+			case "restore_planned_restart_handoff":
+				throw new Error("Planned restart handoffs require the daemon supervisor");
+
 			case "prepare_update_restart":
+				if (command.handoffRequestId) {
+					throw new Error("Planned restart handoffs require the daemon supervisor");
+				}
 				this.log(
 					`prepare_update_restart command received over socket; ${this.sessions.size} active session(s) will be closed`,
 				);
@@ -5621,6 +5752,10 @@ export class AgentDaemon {
 	}
 
 	private createUpdateRestartSession(state: ActiveSessionState): DaemonUpdateRestartSession | undefined {
+		const unsupportedLaunchKey = Object.keys(state.launchEnv ?? {}).find((key) => !isDaemonRestartLaunchEnvKey(key));
+		if (unsupportedLaunchKey) {
+			throw new Error(`Cannot checkpoint unsupported launch environment key ${unsupportedLaunchKey}`);
+		}
 		const session = state.runtime.session;
 		const queue = {
 			actions: session.getSessionActionRecoverySnapshot(),
@@ -5661,6 +5796,7 @@ export class AgentDaemon {
 				cwd: session.sessionManager.getCwd(),
 			},
 			runtimeMetadata: state.runtime.metadata,
+			...(state.launchEnv !== undefined ? { launchEnv: { ...state.launchEnv } } : {}),
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),
 			queue,
 			shouldResume,
@@ -5695,8 +5831,24 @@ export class AgentDaemon {
 
 	private writeUpdateRestartManifest(manifest: DaemonUpdateRestartManifest): void {
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(manifest)}\n`);
+		const directory = dirname(path);
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
+		const tempPath = `${path}.${process.pid}.tmp`;
+		const descriptor = openSync(tempPath, "w", 0o600);
+		try {
+			writeSync(descriptor, `${JSON.stringify(manifest)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(directory, "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	}
 
 	private getUpdateRestartSessionDepth(state: ActiveSessionState): number {
@@ -5721,13 +5873,19 @@ export class AgentDaemon {
 		}
 	}
 
-	private beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemon["updateRestart"]> {
+	private beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		strict = false,
+		handoff?: DaemonPlannedRestartHandoff,
+	): NonNullable<AgentDaemon["updateRestart"]> {
 		if (this.updateRestart) throw new Error("Daemon is already preparing an update restart");
 		const transaction: NonNullable<AgentDaemon["updateRestart"]> = {
 			id: Symbol("update-restart"),
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			strict,
+			...(handoff ? { handoff } : {}),
 			deferredClientEnv: [],
 		};
 		this.updateRestart = transaction;
@@ -5760,6 +5918,43 @@ export class AgentDaemon {
 		}
 	}
 
+	private plannedRestartBlockers(states: readonly ActiveSessionState[]): DaemonPlannedRestartBlocker[] {
+		const blockers: DaemonPlannedRestartBlocker[] = [];
+		for (const state of states) {
+			const session = state.runtime.session;
+			const summary = summaryForActiveSession(state);
+			const base = {
+				activeSessionId: state.activeSessionId,
+				sessionId: session.sessionId,
+				...(summary.sessionName ? { sessionName: summary.sessionName } : {}),
+			};
+			if (session.isBashRunning) blockers.push({ ...base, operation: "bash" });
+			if (session.isCompacting) blockers.push({ ...base, operation: "compaction" });
+			if (session.isRetrying) blockers.push({ ...base, operation: "retry" });
+			if (session.hasRunningRlmChildren()) blockers.push({ ...base, operation: "rlm_child" });
+			if (session.isSessionActive || session.isStreaming || session.hasAcceptedPromptInFlight) {
+				blockers.push({ ...base, operation: "turn" });
+			}
+			const queue = session.getSessionActionRecoverySnapshot();
+			if (queue.actions.length > 0 || session.getPendingNextTurnMessageSnapshots().length > 0) {
+				blockers.push({ ...base, operation: "queued_action" });
+			}
+			if (this.hasScheduledJobsForSession(state.activeSessionId)) {
+				blockers.push({ ...base, operation: "scheduled_job" });
+			}
+		}
+		return blockers;
+	}
+
+	private formatPlannedRestartBlockers(blockers: readonly DaemonPlannedRestartBlocker[]): string {
+		return blockers
+			.map(
+				(blocker) =>
+					`${blocker.sessionName ?? blocker.sessionId} (${blocker.activeSessionId}): ${blocker.operation}`,
+			)
+			.join(", ");
+	}
+
 	private async prepareUpdateRestartCheckpoint(
 		transaction: NonNullable<AgentDaemon["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest> {
@@ -5775,6 +5970,14 @@ export class AgentDaemon {
 			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
 			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));
 			if (addedSession) throw new Error(`Session ${addedSession} became resident during update preparation`);
+			if (transaction.strict) {
+				const blockers = this.plannedRestartBlockers(states);
+				if (blockers.length > 0) {
+					throw new Error(
+						`Planned restart refused; active blockers: ${this.formatPlannedRestartBlockers(blockers)}`,
+					);
+				}
+			}
 
 			const restartSessions = states
 				.filter((state) => this.sessions.get(state.activeSessionId) === state)
@@ -5789,6 +5992,16 @@ export class AgentDaemon {
 					);
 				});
 			this.assertUpdateRestartNotCancelled(transaction);
+			if (transaction.handoff) {
+				const target = restartSessions.find(
+					(session) =>
+						session.activeSessionId === transaction.handoff?.target.activeSessionId &&
+						session.sessionId === transaction.handoff.target.sessionId &&
+						canonicalSessionPath(session.sessionFile) ===
+							canonicalSessionPath(transaction.handoff.target.sessionFile),
+				);
+				if (!target) throw new Error("Planned restart target was deleted or changed during quiescence claim");
+			}
 			const includedActiveSessionIds = new Set(restartSessions.map((session) => session.activeSessionId));
 			const discardedActiveSessionIds = states
 				.filter(

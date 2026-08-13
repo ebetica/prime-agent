@@ -9,6 +9,8 @@ export {
 	type AgentSessionEventListener,
 	type ModelCycleResult,
 	type PromptOptions,
+	type ReloadOptions,
+	SessionReloadBusyError,
 } from "./core/agent-session.js";
 // Auth and model registry
 export {
@@ -275,6 +277,7 @@ export {
 	type AgentConnectionExtensionUiResponse,
 	type AgentConnectionModel,
 	type AgentConnectionModelCycleResult,
+	type AgentConnectionQueuedUserAction,
 	type AgentConnectionQueueState,
 	type AgentConnectionResourceSnapshot,
 	type AgentConnectionRlmChildAgentSnapshot,
@@ -284,9 +287,14 @@ export {
 	DaemonAgentConnection,
 	InProcessAgentConnection,
 } from "./modes/agent-connection/index.js";
+export { AtomicResourceReloadRestartRequiredError } from "./modes/daemon/daemon-errors.js";
 // Run modes for programmatic SDK usage
 export {
+	type AcknowledgeDaemonPlannedRestartHandoffOptions,
+	acknowledgeDaemonPlannedRestartHandoff,
+	type CancelDaemonPlannedRestartHandoffOptions,
 	ClientPromptStashStore,
+	cancelDaemonPlannedRestartHandoff,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServices,
 	createInteractiveModeUiServicesFromServices,
@@ -308,6 +316,14 @@ export {
 	type DaemonEventSequence,
 	type DaemonModeOptions,
 	type DaemonOutbound,
+	type DaemonPlannedRestartBlocker,
+	type DaemonPlannedRestartClaim,
+	type DaemonPlannedRestartCompletion,
+	type DaemonPlannedRestartHandoff,
+	type DaemonPlannedRestartHandoffState,
+	type DaemonPlannedRestartLifecycleResult,
+	type DaemonPlannedRestartRestoredSession,
+	type DaemonPlannedRestartTarget,
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,
 	type DaemonProtocolVersion,
@@ -326,12 +342,14 @@ export {
 	type PrintModeOptions,
 	type PromptStash,
 	type PromptStashState,
+	type RegisterDaemonPlannedRestartHandoffOptions,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
 	type RpcEventListener,
 	type RpcResponse,
 	type RpcSessionState,
+	registerDaemonPlannedRestartHandoff,
 	runPrintMode,
 	runRpcMode,
 	type SessionActivity,
@@ -390,6 +408,10 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.js";
+export {
+	prepareDaemonUpdateRestart,
+	runDaemonUpdateRestartCoordinator,
+} from "./package-manager-cli.js";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.js";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";

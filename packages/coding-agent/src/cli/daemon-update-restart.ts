@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { ENV_AGENT_DIR, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
+import type { DaemonPlannedRestartCompletion } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -14,6 +15,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
+import { isDaemonPlannedRestartCompletion } from "../modes/daemon/planned-restart-handoff.js";
 import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
@@ -57,6 +59,8 @@ export interface DaemonUpdateRestartStatus {
 	coordinator: DaemonUpdateRestartProcessIdentity;
 	predecessor?: DaemonUpdateRestartProcessIdentity;
 	successor?: DaemonUpdateRestartProcessIdentity;
+	handoffRequestId?: string;
+	handoffCompletion?: DaemonPlannedRestartCompletion;
 	counts: DaemonUpdateRestartCounts;
 	failures?: DaemonUpdateRestartFailure[];
 	message?: string;
@@ -158,10 +162,23 @@ function socketKey(socketPath: string): string {
 }
 
 function writeJsonAtomically(path: string, value: unknown): void {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	try {
-		writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+		const descriptor = openSync(tempPath, "w", 0o600);
+		try {
+			writeSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
 		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	} catch (error) {
 		rmSync(tempPath, { force: true });
 		throw error;
@@ -219,6 +236,8 @@ function isDaemonUpdateRestartStatus(value: unknown): value is DaemonUpdateResta
 		isProcessIdentity(status.coordinator) &&
 		(status.predecessor === undefined || isProcessIdentity(status.predecessor)) &&
 		(status.successor === undefined || isProcessIdentity(status.successor)) &&
+		(status.handoffRequestId === undefined || typeof status.handoffRequestId === "string") &&
+		(status.handoffCompletion === undefined || isDaemonPlannedRestartCompletion(status.handoffCompletion)) &&
 		isCounts(status.counts) &&
 		(status.failures === undefined || isFailures(status.failures)) &&
 		(status.message === undefined || typeof status.message === "string") &&
@@ -252,6 +271,7 @@ export class DaemonUpdateRestartStatusWriter {
 		private readonly path: string,
 		requestId: string,
 		socketPath: string,
+		handoffRequestId?: string,
 	) {
 		const now = new Date().toISOString();
 		const processStartId = getProcessStartId(process.pid);
@@ -261,6 +281,7 @@ export class DaemonUpdateRestartStatusWriter {
 			socketPath,
 			phase: "starting",
 			coordinator: { pid: process.pid, ...(processStartId ? { processStartId } : {}) },
+			...(handoffRequestId ? { handoffRequestId } : {}),
 			counts: { total: 0, restored: 0, resumed: 0, failed: 0 },
 			startedAt: now,
 			updatedAt: now,
@@ -291,6 +312,7 @@ export class DaemonUpdateRestartStatusWriter {
 			...this.status,
 			counts: { ...this.status.counts },
 			failures: this.status.failures?.map((failure) => ({ ...failure })),
+			handoffCompletion: this.status.handoffCompletion ? structuredClone(this.status.handoffCompletion) : undefined,
 		};
 	}
 

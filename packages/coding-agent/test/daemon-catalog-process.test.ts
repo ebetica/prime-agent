@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listSavedSessionSiblings, resolveCatalogSessionMatch } from "../src/modes/daemon/daemon-catalog-process.js";
+import {
+	appendInterruptedToolResults,
+	listSavedSessionSiblings,
+	resolveCatalogSessionMatch,
+} from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -91,5 +95,100 @@ describe("daemon catalog selector resolution", () => {
 		];
 
 		expect(() => resolveCatalogSessionMatch(sessions, "target")).toThrow('Ambiguous session selector "target"');
+	});
+});
+
+describe("daemon catalog interrupted tool recovery", () => {
+	function assistantWithTools(...tools: Array<{ id: string; name: string; arguments: Record<string, unknown> }>) {
+		return {
+			role: "assistant" as const,
+			content: tools.map((tool) => ({ type: "toolCall" as const, ...tool })),
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "test-model",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse" as const,
+			timestamp: 1,
+		};
+	}
+
+	it("terminally fails an orphaned RLM admission without consulting a child edge", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-orphaned-rlm-"));
+		const manager = SessionManager.create(root, join(root, "sessions"));
+		manager.newSession();
+		manager.appendMessage(
+			assistantWithTools({ id: "call-rlm", name: "ipython", arguments: { code: 'await rlm("review")' } }),
+		);
+		const artifactDir = manager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing artifact directory");
+		mkdirSync(artifactDir, { recursive: true });
+		writeFileSync(join(artifactDir, "rlm-subagents.jsonl"), "not-json\n");
+
+		expect(appendInterruptedToolResults(manager)).toEqual(["call-rlm"]);
+		const result = manager.buildSessionContext().messages.at(-1);
+		expect(result).toMatchObject({
+			role: "toolResult",
+			toolCallId: "call-rlm",
+			toolName: "ipython",
+			isError: true,
+		});
+		if (result?.role !== "toolResult") throw new Error("Missing recovered tool result");
+		expect(result.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("was not replayed") }),
+		]);
+		expect(appendInterruptedToolResults(manager)).toEqual([]);
+	});
+
+	it("fails only missing results in a partially persisted tool batch", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-partial-tools-"));
+		const manager = SessionManager.create(root, join(root, "sessions"));
+		manager.newSession();
+		manager.appendMessage(
+			assistantWithTools(
+				{ id: "healthy", name: "first", arguments: {} },
+				{ id: "orphaned", name: "ipython", arguments: { code: "await rlm(task)" } },
+			),
+		);
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "healthy",
+			toolName: "first",
+			content: [{ type: "text", text: "done" }],
+			isError: false,
+			timestamp: 2,
+		});
+
+		expect(appendInterruptedToolResults(manager)).toEqual(["orphaned"]);
+		expect(
+			manager
+				.buildSessionContext()
+				.messages.filter((message) => message.role === "toolResult")
+				.map((message) => message.toolCallId),
+		).toEqual(["healthy", "orphaned"]);
+	});
+
+	it("leaves a healthy completed tool batch unchanged", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-complete-tools-"));
+		const manager = SessionManager.create(root, join(root, "sessions"));
+		manager.newSession();
+		manager.appendMessage(assistantWithTools({ id: "complete", name: "ipython", arguments: { code: "1 + 1" } }));
+		manager.appendMessage({
+			role: "toolResult",
+			toolCallId: "complete",
+			toolName: "ipython",
+			content: [{ type: "text", text: "2" }],
+			isError: false,
+			timestamp: 2,
+		});
+
+		expect(appendInterruptedToolResults(manager)).toEqual([]);
+		expect(manager.buildSessionContext().messages).toHaveLength(2);
 	});
 });

@@ -17,7 +17,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	Agent,
 	type AgentContext,
@@ -133,6 +133,7 @@ import {
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
+	type KernelHostRequestContext,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -187,6 +188,8 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+	PLANNED_RESTART_INTENT_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -213,7 +216,12 @@ import {
 	saveHarnessState,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
-import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import type {
+	PreparedResourceReload,
+	ResourceExtensionPaths,
+	ResourceLoader,
+	ResourceReloadOptions,
+} from "./resource-loader.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -250,7 +258,13 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	SessionContext,
+	SessionEntry,
+	SessionMessageEntry,
+} from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -902,8 +916,27 @@ export interface ModelCycleResult {
 	isScoped: boolean;
 }
 
+export interface ReloadOptions extends ResourceReloadOptions {
+	/** Claim the idle session before rebuilding resources, or fail without changing them. */
+	onlyIfIdle?: boolean;
+}
+
+export class SessionReloadBusyError extends Error {
+	constructor() {
+		super("Session is busy; resources not reloaded");
+		this.name = "SessionReloadBusyError";
+	}
+}
+
+export interface PreparedSessionReload {
+	readonly resources: ResourceReloadOptions;
+	commit(): void;
+	rollback(): Promise<void>;
+}
+
 interface ModelSelectOptions {
 	waitForExtensions?: boolean;
+	onlyIfIdle?: boolean;
 }
 
 interface ToolDefinitionEntry {
@@ -1112,6 +1145,7 @@ export class AgentSession {
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
+	private _idleQueuePromotionGeneration = 0;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private _sessionActionCommitTail: Promise<void> = Promise.resolve();
@@ -1198,8 +1232,12 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _resourceReloadInProgress = false;
+	private _resourceReloadTail: Promise<void> = Promise.resolve();
+	private _resourceMutationAdmissions = 0;
 	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	private _kernelHostRequestAbortController?: AbortController;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
@@ -1363,6 +1401,13 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		if (this._recoverPlannedRestartContinuationIntents() > 0) {
+			// A prior successor may have acknowledged resume and crashed before the
+			// queued continuation reached the transcript. The durable intent is
+			// successor-claim proof, so a later session load may safely finish it.
+			this._sessionInputPumpSuspended = false;
+			this._scheduleSessionInputPump();
+		}
 	}
 
 	/**
@@ -3978,6 +4023,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._kernelHostRequestAbortController?.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
@@ -4906,6 +4952,134 @@ export class AgentSession {
 		});
 	}
 
+	private _plannedRestartMarker(
+		entry: SessionEntry,
+	): { actionId: string; message?: string; completed: boolean } | undefined {
+		let customType: string;
+		let rawDetails: unknown;
+		if (entry.type === "custom_message") {
+			customType = entry.customType;
+			rawDetails = entry.details;
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			customType = entry.message.customType;
+			rawDetails = entry.message.details;
+		} else {
+			return undefined;
+		}
+		if (
+			(customType !== PLANNED_RESTART_INTENT_CUSTOM_TYPE && customType !== PLANNED_RESTART_HANDOFF_CUSTOM_TYPE) ||
+			!rawDetails ||
+			typeof rawDetails !== "object"
+		) {
+			return undefined;
+		}
+		const details = rawDetails as { actionId?: unknown; message?: unknown };
+		if (typeof details.actionId !== "string") return undefined;
+		return {
+			actionId: details.actionId,
+			...(typeof details.message === "string" ? { message: details.message } : {}),
+			completed: customType === PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+		};
+	}
+
+	private _recoverPlannedRestartContinuationIntents(): number {
+		const completed = new Set<string>();
+		const pending = new Map<string, string>();
+		for (const entry of this.sessionManager.getEntries()) {
+			const marker = this._plannedRestartMarker(entry);
+			if (!marker) continue;
+			if (marker.completed) {
+				completed.add(marker.actionId);
+				continue;
+			}
+			if (marker.message === undefined) continue;
+			const prior = pending.get(marker.actionId);
+			if (prior !== undefined && prior !== marker.message) {
+				throw new Error(`Planned restart action ${marker.actionId} has conflicting durable intents`);
+			}
+			pending.set(marker.actionId, marker.message);
+		}
+		let recovered = 0;
+		for (const [actionId, text] of pending) {
+			if (completed.has(actionId) || this._actionStore.ownedActions().some((action) => action.id === actionId)) {
+				continue;
+			}
+			const message: CustomMessage = {
+				role: "custom",
+				customType: PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+				content: text,
+				display: true,
+				timestamp: Date.now(),
+				details: { actionId, message: text },
+			};
+			const action = this._createPreparedTurnAction("followUp", text, undefined, {
+				actionId,
+				agentMessageId: actionId,
+				message,
+				source: "internal",
+				queueVisible: false,
+			});
+			this._admitSessionInput(action, { restore: true });
+			recovered++;
+		}
+		return recovered;
+	}
+
+	admitPlannedRestartContinuation(actionId: string, text: string): "admitted" | "already_admitted" {
+		const entries = this.sessionManager.getEntries();
+		const completed = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === true && marker.actionId === actionId;
+		});
+		if (completed) {
+			const marker = this._plannedRestartMarker(completed);
+			if (marker?.message !== text) {
+				throw new Error(`Planned restart action ${actionId} conflicts with its completed message`);
+			}
+			return "already_admitted";
+		}
+		const existing = this._actionStore.ownedActions().find((action) => action.id === actionId);
+		if (existing) {
+			if (existing.payload.kind !== "turn" || existing.payload.text !== text) {
+				throw new Error(`Planned restart action ${actionId} conflicts with an existing action`);
+			}
+			return "already_admitted";
+		}
+		const intent = entries.find((entry) => {
+			const marker = this._plannedRestartMarker(entry);
+			return marker?.completed === false && marker.actionId === actionId;
+		});
+		const intentDetails = intent ? this._plannedRestartMarker(intent) : undefined;
+		if (intentDetails?.message !== undefined && intentDetails.message !== text) {
+			throw new Error(`Planned restart action ${actionId} conflicts with its durable intent`);
+		}
+		if (!intent) {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				PLANNED_RESTART_INTENT_CUSTOM_TYPE,
+				"Planned restart continuation pending",
+				false,
+				{ actionId, message: text },
+			);
+		}
+		const message: CustomMessage = {
+			role: "custom",
+			customType: PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			timestamp: Date.now(),
+			details: { actionId, message: text },
+		};
+		const action = this._createPreparedTurnAction("followUp", text, undefined, {
+			actionId,
+			agentMessageId: actionId,
+			message,
+			source: "internal",
+			queueVisible: false,
+		});
+		this._admitSessionInput(action, { restore: true });
+		return "admitted";
+	}
+
 	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<number> {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
@@ -5187,6 +5361,7 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		options: {
+			actionId?: string;
 			agentMessageId?: string;
 			queueKey?: string;
 			content?: (TextContent | ImageContent)[];
@@ -5202,7 +5377,7 @@ export class AgentSession {
 			acceptedBeforeCompletion?: boolean;
 		},
 	): QueuedSessionAction {
-		const id = randomUUID();
+		const id = options.actionId ?? randomUUID();
 		const content = options.content ?? this._buildPromptContent(text, images);
 		const message =
 			options.message ??
@@ -5281,12 +5456,59 @@ export class AgentSession {
 			);
 	}
 
-	private _assertSessionActionAdmissionAvailable(): void {
-		if (this._disposed || this._disposing) {
-			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
+	private async _acquireResourceReloadFence(): Promise<{ release(): void }> {
+		const previous = this._resourceReloadTail;
+		let resolve = () => {};
+		this._resourceReloadTail = new Promise<void>((release) => {
+			resolve = release;
+		});
+		await previous;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				resolve();
+			},
+		};
+	}
+
+	private _claimResourceMutationAdmission(operation: string): { release(): void } {
+		if (this._resourceReloadInProgress) {
+			throw new Error(`Cannot ${operation} while resources are reloading.`);
 		}
+		this._resourceMutationAdmissions++;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				this._resourceMutationAdmissions--;
+			},
+		};
+	}
+
+	private _assertSessionActionAdmissionAvailable(): void {
+		this._assertSessionActionAdmissionOpen();
 		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
+		}
+	}
+
+	/**
+	 * The admission checks that also bind internal admission. Restoring queued work
+	 * and promoting it once the agent reaches idle both run while the input pump is
+	 * still suspended by an abort, so the suspended-pump gate above is enforced on
+	 * the direct-turn path rather than on admission itself. Queueing entry points
+	 * (steer, followUp, agent messages) deliberately stay admissible so a backlog
+	 * survives an abort and reaches the restart manifest.
+	 */
+	private _assertSessionActionAdmissionOpen(): void {
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot admit a session action while resources are reloading.");
+		}
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 	}
 
@@ -5303,9 +5525,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
-			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
-		}
+		this._assertSessionActionAdmissionOpen();
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5376,6 +5596,8 @@ export class AgentSession {
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
+			resourceReload: this._resourceReloadInProgress,
+			resourceMutationAdmission: this._resourceMutationAdmissions > 0,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 		};
@@ -6179,6 +6401,29 @@ export class AgentSession {
 		return "applied";
 	}
 
+	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
+		return visibleSessionActionProjection(this._actionStore.queuedActions())
+			.filter((action) => action.payload.kind === "turn")
+			.map((action) => ({
+				id: action.id,
+				text: queuedAgentMessagePreview(action),
+				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+			}));
+	}
+
+	cancelQueuedAction(id: string): boolean {
+		const action = visibleSessionActionProjection(this._actionStore.queuedActions()).find(
+			(candidate) => candidate.id === id && candidate.payload.kind === "turn",
+		);
+		if (!action) return false;
+		const error = new Error("Queued message was cancelled before delivery.");
+		this._rejectAgentMessage(action.agentMessageId, error);
+		const removed = this._cancelSessionActions((candidate) => candidate === action, error, [action]);
+		if (removed.length === 0) return false;
+		this._emitQueueUpdate();
+		return true;
+	}
+
 	get queuedActionCount(): number {
 		return visibleSessionActionProjection(this._actionStore.queuedActions()).length;
 	}
@@ -6583,7 +6828,24 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	private _promoteQueuedWorkAfterAbort(generation: number): void {
+		void this.agent
+			.waitForIdle()
+			.then(() => this._agentEventQueue)
+			.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+			.then(() => {
+				if (generation !== this._idleQueuePromotionGeneration || this._disposed || this._disposing) {
+					return;
+				}
+				this._sessionInputPumpSuspended = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+			})
+			.catch(() => undefined);
+	}
+
 	requestAbort(): void {
+		const promotionGeneration = ++this._idleQueuePromotionGeneration;
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -6601,6 +6863,7 @@ export class AgentSession {
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
 		this.agent.abort();
+		this._promoteQueuedWorkAfterAbort(promotionGeneration);
 	}
 
 	/**
@@ -6625,6 +6888,7 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		this._idleQueuePromotionGeneration++;
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
 		this._sessionInputPumpRequested = false;
@@ -6695,6 +6959,14 @@ export class AgentSession {
 		if (!(await this._modelRegistry.canUseModel(model))) {
 			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
 		}
+		// Immediately adjacent to the synchronous mutation below: nothing else on
+		// this worker's event loop can claim a reload between the two.
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
+		if (options.onlyIfIdle && (this.isStreaming || this.isCompacting || this.isRetrying || this.isBashRunning)) {
+			throw new Error("Session is busy; model unchanged");
+		}
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
@@ -6762,6 +7034,9 @@ export class AgentSession {
 			availableModels.some((model) => modelsAreEqual(model, scoped.model)),
 		);
 		if (scopedModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = scopedModels.findIndex((sm) => modelsAreEqual(sm.model, currentModel));
@@ -6806,6 +7081,9 @@ export class AgentSession {
 	): Promise<ModelCycleResult | undefined> {
 		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		if (availableModels.length <= 1) return undefined;
+		if (this._resourceReloadInProgress) {
+			throw new Error("Cannot change model while resources are reloading.");
+		}
 
 		const currentModel = this.model;
 		let currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
@@ -7083,15 +7361,21 @@ export class AgentSession {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
-		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		const resourceAdmission = this._claimResourceMutationAdmission("compact");
 		let didCompact = false;
-		this._compactionAbortController = new AbortController();
+		let compactionOperation: Promise<void> | undefined;
 		let resolveCompactionOperation: () => void = () => {};
-		const compactionOperation = new Promise<void>((resolve) => {
-			resolveCompactionOperation = resolve;
-		});
-		this._compactionOperation = compactionOperation;
+		try {
+			this._disconnectFromAgent();
+			if (!options.skipAbort) await this.abort();
+			this._compactionAbortController = new AbortController();
+			compactionOperation = new Promise<void>((resolve) => {
+				resolveCompactionOperation = resolve;
+			});
+			this._compactionOperation = compactionOperation;
+		} finally {
+			resourceAdmission.release();
+		}
 		this._emit({
 			type: "compaction_start",
 			reason: "manual",
@@ -7711,16 +7995,23 @@ export class AgentSession {
 			}
 		}
 
+		const resourceAdmission = this._claimResourceMutationAdmission("refine");
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		// Background planning phase — does NOT block turn entry points
-		const planRun = this._planRefine(options, refineAbort.signal);
-		const planSettled = planRun.then(
-			() => undefined,
-			() => undefined,
-		);
-		this._refinePlanInFlight = planSettled;
+		// Background planning phase — does NOT block turn entry points.
+		let planRun: Promise<RefinementPlan>;
+		let planSettled: Promise<void>;
+		try {
+			planRun = this._planRefine(options, refineAbort.signal);
+			planSettled = planRun.then(
+				() => undefined,
+				() => undefined,
+			);
+			this._refinePlanInFlight = planSettled;
+		} finally {
+			resourceAdmission.release();
+		}
 		let plan: RefinementPlan;
 		try {
 			plan = await planRun;
@@ -8649,7 +8940,9 @@ export class AgentSession {
 			// kernel so the session never holds two live kernels. Gate the new kernel's
 			// startup on the old one's dispose (which flushes a final snapshot), so a
 			// reload can't restore from a snapshot the old kernel is still writing.
+			this._kernelHostRequestAbortController?.abort();
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
+			this._kernelHostRequestAbortController = new AbortController();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
 			// Only surface the "revived from your previous session" notice on the first
 			// build (a genuine resume). A later rebuild (/reload) restores state silently
@@ -8658,7 +8951,7 @@ export class AgentSession {
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				sessionId: this.sessionId,
-				hostHandlers: this._createKernelHostHandlers(),
+				hostHandlers: this._createKernelHostHandlers(this._kernelHostRequestAbortController.signal),
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
@@ -8758,7 +9051,9 @@ export class AgentSession {
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
-	private _createKernelHostHandlers(): HostRequestHandlers {
+	private _createKernelHostHandlers(
+		lifecycleSignal: AbortSignal = this._kernelHostRequestAbortController?.signal ?? new AbortController().signal,
+	): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
@@ -8859,40 +9154,219 @@ export class AgentSession {
 		if (this._mcpManager) {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
+		for (const extension of this._resourceLoader.getExtensions().extensions) {
+			for (const [type, registration] of extension.kernelHostRequests) {
+				if (handlers[type]) {
+					throw new Error(`Kernel host request type already registered: ${type}`);
+				}
+				const allowedKeys = new Set(registration.allowedPayloadKeys);
+				handlers[type] = async (payload) => {
+					if (lifecycleSignal.aborted || this._disposed || this._disposing) {
+						throw new Error(`Kernel host request type "${type}" is no longer available`);
+					}
+					const sessionFile = this.sessionManager.getSessionFile();
+					if (!sessionFile || !isAbsolute(sessionFile)) {
+						throw new Error(`Kernel host request type "${type}" requires a durable session`);
+					}
+					const sessionId = this.sessionManager.getSessionId();
+					const untrustedEntries = Object.entries(payload).filter(
+						([key]) => key !== "type" && key !== "cellSourceCode",
+					);
+					const unexpectedKey = untrustedEntries.find(([key]) => !allowedKeys.has(key))?.[0];
+					if (unexpectedKey) {
+						throw new Error(`Kernel host request type "${type}" does not accept payload key "${unexpectedKey}"`);
+					}
+					const requestPayload = Object.fromEntries(untrustedEntries);
+					const context: KernelHostRequestContext = {
+						sessionFile: resolve(sessionFile),
+						sessionId,
+						signal: lifecycleSignal,
+					};
+					const result = await registration.handler(requestPayload, context);
+					if (
+						lifecycleSignal.aborted ||
+						this._disposed ||
+						this._disposing ||
+						this.sessionManager.getSessionFile() !== sessionFile ||
+						this.sessionManager.getSessionId() !== sessionId
+					) {
+						throw new Error(`Kernel host request type "${type}" outlived its owning session`);
+					}
+					return result;
+				};
+			}
+		}
 		return handlers;
 	}
 
-	async reload(): Promise<void> {
-		const previousFlagValues = this._extensionRunner.getFlagValues();
-		await emitSessionShutdownEvent(this._extensionRunner, {
-			type: "session_shutdown",
-			reason: "reload",
-		});
-		await this.settingsManager.reload();
-		// Re-read auth.json: a login saved by the client process (daemon mode) must be
-		// visible here so MCP skill gating sees the new credentials.
-		this._modelRegistry.authStorage.reload();
-		resetApiProviders();
-		// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
-		this._mcpManager?.refresh();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+	async reload(options: ReloadOptions = {}): Promise<void> {
+		const prepared = await this.prepareReload(options);
+		prepared.commit();
+	}
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await this._extensionRunner.emit({
-				type: "session_start",
+	/**
+	 * Apply a resource reload while retaining every admission fence. Daemon mode
+	 * uses the returned transaction to make its worker descriptor durable before
+	 * releasing the session; local callers commit immediately via reload().
+	 */
+	async prepareReload(options: ReloadOptions = {}): Promise<PreparedSessionReload> {
+		const reloadFence = await this._acquireResourceReloadFence();
+		let claimedReload = false;
+		let preparedResources: PreparedResourceReload | undefined;
+		let rollbackLoader: (() => void) | undefined;
+		let oldRunnerShutdownBegan = false;
+		let settled = false;
+		const previousExtensionRunner = this._extensionRunner;
+		const previousFlagValues = previousExtensionRunner.getFlagValues();
+		const previousActiveToolNames = this.getActiveToolNames();
+		const requestedResources: ResourceReloadOptions = {
+			...(options.appendSystemPrompt !== undefined ? { appendSystemPrompt: options.appendSystemPrompt } : {}),
+			...(options.contextDirectories !== undefined ? { contextDirectories: options.contextDirectories } : {}),
+			...(options.extensions !== undefined ? { extensions: options.extensions } : {}),
+			...(options.skills !== undefined ? { skills: options.skills } : {}),
+			...(options.promptTemplates !== undefined ? { promptTemplates: options.promptTemplates } : {}),
+			...(options.themes !== undefined ? { themes: options.themes } : {}),
+		};
+		const hasResourceReplacement = Object.keys(requestedResources).length > 0;
+
+		const releaseClaim = (): void => {
+			if (claimedReload) {
+				this._resourceReloadInProgress = false;
+				this._notifySessionInputCheckpointChange();
+				this._scheduleSessionInputPump();
+				claimedReload = false;
+			}
+			reloadFence.release();
+		};
+
+		const rollback = async (): Promise<void> => {
+			if (settled) return;
+			settled = true;
+			let rollbackError: unknown;
+			try {
+				if (oldRunnerShutdownBegan) {
+					let candidateShutdownError: unknown;
+					if (this._extensionRunner !== previousExtensionRunner) {
+						try {
+							await emitSessionShutdownEvent(this._extensionRunner, {
+								type: "session_shutdown",
+								reason: "reload",
+							});
+						} catch (error) {
+							candidateShutdownError = error;
+						} finally {
+							this._extensionRunner.invalidate("Resource reload was rolled back");
+						}
+					}
+					rollbackLoader?.();
+					preparedResources?.dispose();
+					this._buildRuntime({
+						activeToolNames: previousActiveToolNames,
+						flagValues: previousFlagValues,
+						includeAllExtensionTools: true,
+					});
+					const hasBindings =
+						this._extensionUIContext ||
+						this._extensionCommandContextActions ||
+						this._extensionShutdownHandler ||
+						this._extensionErrorListener;
+					if (hasBindings) {
+						await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+						await this.extendResourcesFromExtensions("reload");
+					}
+					if (candidateShutdownError) throw candidateShutdownError;
+				} else {
+					preparedResources?.dispose();
+				}
+			} catch (error) {
+				rollbackError = error;
+			}
+			if (rollbackError) {
+				// Fail closed. The daemon supervisor will replace this worker; admitting
+				// work after an incomplete rollback would expose half-restored resources.
+				throw rollbackError;
+			}
+			releaseClaim();
+		};
+
+		try {
+			const fence = await this._acquireSessionActionCommitFence();
+			try {
+				if (
+					options.onlyIfIdle &&
+					(!canSelectSessionAction(this._runtimeActivity()) ||
+						this.unfinishedActionCount > 0 ||
+						this._refinePlanInFlight !== undefined ||
+						this._serializedPlanInFlight !== undefined ||
+						!this._modelSelectEmitQueueIdle)
+				) {
+					throw new SessionReloadBusyError();
+				}
+				this._resourceReloadInProgress = true;
+				claimedReload = true;
+			} finally {
+				fence.release();
+			}
+
+			if (this._resourceLoader.prepareReload) {
+				preparedResources = await this._resourceLoader.prepareReload(requestedResources);
+			} else {
+				if (hasResourceReplacement) {
+					throw new Error("This resource loader cannot replace live resource configuration");
+				}
+				await this._resourceLoader.reload();
+			}
+
+			this._kernelHostRequestAbortController?.abort();
+			oldRunnerShutdownBegan = true;
+			await emitSessionShutdownEvent(this._extensionRunner, {
+				type: "session_shutdown",
 				reason: "reload",
 			});
-			await this.extendResourcesFromExtensions("reload");
+			await this.settingsManager.reload();
+			this._modelRegistry.authStorage.reload();
+			resetApiProviders();
+			this._mcpManager?.refresh();
+			if (preparedResources) rollbackLoader = preparedResources.commit();
+			this._buildRuntime({
+				activeToolNames: previousActiveToolNames,
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
+
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener;
+			if (hasBindings) {
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+				await this.extendResourcesFromExtensions("reload");
+			}
+
+			const resources = preparedResources?.resources ?? requestedResources;
+			return {
+				resources,
+				commit: () => {
+					if (settled) return;
+					preparedResources?.finalize();
+					settled = true;
+					if (this._extensionRunner !== previousExtensionRunner) {
+						previousExtensionRunner.invalidate(
+							"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+						);
+					}
+					releaseClaim();
+				},
+				rollback,
+			};
+		} catch (error) {
+			try {
+				await rollback();
+			} catch (rollbackError) {
+				throw new AggregateError([error, rollbackError], "Resource reload and rollback both failed");
+			}
+			throw error;
 		}
 	}
 
@@ -10394,6 +10868,7 @@ export class AgentSession {
 			transient?: boolean;
 		},
 	): Promise<BashResult> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		this._bashAbortController = new AbortController();
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
@@ -10438,6 +10913,7 @@ export class AgentSession {
 			runId?: string;
 		},
 	): Promise<void> {
+		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}

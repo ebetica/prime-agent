@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +11,10 @@ import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
-import type { DaemonUpdateRestartManifest } from "../../../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+	type DaemonUpdateRestartManifest,
+} from "../../../src/modes/daemon/daemon-protocol.js";
 import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { prepareDaemonUpdateRestart } from "../../../src/package-manager-cli.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
@@ -23,7 +26,10 @@ type AgentDaemonUpdateInternals = {
 	cronScheduler: AgentCronScheduler;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
-	beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
+	beginUpdateRestartTransaction(
+		owner?: DaemonSocketClient,
+		strict?: boolean,
+	): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
 	runUpdateRestartPreparation(
 		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest>;
@@ -38,6 +44,7 @@ type AgentDaemonUpdateInternals = {
 		abort: AbortController;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		strict?: boolean;
 		owner?: DaemonSocketClient;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
@@ -57,7 +64,11 @@ function createState(
 	harness: Harness,
 	activeSessionId: string,
 	metadata: AgentSessionRuntime["metadata"],
-	options: { clientEnv?: Record<string, string>; onDispose?: () => void } = {},
+	options: {
+		clientEnv?: Record<string, string>;
+		launchEnv?: Record<string, string>;
+		onDispose?: () => void;
+	} = {},
 ): ActiveSessionState {
 	const runtime = {
 		session: harness.session,
@@ -78,6 +89,7 @@ function createState(
 		eventGeneration: `generation-${activeSessionId}`,
 		lastEventSequence: 0,
 		...(options.clientEnv ? { clientEnv: options.clientEnv } : {}),
+		...(options.launchEnv !== undefined ? { launchEnv: options.launchEnv } : {}),
 	};
 }
 
@@ -149,6 +161,92 @@ describe("issue #4257 update restart resume", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("refuses strict restart claims with named queued and scheduled blockers", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		await harness.session.restoreFollowUpMessage("queued before restart");
+		const internals = createDaemonInternals(harness);
+		const state = createState(harness, "active-blocked", { kind: "top-level", createdAt: Date.now() });
+		internals.sessions.set(state.activeSessionId, state);
+		internals.cronStore.create({
+			activeSessionId: state.activeSessionId,
+			sessionId: harness.session.sessionId,
+			sessionFile: harness.session.sessionFile ?? "",
+			cwd: harness.tempDir,
+			scheduleText: "in 1h",
+			prompt: "scheduled after restart",
+			now: new Date("2026-01-01T00:00:00.000Z"),
+		});
+		const transaction = internals.beginUpdateRestartTransaction(undefined, true);
+		await expect(internals.runUpdateRestartPreparation(transaction)).rejects.toThrow(
+			/active-blocked.*queued_action.*active-blocked.*scheduled_job/,
+		);
+		expect(internals.updateRestart).toBeUndefined();
+	});
+
+	it("names active child turns as strict restart blockers", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		vi.spyOn(harness.session, "hasRunningRlmChildren").mockReturnValue(true);
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-parent",
+			createState(harness, "active-parent", { kind: "top-level", createdAt: Date.now() }),
+		);
+		const transaction = internals.beginUpdateRestartTransaction(undefined, true);
+		await expect(internals.runUpdateRestartPreparation(transaction)).rejects.toThrow(/active-parent.*rlm_child/);
+	});
+
+	it("admits a deterministic restart continuation exactly once and only runs it when resumed", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("continued after restart")]);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe("admitted");
+		// Simulate losing the in-memory queue after the durable intent was written.
+		harness.session.clearQueuedUserMessagesMatching(() => true);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe("admitted");
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
+			"already_admitted",
+		);
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
+			),
+		).toEqual([expect.objectContaining({ content: "continue nonce" })]);
+		expect(harness.session.admitPlannedRestartContinuation("restart-action-1", "continue nonce")).toBe(
+			"already_admitted",
+		);
+		expect(() => harness.session.admitPlannedRestartContinuation("restart-action-1", "different nonce")).toThrow(
+			/conflicts with its completed message/,
+		);
+	});
+
+	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered continuation")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.planned_restart_intent",
+					"Planned restart continuation pending",
+					false,
+					{ actionId: "restart-action-recovered", message: "recover nonce" },
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.planned_restart_handoff",
+			),
+		).toEqual([expect.objectContaining({ content: "recover nonce" })]);
 	});
 
 	it.each([
@@ -328,7 +426,7 @@ describe("issue #4257 update restart resume", () => {
 		});
 		Reflect.set(internals, "mutationDrain", mutationDrain);
 		const checkpoint = vi.spyOn(internals, "prepareUpdateRestartCheckpoint").mockResolvedValue({
-			formatVersion: 1,
+			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 			createdAt: "now",
 			sessions: [],
 		});
@@ -869,15 +967,33 @@ describe("issue #4257 update restart resume", () => {
 		});
 		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 
+		const launchEnv = {
+			RECURSE_MODEL_POLICY: "policy-json",
+			RECURSE_SAFETY_DIR: "/trusted/safety",
+			PATH: "/trusted/skills:/usr/bin",
+			RLM_MAX_DEPTH: "7",
+		};
 		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
-			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
+			createState(
+				harness,
+				"active-1",
+				{ kind: "top-level", createdAt: Date.now() },
+				{
+					clientEnv: { HERDR_PANE_ID: "pane-1" },
+					launchEnv,
+				},
+			),
 		);
 
 		const manifest = await internals.prepareUpdateRestart();
 
-		expect(manifest.formatVersion).toBe(1);
+		expect(manifest.formatVersion).toBe(DAEMON_UPDATE_RESTART_FORMAT_VERSION);
+		expect(manifest.sessions[0]).toMatchObject({
+			launchEnv,
+			clientEnv: { HERDR_PANE_ID: "pane-1" },
+		});
 		expect(manifest.sessions[0]?.queue.nextTurn).toEqual([pendingNextTurn]);
 		const recovered = manifest.sessions[0]?.queue.actions.actions[0];
 		expect(recovered).toMatchObject({
@@ -896,6 +1012,29 @@ describe("issue #4257 update restart resume", () => {
 				]),
 			},
 		});
+	});
+
+	it("refuses to persist credential-bearing launch environment overrides", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-sensitive",
+			createState(
+				harness,
+				"active-sensitive",
+				{ kind: "top-level", createdAt: Date.now() },
+				{
+					launchEnv: { ANTHROPIC_API_KEY: "must-not-persist" },
+				},
+			),
+		);
+		await expect(internals.prepareUpdateRestart()).rejects.toThrow(
+			"Cannot checkpoint unsupported launch environment key ANTHROPIC_API_KEY",
+		);
+		expect(existsSync(getDaemonUpdateRestartManifestPath(`${harness.tempDir}/daemon.sock`, harness.tempDir))).toBe(
+			false,
+		);
 	});
 
 	it("materializes queued in-memory drafts before update restart", async () => {

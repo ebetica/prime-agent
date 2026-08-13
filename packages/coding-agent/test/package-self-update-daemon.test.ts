@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,8 +19,17 @@ import {
 	VERSION,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	type DaemonPlannedRestartHandoff,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
+import {
+	readPlannedRestartHandoff,
+	registerPlannedRestartHandoff,
+	updatePlannedRestartHandoff,
+} from "../src/modes/daemon/planned-restart-handoff.js";
 import {
 	handlePackageCommand,
 	prepareDaemonUpdateRestart,
@@ -66,6 +75,8 @@ interface MockUpdateRestartSession {
 	cwd: string;
 	config: Record<string, unknown>;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
+	launchEnv?: Record<string, string>;
+	clientEnv?: Record<string, string>;
 	queue: {
 		actions: { formatVersion: 1; actions: MockRecoveryAction[] };
 		nextTurn: MockCustomMessage[];
@@ -80,9 +91,10 @@ interface MockUpdateRestartSession {
 }
 
 interface MockUpdateRestartManifest {
-	formatVersion: 1;
+	formatVersion: 2;
 	createdAt: string;
 	sessions: MockUpdateRestartSession[];
+	handoff?: DaemonPlannedRestartHandoff;
 }
 
 function createMockTurnExecutionPolicy(): Record<string, unknown> {
@@ -105,6 +117,7 @@ function createMockTurnExecutionPolicy(): Record<string, unknown> {
 interface MockDaemonRequest {
 	type: string;
 	activeSessionId?: string;
+	requestId?: string;
 	message?: string;
 	agentMessageId?: string;
 	customMessage?: MockCustomMessage;
@@ -115,6 +128,9 @@ interface MockDaemonRequest {
 	snapshot?: unknown;
 	sessionPath?: string;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
+	lifecycle?: string;
+	launchEnv?: Record<string, string>;
+	env?: Record<string, string>;
 }
 
 type MockDaemonResponse = { success: true; data?: unknown } | { success: false; error: string };
@@ -125,6 +141,7 @@ const mockState = vi.hoisted(() => ({
 	createThrowSessionPaths: [] as string[],
 	daemonProbe: { reachable: true, activeSessions: [] } as MockRunningDaemonProbe,
 	daemonProbeAfterShutdown: undefined as MockRunningDaemonProbe | undefined,
+	agentDir: "",
 	globalPackageRoot: "",
 	hello: { protocol: { version: 0 } } as {
 		protocol: { version: number };
@@ -141,7 +158,7 @@ const mockState = vi.hoisted(() => ({
 	noticeError: undefined as string | undefined,
 	prepareError: undefined as string | undefined,
 	prepareManifest: {
-		formatVersion: 1,
+		formatVersion: 2,
 		createdAt: "2026-07-07T00:00:00.000Z",
 		sessions: [],
 	} as MockUpdateRestartManifest,
@@ -369,6 +386,13 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 				const activeSessionId = mockState.createActiveSessionIds.shift() ?? "restored-active";
 				return { success: true, data: { id: activeSessionId, activeSessionId } };
 			}
+			if (request.type === "restore_planned_restart_handoff") {
+				const current = readPlannedRestartHandoff(mockState.agentDir, mockState.socketPath, request.requestId!);
+				if (!current) return { success: false, error: "unknown planned handoff" };
+				const status = current.state === "delivered" ? "already_admitted" : "admitted";
+				updatePlannedRestartHandoff(mockState.agentDir, mockState.socketPath, current, "delivered");
+				return { success: true, data: { status } };
+			}
 			if (request.type === "restore_actions" && mockState.restoreActionFailures > 0) {
 				mockState.restoreActionFailures--;
 				return { success: false, error: "restore failed" };
@@ -415,7 +439,7 @@ describe("self-update daemon restart", () => {
 
 	function createAcceptedRecoveryManifest(nextTurn: MockCustomMessage[] = []): MockUpdateRestartManifest {
 		return {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -470,6 +494,7 @@ describe("self-update daemon restart", () => {
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-self-update-daemon-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
+		mockState.agentDir = agentDir;
 		projectDir = join(tempDir, "project");
 		packageDir = join(tempDir, "global-prefix", "lib", "node_modules", PACKAGE_NAME);
 		mockState.globalPackageRoot = join(tempDir, "global-prefix", "lib", "node_modules");
@@ -489,7 +514,11 @@ describe("self-update daemon restart", () => {
 		mockState.daemonProbeAfterShutdown = undefined;
 		mockState.disconnectAfterPersistRequestTypes = [];
 		mockState.disconnectRequestTypes = [];
-		mockState.prepareManifest = { formatVersion: 1, createdAt: "2026-07-07T00:00:00.000Z", sessions: [] };
+		mockState.prepareManifest = {
+			formatVersion: 2,
+			createdAt: "2026-07-07T00:00:00.000Z",
+			sessions: [],
+		};
 		mockState.preparedManifestPath = getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir);
 		mockState.prepareResponse = undefined;
 		mockState.helloWaitFailures = 0;
@@ -762,7 +791,7 @@ describe("self-update daemon restart", () => {
 	it("clears the prepared manifest after fallback restoration when shutdown fails", async () => {
 		mockState.shutdownResult = false;
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -796,7 +825,7 @@ describe("self-update daemon restart", () => {
 		mockState.shutdownResult = false;
 		mockState.daemonProbeAfterShutdown = { reachable: false };
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -830,7 +859,7 @@ describe("self-update daemon restart", () => {
 	it("continues queued-work restoration when the update notice request rejects", async () => {
 		mockState.noticeError = "socket closed";
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -918,7 +947,11 @@ describe("self-update daemon restart", () => {
 			{ success: false, error: "prepare failed" } as const,
 			{
 				success: true,
-				data: { formatVersion: 1, createdAt: "2026-07-07T00:00:00.000Z", sessions: "invalid" },
+				data: {
+					formatVersion: 2,
+					createdAt: "2026-07-07T00:00:00.000Z",
+					sessions: "invalid",
+				},
 			} as const,
 		]) {
 			mockState.calls = [];
@@ -949,7 +982,7 @@ describe("self-update daemon restart", () => {
 		mockState.preparedManifestPath = legacyManifestPath;
 		mockState.disconnectAfterPersistRequestTypes = ["prepare_update_restart"];
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -984,7 +1017,7 @@ describe("self-update daemon restart", () => {
 	it("fences a pending prepared restart only after verifying the live daemon is empty", async () => {
 		useFixedOwnerHello();
 		const pendingManifest: MockUpdateRestartManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -1098,12 +1131,165 @@ describe("self-update daemon restart", () => {
 		}
 	});
 
+	it("admits a claimed planned restart handoff once after the successor session is ready", async () => {
+		const sessionFile = join(projectDir, "session.jsonl");
+		mockState.prepareManifest = {
+			formatVersion: 2,
+			createdAt: "2026-07-07T00:00:00.000Z",
+			sessions: [
+				{
+					activeSessionId: "old-active",
+					sessionId: "session-1",
+					sessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					launchEnv: {
+						RECURSE_MODEL_POLICY: "trusted-policy",
+						RECURSE_SAFETY_DIR: "/trusted/safety",
+						PATH: "/trusted/skills:/usr/bin",
+						RLM_MAX_DEPTH: "9",
+					},
+					clientEnv: { HERDR_PANE_ID: "pane-1" },
+					queue: { actions: { formatVersion: 1, actions: [] }, nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+			],
+			handoff: {
+				requestId: "restart-1",
+				target: { activeSessionId: "old-active", sessionId: "session-1", sessionFile },
+				message: "Restart complete; continue nonce",
+				actionId: "planned-restart:1",
+				state: "prepared",
+				createdAt: "2026-07-07T00:00:00.000Z",
+				updatedAt: "2026-07-07T00:00:01.000Z",
+				claim: {
+					claimedAt: "2026-07-07T00:00:01.000Z",
+					supervisorGeneration: "predecessor-generation",
+					supervisorOwnerToken: "predecessor-owner",
+					supervisorPid: 101,
+					supervisorSocketPath: mockState.socketPath,
+				},
+			},
+		};
+		const registered = registerPlannedRestartHandoff(agentDir, mockState.socketPath, {
+			requestId: mockState.prepareManifest.handoff!.requestId,
+			target: mockState.prepareManifest.handoff!.target,
+			message: mockState.prepareManifest.handoff!.message,
+			actionId: mockState.prepareManifest.handoff!.actionId,
+		});
+		updatePlannedRestartHandoff(
+			agentDir,
+			mockState.socketPath,
+			registered,
+			"prepared",
+			undefined,
+			mockState.prepareManifest.handoff!.claim,
+		);
+		mockState.requestThrowTypes = ["resume_queue"];
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			await expect(performUpdateAndRunCoordinator()).resolves.toBeUndefined();
+			expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(1);
+			expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+
+			// Also simulate the claim-publication crash window by rolling only the
+			// aggregate manifest back to its pre-claim embedded handoff. The durable
+			// per-request marker is authoritative and must repair the checkpoint.
+			const staleAggregate = JSON.parse(readFileSync(mockState.preparedManifestPath, "utf8"));
+			staleAggregate.handoff = { ...staleAggregate.handoff, state: "registered", claim: undefined };
+			writeFileSync(
+				mockState.preparedManifestPath,
+				`${JSON.stringify(staleAggregate)}
+`,
+			);
+			mockState.prepareManifest = staleAggregate;
+			// A lost resume reply leaves the successor resident. The next coordinator
+			// must finish that pending manifest in place instead of restarting it or
+			// trying to resolve the predecessor's obsolete active id.
+			mockState.requestThrowTypes = [];
+			const retryStatus = await runDaemonUpdateRestartCoordinator({
+				socketPath: mockState.socketPath,
+				agentDir,
+				statusPath: join(agentDir, "update-restarts", "retry-status.json"),
+				handoffRequestId: "restart-1",
+			});
+			expect(retryStatus).toMatchObject({ phase: "complete", counts: { failed: 0, resumed: 1 } });
+			expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+			expect(
+				mockState.requestPayloads.filter((request) => request.type === "restore_planned_restart_handoff"),
+			).toEqual([
+				{ type: "restore_planned_restart_handoff", activeSessionId: "restored-active", requestId: "restart-1" },
+				{ type: "restore_planned_restart_handoff", activeSessionId: "restored-active", requestId: "restart-1" },
+			]);
+			expect(mockState.requestPayloads.filter((request) => request.type === "resume_queue")).toHaveLength(2);
+			const restoreCreates = mockState.requestPayloads.filter((request) => request.type === "create");
+			expect(restoreCreates).toHaveLength(2);
+			expect(restoreCreates[0]).toMatchObject({
+				launchEnv: {
+					RECURSE_MODEL_POLICY: "trusted-policy",
+					RECURSE_SAFETY_DIR: "/trusted/safety",
+					PATH: "/trusted/skills:/usr/bin",
+					RLM_MAX_DEPTH: "9",
+				},
+				env: { HERDR_PANE_ID: "pane-1" },
+			});
+			expect(restoreCreates.every((request) => request.lifecycle === undefined)).toBe(true);
+			expect(mockState.requestPayloads.some((request) => request.type === "promote_owned_session")).toBe(false);
+			expect(retryStatus.handoffCompletion).toMatchObject({
+				requestId: "restart-1",
+				counts: { total: 1, restored: 1, resumed: 1, failed: 0 },
+				restoredSessions: [{ sessionId: "session-1", sourceActiveSessionId: "old-active" }],
+				continuation: { sessionId: "session-1", admissionStatus: "already_admitted" },
+			});
+			const restoreCount = mockState.requestPayloads.filter(
+				(request) => request.type === "restore_planned_restart_handoff",
+			).length;
+			// Simulate a crash after the full completion proof/status fsync but before
+			// the prepared manifest unlink. The retry must return the same proof and
+			// durably finish cleanup without replaying any session.
+			writeFileSync(
+				mockState.preparedManifestPath,
+				`${JSON.stringify(mockState.prepareManifest)}
+`,
+			);
+			const proofRetry = await runDaemonUpdateRestartCoordinator({
+				socketPath: mockState.socketPath,
+				agentDir,
+				statusPath: join(agentDir, "update-restarts", "proof-retry-status.json"),
+				handoffRequestId: "restart-1",
+			});
+			expect(proofRetry.handoffCompletion).toEqual(retryStatus.handoffCompletion);
+			expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+			const postClearRetry = await runDaemonUpdateRestartCoordinator({
+				socketPath: mockState.socketPath,
+				agentDir,
+				statusPath: join(agentDir, "update-restarts", "post-clear-status.json"),
+				handoffRequestId: "restart-1",
+			});
+			expect(postClearRetry.handoffCompletion).toEqual(retryStatus.handoffCompletion);
+			expect(
+				mockState.requestPayloads.filter((request) => request.type === "restore_planned_restart_handoff"),
+			).toHaveLength(restoreCount);
+			expect(mockState.requestPayloads.some((request) => request.type === "prompt")).toBe(false);
+		} finally {
+			errorSpy.mockRestore();
+			logSpy.mockRestore();
+		}
+	});
+
 	it("continues restoring later sessions when one session restore throws", async () => {
 		const failedSessionFile = join(projectDir, "failed.jsonl");
 		const restoredSessionFile = join(projectDir, "restored.jsonl");
 		mockState.createThrowSessionPaths = [failedSessionFile];
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -1174,7 +1360,7 @@ describe("self-update daemon restart", () => {
 		const childSessionFile = join(projectDir, "child.jsonl");
 		mockState.createActiveSessionIds = ["new-parent", "new-child"];
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -1247,6 +1433,37 @@ describe("self-update daemon restart", () => {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();
 		}
+	});
+
+	it("preserves absent and empty launch environments and rejects hostile fields", async () => {
+		const manifest = createAcceptedRecoveryManifest();
+		const session = manifest.sessions[0]!;
+		mockState.prepareResponse = {
+			success: true,
+			data: { ...manifest, sessions: [{ ...session, launchEnv: {} }] },
+		};
+		const empty = await prepareDaemonUpdateRestart(mockState.socketPath, agentDir);
+		expect(empty.sessions[0]).toHaveProperty("launchEnv", {});
+
+		mockState.prepareResponse = { success: true, data: manifest };
+		const absent = await prepareDaemonUpdateRestart(mockState.socketPath, agentDir);
+		expect(absent.sessions[0]).not.toHaveProperty("launchEnv");
+
+		mockState.prepareResponse = { success: true, data: { ...manifest, formatVersion: 1 } };
+		const migrated = await prepareDaemonUpdateRestart(mockState.socketPath, agentDir);
+		expect(migrated.formatVersion).toBe(2);
+		expect(migrated.sessions[0]).not.toHaveProperty("launchEnv");
+
+		mockState.prepareResponse = {
+			success: true,
+			data: { ...manifest, sessions: [{ ...session, launchEnv: { constructor: "malicious" } }] },
+		};
+		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow("invalid launchEnv key");
+		mockState.prepareResponse = {
+			success: true,
+			data: { ...manifest, sessions: [{ ...session, launchEnv: { BIG: "x".repeat(256 * 1024) } }] },
+		};
+		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow("oversized launchEnv");
 	});
 
 	it("rejects malformed recovery actions while parsing the manifest", async () => {
@@ -1337,7 +1554,7 @@ describe("self-update daemon restart", () => {
 			},
 		};
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{
@@ -1369,10 +1586,10 @@ describe("self-update daemon restart", () => {
 			});
 			mockState.prepareResponse = {
 				success: true,
-				data: { ...mockState.prepareManifest, formatVersion: 2 },
+				data: { ...mockState.prepareManifest, formatVersion: 3 },
 			};
 			await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
-				"Unsupported daemon update restart format version: 2",
+				"Unsupported daemon update restart format version: 3",
 			);
 		} finally {
 			errorSpy.mockRestore();
@@ -1406,7 +1623,7 @@ describe("self-update daemon restart", () => {
 			},
 		};
 		mockState.prepareManifest = {
-			formatVersion: 1,
+			formatVersion: 2,
 			createdAt: "2026-07-07T00:00:00.000Z",
 			sessions: [
 				{

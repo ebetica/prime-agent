@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
+import type { AgentSessionResourceConfig } from "../../core/agent-session-config.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -449,6 +450,20 @@ export class AgentConnectionPromptAdmissionError extends Error {
 	}
 }
 
+export interface AgentConnectionReloadOptions extends AgentSessionResourceConfig {
+	/** Atomically refuse the reload if the session has active or admitted work. */
+	ifIdle?: boolean;
+}
+
+export interface AgentConnectionSetModelOptions {
+	/**
+	 * Refuse the change instead of applying it while the session is working.
+	 * A caller in another process cannot check busyness and then switch without
+	 * racing whatever begins in between, so the session tests it itself.
+	 */
+	ifIdle?: boolean;
+}
+
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
@@ -522,6 +537,11 @@ export type AgentConnectionQueuedMessageLane = QueuedMessageLane;
 export type AgentConnectionQueuedMessageMutation = QueuedMessageMutation;
 /** "unsupported" is returned only by remote connections whose daemon predates queued-message mutation. */
 export type AgentConnectionQueuedMessageMutationStatus = QueuedMessageMutationStatus | "unsupported";
+export interface AgentConnectionQueuedUserAction {
+	id: string;
+	text: string;
+	delivery: "steering" | "followUp";
+}
 
 export interface AgentConnectionHeartbeat {
 	job: AgentCronJob;
@@ -659,6 +679,9 @@ export interface AgentConnection {
 		expectedText: string,
 		mutation: AgentConnectionQueuedMessageMutation,
 	): Promise<AgentConnectionQueuedMessageMutationStatus>;
+	getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]>;
+	cancelQueuedAction(id: string): Promise<boolean>;
+
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
@@ -729,7 +752,7 @@ export interface AgentConnection {
 	abortBranchSummary(): Promise<void>;
 	abortRetry(): Promise<void>;
 
-	reload(): Promise<void>;
+	reload(options?: AgentConnectionReloadOptions): Promise<void>;
 	newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }>;
 	switchSession(sessionPath: string, options?: AgentConnectionSwitchSessionOptions): Promise<{ cancelled: boolean }>;
 	fork(entryId: string, options?: AgentConnectionForkOptions): Promise<{ cancelled: boolean; selectedText?: string }>;

@@ -1,8 +1,20 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+	writeSync,
+} from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
@@ -21,7 +33,12 @@ import {
 	formatAgentSessionNameUnavailable,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import {
+	type AgentSessionRuntimeConfig,
+	isAgentSessionResourceConfig,
+	mergeAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "../../core/agent-session-config.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -52,7 +69,11 @@ import { CoalescedWorkerRefresh } from "./coalesced-worker-refresh.js";
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	AtomicResourceReloadRestartRequiredError,
+	deserializeDaemonError,
+	serializeDaemonError,
+} from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -69,11 +90,13 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPlannedRestartHandoff,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -119,6 +142,14 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import {
+	acknowledgePlannedRestartHandoff,
+	cancelPlannedRestartHandoff,
+	readPlannedRestartHandoff,
+	registerPlannedRestartHandoff,
+	updatePlannedRestartHandoff,
+	validatePlannedRestartRequest,
+} from "./planned-restart-handoff.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
@@ -172,6 +203,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"follow_up",
 	"restore_next_turn",
 	"restore_actions",
+	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -201,6 +233,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",
 	"get_queue",
 	"mutate_queued_message",
+	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
@@ -248,6 +281,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
+	"register_planned_restart_handoff",
+	"cancel_planned_restart_handoff",
+	"acknowledge_planned_restart_handoff",
 	"prepare_update_restart",
 	"retry_worker",
 	"restart",
@@ -407,6 +443,26 @@ function responseWithId(response: DaemonResponse, id: string | undefined): Daemo
 	return { ...response, id };
 }
 
+function withoutPendingResourceReload(descriptor: DaemonWorkerDescriptor): DaemonWorkerDescriptor {
+	const { pendingResourceReload: _pending, ...committed } = descriptor;
+	return committed;
+}
+
+function launchEnvironmentDigest(environment: Record<string, string>): string {
+	const canonical = Object.keys(environment)
+		.sort()
+		.map((key) => [key, environment[key]] as const);
+	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function launchEnvironmentsEqual(
+	left: Record<string, string> | undefined,
+	right: Record<string, string> | undefined,
+): boolean {
+	if (left === undefined || right === undefined) return left === right;
+	return launchEnvironmentDigest(left) === launchEnvironmentDigest(right);
+}
+
 function isSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
 		return false;
@@ -430,12 +486,17 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.launchEnvDigest === undefined || /^[a-f0-9]{64}$/.test(descriptor.launchEnvDigest)) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
 		typeof descriptor.createdAt === "string" &&
 		typeof descriptor.updatedAt === "string" &&
 		Number.isInteger(descriptor.consecutiveFailures) &&
+		(descriptor.pendingResourceReload === undefined ||
+			(typeof descriptor.pendingResourceReload === "object" &&
+				typeof descriptor.pendingResourceReload.transactionId === "string" &&
+				isAgentSessionResourceConfig(descriptor.pendingResourceReload.resources))) &&
 		descriptor.createCommand !== undefined &&
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
@@ -598,6 +659,8 @@ export class DaemonSupervisor {
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
 	private workerStopCounts?: Map<ResidentWorker, number>;
+	private preparedLaunchEnvironments = new Map<string, Record<string, string>>();
+	private readonly resourceReloadTails = new Map<string, Promise<void>>();
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
@@ -919,7 +982,74 @@ export class DaemonSupervisor {
 		};
 	}
 
+	private loadPreparedLaunchEnvironments(): Map<string, Record<string, string>> {
+		const environments = new Map<string, Record<string, string>>();
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) return environments;
+		try {
+			const manifestPath = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
+			const directory = dirname(manifestPath);
+			const tempPrefix = `${basename(manifestPath)}.`;
+			let removedTemp = false;
+			for (const name of readdirSync(directory)) {
+				if (name.startsWith(tempPrefix) && name.endsWith(".tmp")) {
+					rmSync(join(directory, name), { force: true });
+					removedTemp = true;
+				}
+			}
+			if (removedTemp) {
+				const descriptor = openSync(directory, "r");
+				try {
+					fsyncSync(descriptor);
+				} finally {
+					closeSync(descriptor);
+				}
+			}
+			const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+				formatVersion?: unknown;
+				sessions?: unknown;
+			};
+			if (parsed.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION || !Array.isArray(parsed.sessions)) {
+				return environments;
+			}
+			for (const candidate of parsed.sessions) {
+				if (!candidate || typeof candidate !== "object") continue;
+				const session = candidate as { sessionFile?: unknown; launchEnv?: unknown };
+				if (
+					typeof session.sessionFile !== "string" ||
+					!session.launchEnv ||
+					typeof session.launchEnv !== "object"
+				) {
+					continue;
+				}
+				const entries = Object.entries(session.launchEnv);
+				if (
+					entries.length > 256 ||
+					entries.some(
+						([key, value]) =>
+							!key ||
+							key.length > 256 ||
+							key === "__proto__" ||
+							key === "prototype" ||
+							key === "constructor" ||
+							typeof value !== "string",
+					)
+				) {
+					continue;
+				}
+				const environment = Object.fromEntries(entries) as Record<string, string>;
+				if (Buffer.byteLength(JSON.stringify(environment)) > 256 * 1024) continue;
+				environments.set(canonicalSessionPath(session.sessionFile), environment);
+			}
+		} catch {
+			// No committed restart checkpoint is the normal startup case.
+		}
+		return environments;
+	}
+
 	private loadWorkerDescriptors(): void {
+		this.preparedLaunchEnvironments = this.loadPreparedLaunchEnvironments();
+		const preparedLaunchEnvironments = this.preparedLaunchEnvironments;
 		for (const name of readdirSync(this.descriptorDir)) {
 			if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) {
 				continue;
@@ -933,7 +1063,18 @@ export class DaemonSupervisor {
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
-				this.workers.set(descriptor.workerId, {
+				const preparedLaunchEnv = descriptor.sessionFile
+					? preparedLaunchEnvironments.get(canonicalSessionPath(descriptor.sessionFile))
+					: undefined;
+				const preparedLaunchEnvDigest = preparedLaunchEnv ? launchEnvironmentDigest(preparedLaunchEnv) : undefined;
+				const trustedLaunchEnv =
+					preparedLaunchEnv &&
+					(descriptor.launchEnvDigest === undefined || descriptor.launchEnvDigest === preparedLaunchEnvDigest)
+						? preparedLaunchEnv
+						: undefined;
+				const migratedLaunchEnvDigest = trustedLaunchEnv !== undefined && !descriptor.launchEnvDigest;
+				if (migratedLaunchEnvDigest) descriptor.launchEnvDigest = preparedLaunchEnvDigest!;
+				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -943,7 +1084,10 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
-				});
+					...(trustedLaunchEnv ? { launchEnv: { ...trustedLaunchEnv } } : {}),
+				};
+				this.workers.set(descriptor.workerId, worker);
+				if (migratedLaunchEnvDigest) this.persistWorker(worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -988,12 +1132,17 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private persistWorker(worker: ResidentWorker): void {
-		worker.descriptor.updatedAt = new Date().toISOString();
+	private persistWorkerDescriptor(worker: ResidentWorker, descriptor: DaemonWorkerDescriptor): void {
+		const candidate = { ...descriptor, updatedAt: new Date().toISOString() };
 		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(worker.descriptor, null, 2)}\n`, { mode: 0o600 });
+		writeFileSync(tempPath, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
+		worker.descriptor = candidate;
+	}
+
+	private persistWorker(worker: ResidentWorker): void {
+		this.persistWorkerDescriptor(worker, worker.descriptor);
 	}
 
 	private deleteWorkerDescriptor(worker: ResidentWorker): void {
@@ -1379,6 +1528,21 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private async acquireResourceReloadLock(workerId: string): Promise<() => void> {
+		const previous = this.resourceReloadTails.get(workerId) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const tail = previous.then(() => current);
+		this.resourceReloadTails.set(workerId, tail);
+		await previous;
+		return () => {
+			release();
+			if (this.resourceReloadTails.get(workerId) === tail) this.resourceReloadTails.delete(workerId);
+		};
+	}
+
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
@@ -1547,6 +1711,98 @@ export class DaemonSupervisor {
 				await this.promoteOwnedWorker(client, match.worker);
 				return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
 			}
+			case "reload": {
+				if (command.resources === undefined) {
+					const match = await this.findWorkerForClient(client, command.activeSessionId);
+					return responseWithId(await this.forwardToWorker(match.worker, command), command.id);
+				}
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+				if (activeSessionId !== match.worker.descriptor.rootActiveSessionId) {
+					throw new Error("Persistent resource reloads must target the worker root session");
+				}
+				const release = await this.acquireResourceReloadLock(match.worker.descriptor.workerId);
+				try {
+					if (!match.worker.client?.supportsServerCapability("atomic_resource_reload")) {
+						throw new AtomicResourceReloadRestartRequiredError();
+					}
+					const response = await this.forwardToWorker(match.worker, command);
+					if (!response.success) return responseWithId(response, command.id);
+					const data = response.data as { transactionId?: unknown; resources?: unknown } | undefined;
+					if (typeof data?.transactionId !== "string" || !data.transactionId) {
+						match.worker.client?.close();
+						throw new Error("Session worker returned an invalid resource reload transaction");
+					}
+					if (!isAgentSessionResourceConfig(data.resources)) {
+						const rollbackResponse = await match.worker.client?.requestWorker({
+							type: "worker_rollback_resource_reload",
+							transactionId: data.transactionId,
+						});
+						if (rollbackResponse && !rollbackResponse.success) match.worker.client?.close();
+						throw new Error("Session worker returned invalid prepared resources");
+					}
+					const resources = data.resources;
+					const previousDescriptor = match.worker.descriptor;
+					const candidate: DaemonWorkerDescriptor = {
+						...previousDescriptor,
+						createCommand: {
+							...previousDescriptor.createCommand,
+							config: mergeAgentSessionResourceConfig(previousDescriptor.createCommand.config, resources),
+						},
+						pendingResourceReload: {
+							transactionId: data.transactionId,
+							resources,
+						},
+					};
+					try {
+						this.persistWorkerDescriptor(match.worker, candidate);
+					} catch (error) {
+						try {
+							const rollbackResponse = await match.worker.client?.requestWorker({
+								type: "worker_rollback_resource_reload",
+								transactionId: data.transactionId,
+							});
+							if (rollbackResponse && !rollbackResponse.success) throw deserializeDaemonError(rollbackResponse);
+						} catch (rollbackError) {
+							match.worker.client?.close();
+							this.log(`Could not roll back resource reload after descriptor failure: ${String(rollbackError)}`);
+						}
+						throw error;
+					}
+					try {
+						const commitResponse = await match.worker.client?.requestWorker({
+							type: "worker_commit_resource_reload",
+							transactionId: data.transactionId,
+						});
+						if (!commitResponse) throw new Error("Session worker disconnected during resource reload commit");
+						if (!commitResponse.success) throw deserializeDaemonError(commitResponse);
+					} catch (error) {
+						// The committed descriptor is authoritative. Keep the marker so a
+						// replacement supervisor commits the still-fenced transaction or
+						// a replacement worker starts directly from the new config. The
+						// caller must not treat a lost commit reply as a definite rollback.
+						match.worker.client?.close();
+						return failure(
+							command.id,
+							command.type,
+							`Resource reload commit result is uncertain: ${String(error)}`,
+							{
+								code: "command_result_uncertain",
+								clientId: this.protocolClientId(client),
+								commandId: command.id ?? "reload",
+							},
+						);
+					}
+					try {
+						this.persistWorkerDescriptor(match.worker, withoutPendingResourceReload(match.worker.descriptor));
+					} catch (error) {
+						this.log(`Could not clear committed resource reload marker: ${String(error)}`);
+					}
+					return success(command.id, "reload", { resources });
+				} finally {
+					release();
+				}
+			}
 			case "retry_worker": {
 				const direct = [...this.workers.values()].find(
 					(worker) =>
@@ -1577,8 +1833,96 @@ export class DaemonSupervisor {
 			case "shutdown":
 				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
 				return success(command.id, "shutdown");
+			case "register_planned_restart_handoff": {
+				const handoff = await this.registerPlannedRestartHandoff(command);
+				return success(command.id, command.type, handoff);
+			}
+			case "cancel_planned_restart_handoff": {
+				if (!command.workerToken) throw new Error("Planned restart worker token is required");
+				const match = await this.findWorker(
+					command.activeSessionId,
+					(worker) => worker.descriptor.authenticationToken === command.workerToken,
+				);
+				const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+				if (activeSessionId !== command.activeSessionId) {
+					throw new Error(`Unknown active session: ${command.activeSessionId}`);
+				}
+				const result = cancelPlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+					{ activeSessionId, sessionId: match.summary.sessionId },
+				);
+				return success(command.id, command.type, result);
+			}
+			case "acknowledge_planned_restart_handoff": {
+				await this.assertCurrentOwnership();
+				const owner = this.ownership?.record;
+				if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+				const result = acknowledgePlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+					command.acknowledgementToken,
+					{
+						supervisorGeneration: owner.generation,
+						supervisorOwnerToken: owner.token,
+						pid: process.pid,
+						...(owner.processStartId ? { processStartId: owner.processStartId } : {}),
+					},
+				);
+				return success(command.id, command.type, result);
+			}
+			case "restore_planned_restart_handoff": {
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const handoff = readPlannedRestartHandoff(
+					this.plannedRestartAgentDir(),
+					this.socketPath,
+					command.requestId,
+				);
+				if (!handoff) throw new Error(`Unknown planned restart request: ${command.requestId}`);
+				if (
+					(handoff.state !== "prepared" && handoff.state !== "delivered" && handoff.state !== "completed") ||
+					!handoff.claim
+				) {
+					throw new Error(`Planned restart request ${command.requestId} has no strict quiescence claim`);
+				}
+				const owner = this.ownership?.record;
+				if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+				if (
+					handoff.claim.supervisorGeneration === owner.generation ||
+					handoff.claim.supervisorOwnerToken === owner.token
+				) {
+					throw new Error("Planned restart continuation is not eligible in the predecessor runtime");
+				}
+				const summary = match.summary;
+				if (
+					summary.sessionId !== handoff.target.sessionId ||
+					!summary.sessionFile ||
+					canonicalSessionPath(summary.sessionFile) !== canonicalSessionPath(handoff.target.sessionFile)
+				) {
+					throw new Error("Planned restart target session identity does not match");
+				}
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				const workerClient = match.worker.client;
+				if (!workerClient) throw new Error("Planned restart target worker is unavailable");
+				const response = await workerClient.requestWorker(
+					{
+						type: "worker_restore_planned_restart_handoff",
+						activeSessionId,
+						sessionId: summary.sessionId,
+						requestId: handoff.requestId,
+						actionId: handoff.actionId,
+						message: handoff.message,
+					},
+					WORKER_REQUEST_TIMEOUT_MS,
+				);
+				if (!response.success) throw new Error(response.error);
+				updatePlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, handoff, "delivered");
+				return success(command.id, command.type, response.data);
+			}
 			case "prepare_update_restart": {
-				const manifest = await this.prepareUpdateRestart();
+				const manifest = await this.prepareUpdateRestart(command.handoffRequestId);
 				return success(command.id, "prepare_update_restart", manifest);
 			}
 			case "agent_messages_status": {
@@ -2009,7 +2353,12 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+				return this.reuseWorkerForCreate(
+					activeMatches[0]!.worker,
+					ownerClientId,
+					command.sessionPath,
+					command.launchEnv,
+				);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2021,7 +2370,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
-				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
+				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, createCommand.launchEnv);
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -2064,8 +2413,12 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		launchEnv?: Record<string, string>,
 	): ResidentWorker {
 		if (worker.descriptor.ownerClientId === ownerClientId) {
+			if (launchEnv !== undefined && worker.descriptor.launchEnvDigest !== launchEnvironmentDigest(launchEnv)) {
+				throw new Error("Session launch environment does not match its immutable descriptor");
+			}
 			return worker;
 		}
 		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
@@ -2132,7 +2485,6 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		worker.launchEnv = undefined;
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
@@ -2146,8 +2498,31 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
-		const launchEnv =
-			ownerClientId || existing?.descriptor.ownerClientId ? (command.launchEnv ?? existing?.launchEnv) : undefined;
+		if (existing && !existing.launchEnv && command.launchEnv !== undefined && command.sessionPath) {
+			const prepared = this.preparedLaunchEnvironments.get(canonicalSessionPath(command.sessionPath));
+			if (launchEnvironmentsEqual(prepared, command.launchEnv)) {
+				existing.launchEnv = { ...command.launchEnv };
+				existing.descriptor.launchEnvDigest = launchEnvironmentDigest(command.launchEnv);
+				this.persistWorker(existing);
+			}
+		}
+		let trustedResidentRestoreLaunchEnv: Record<string, string> | undefined;
+		if (!existing && !ownerClientId && command.launchEnv !== undefined) {
+			const prepared = command.sessionPath
+				? this.preparedLaunchEnvironments.get(canonicalSessionPath(command.sessionPath))
+				: undefined;
+			if (!launchEnvironmentsEqual(prepared, command.launchEnv)) {
+				throw new Error("Resident launch environment is not authorized by the prepared restart checkpoint");
+			}
+			trustedResidentRestoreLaunchEnv = { ...command.launchEnv };
+		}
+		const launchEnv = existing
+			? existing.launchEnv
+			: ownerClientId
+				? command.launchEnv === undefined
+					? undefined
+					: { ...command.launchEnv }
+				: trustedResidentRestoreLaunchEnv;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2225,6 +2600,7 @@ export class DaemonSupervisor {
 				authenticationToken: token,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
+				...(launchEnv !== undefined ? { launchEnvDigest: launchEnvironmentDigest(launchEnv) } : {}),
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
@@ -2282,7 +2658,11 @@ export class DaemonSupervisor {
 				child.unref();
 			}
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
-			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
+			// The worker needs the exact immutable launch overrides for a future
+			// checkpoint, but they must never enter the durable worker descriptor.
+			const workerCreateCommand: DaemonCreateCommand =
+				launchEnv === undefined ? createCommand : { ...createCommand, launchEnv: { ...launchEnv } };
+			const response = await client.request(withoutCommandId(workerCreateCommand), WORKER_REQUEST_TIMEOUT_MS);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
 			}
@@ -2390,6 +2770,11 @@ export class DaemonSupervisor {
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
+				if (client.supportsServerCapability("atomic_resource_reload")) {
+					await this.reconcilePendingResourceReload(worker, client);
+				} else if (worker.descriptor.pendingResourceReload) {
+					throw new Error("Legacy worker cannot reconcile a committed resource reload");
+				}
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -2401,6 +2786,34 @@ export class DaemonSupervisor {
 			}
 		}
 		throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+	}
+
+	private async reconcilePendingResourceReload(worker: ResidentWorker, client: DaemonWorkerClient): Promise<void> {
+		const listed = await client.requestWorker({ type: "worker_list_resource_reloads" });
+		if (!listed.success) throw deserializeDaemonError(listed);
+		const transactions =
+			typeof listed.data === "object" && listed.data !== null && "transactions" in listed.data
+				? ((listed.data as { transactions?: Array<{ transactionId?: unknown }> }).transactions ?? [])
+				: [];
+		const marker = worker.descriptor.pendingResourceReload;
+		for (const transaction of transactions) {
+			if (typeof transaction.transactionId !== "string") {
+				throw new Error("Worker reported a malformed resource reload transaction");
+			}
+			const response = await client.requestWorker({
+				type:
+					marker?.transactionId === transaction.transactionId
+						? "worker_commit_resource_reload"
+						: "worker_rollback_resource_reload",
+				transactionId: transaction.transactionId,
+			});
+			if (!response.success) throw deserializeDaemonError(response);
+		}
+		if (marker) {
+			// If the transaction was absent, this is a replacement worker and it
+			// already started from the committed createCommand config.
+			this.persistWorkerDescriptor(worker, withoutPendingResourceReload(worker.descriptor));
+		}
 	}
 
 	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
@@ -2774,6 +3187,12 @@ export class DaemonSupervisor {
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
+			return;
+		}
+		if (worker.descriptor.launchEnvDigest && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for the trusted launch environment checkpoint";
+			this.persistWorker(worker);
 			return;
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
@@ -3360,6 +3779,26 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
+		if (command.launchEnv !== undefined) {
+			const descriptorMatches = [...this.workers.values()].filter(
+				(worker) =>
+					worker.descriptor.rootActiveSessionId === command.activeSessionId ||
+					worker.descriptor.rootSessionId === command.activeSessionId,
+			);
+			if (descriptorMatches.length === 1) {
+				const worker = descriptorMatches[0]!;
+				const expectedDigest = worker.descriptor.launchEnvDigest;
+				if (expectedDigest) {
+					if (expectedDigest !== launchEnvironmentDigest(command.launchEnv)) {
+						throw new Error("Session launch environment does not match its immutable descriptor");
+					}
+					if (worker.launchEnv === undefined) worker.launchEnv = { ...command.launchEnv };
+					else if (!launchEnvironmentsEqual(worker.launchEnv, command.launchEnv)) {
+						throw new Error("Session launch environment is immutable");
+					}
+				}
+			}
+		}
 		const ownedWorker = [...this.workers.values()].find(
 			(worker) =>
 				worker.descriptor.ownerClientId !== undefined &&
@@ -3371,7 +3810,20 @@ export class DaemonSupervisor {
 				throw new Error(`Unknown active session: ${command.activeSessionId}`);
 			}
 			this.assertTelemetryAttachAllowed(ownedWorker, command.telemetryDisabled);
-			ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
+			if (command.launchEnv !== undefined) {
+				const digest = launchEnvironmentDigest(command.launchEnv);
+				if (ownedWorker.descriptor.launchEnvDigest && ownedWorker.descriptor.launchEnvDigest !== digest) {
+					throw new Error("Session launch environment does not match its immutable descriptor");
+				}
+				if (!ownedWorker.descriptor.launchEnvDigest) {
+					ownedWorker.descriptor.launchEnvDigest = digest;
+					this.persistWorker(ownedWorker);
+				}
+				if (ownedWorker.launchEnv === undefined) ownedWorker.launchEnv = { ...command.launchEnv };
+				else if (!launchEnvironmentsEqual(ownedWorker.launchEnv, command.launchEnv)) {
+					throw new Error("Session launch environment is immutable");
+				}
+			}
 			if (!ownedWorker.client || ownedWorker.descriptor.lifecycle !== "ready") {
 				if (!ownedWorker.launchEnv) {
 					throw new Error("Client-owned session recovery requires the owning client environment");
@@ -3388,6 +3840,20 @@ export class DaemonSupervisor {
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
+		if (
+			command.launchEnv !== undefined &&
+			match.worker.descriptor.ownerClientId === undefined &&
+			match.worker.descriptor.launchEnvDigest
+		) {
+			const digest = launchEnvironmentDigest(command.launchEnv);
+			if (match.worker.descriptor.launchEnvDigest !== digest) {
+				throw new Error("Session launch environment does not match its immutable descriptor");
+			}
+			if (match.worker.launchEnv === undefined) match.worker.launchEnv = { ...command.launchEnv };
+			else if (!launchEnvironmentsEqual(match.worker.launchEnv, command.launchEnv)) {
+				throw new Error("Session launch environment is immutable");
+			}
+		}
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {
@@ -4414,8 +4880,59 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
+	private plannedRestartAgentDir(): string {
+		const agentDir = this.defaultSessionConfig.agentDir;
+		if (!agentDir) throw new Error("Daemon supervisor config is missing agentDir");
+		return agentDir;
+	}
+
+	private async registerPlannedRestartHandoff(
+		command: Extract<DaemonCommand, { type: "register_planned_restart_handoff" }>,
+	): Promise<DaemonPlannedRestartHandoff> {
+		validatePlannedRestartRequest(command.requestId, command.message);
+		if (!command.workerToken) throw new Error("Planned restart worker token is required");
+		const match = await this.findWorker(
+			command.activeSessionId,
+			(worker) => worker.descriptor.authenticationToken === command.workerToken,
+		);
+		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+		if (activeSessionId !== command.activeSessionId || !match.summary.sessionFile) {
+			throw new Error(`Unknown active session: ${command.activeSessionId}`);
+		}
+		return registerPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, {
+			requestId: command.requestId,
+			target: {
+				activeSessionId,
+				sessionId: match.summary.sessionId,
+				sessionFile: canonicalSessionPath(match.summary.sessionFile),
+			},
+			message: command.message,
+			actionId: `planned-restart:${createHash("sha256").update(command.requestId).digest("hex")}`,
+		});
+	}
+
+	private async resolvePlannedRestartHandoff(requestId: string): Promise<DaemonPlannedRestartHandoff> {
+		const handoff = readPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, requestId);
+		if (!handoff) throw new Error(`Unknown planned restart request: ${requestId}`);
+		if (handoff.state === "delivered") throw new Error(`Planned restart request ${requestId} was already delivered`);
+		const match = await this.findWorker(handoff.target.activeSessionId);
+		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
+		if (
+			activeSessionId !== handoff.target.activeSessionId ||
+			match.summary.sessionId !== handoff.target.sessionId ||
+			!match.summary.sessionFile ||
+			canonicalSessionPath(match.summary.sessionFile) !== canonicalSessionPath(handoff.target.sessionFile)
+		) {
+			throw new Error(
+				`Planned restart target ${handoff.target.activeSessionId} no longer has the registered identity`,
+			);
+		}
+		return handoff;
+	}
+
+	private async prepareUpdateRestart(handoffRequestId?: string): Promise<DaemonUpdateRestartManifest> {
 		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
+		let handoff: DaemonPlannedRestartHandoff | undefined;
 		this.updateRestartPhase = "draining";
 		try {
 			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
@@ -4423,16 +4940,37 @@ export class DaemonSupervisor {
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
-			const manifest = await this.prepareUpdateRestartFenced(deadline);
+			handoff = handoffRequestId ? await this.resolvePlannedRestartHandoff(handoffRequestId) : undefined;
+			const manifest = await this.prepareUpdateRestartFenced(deadline, handoff);
 			this.updateRestartPhase = "prepared";
 			return manifest;
 		} catch (error) {
-			this.updateRestartPhase = undefined;
+			const failedHandoff =
+				handoff ??
+				(handoffRequestId
+					? readPlannedRestartHandoff(this.plannedRestartAgentDir(), this.socketPath, handoffRequestId)
+					: undefined);
+			const updatedHandoff = failedHandoff
+				? updatePlannedRestartHandoff(
+						this.plannedRestartAgentDir(),
+						this.socketPath,
+						failedHandoff,
+						"failed",
+						error instanceof Error ? error.message : String(error),
+					)
+				: undefined;
+			// A published strict claim is monotonic. Its workers have closed all
+			// sessions and remain publication-fenced, so an after-commit failure
+			// must not reopen ingress or make the continuation ineligible.
+			this.updateRestartPhase = updatedHandoff?.state === "prepared" ? "prepared" : undefined;
 			throw error;
 		}
 	}
 
-	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
+	private async prepareUpdateRestartFenced(
+		deadline: number,
+		handoff?: DaemonPlannedRestartHandoff,
+	): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) =>
@@ -4448,8 +4986,13 @@ export class DaemonSupervisor {
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const client = worker.client;
+				const ownsHandoff = handoff ? worker.summaries.has(handoff.target.activeSessionId) : false;
 				const response = await client.requestWorker(
-					{ type: "worker_prepare_update" },
+					{
+						type: "worker_prepare_update",
+						...(handoff ? { strict: true } : {}),
+						...(ownsHandoff ? { handoff } : {}),
+					},
 					Math.max(1, Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now())),
 				);
 				if (!response.success) throw new Error(response.error);
@@ -4464,6 +5007,9 @@ export class DaemonSupervisor {
 				const manifest = response.data as DaemonUpdateRestartManifest;
 				if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
 					throw new Error(`Worker returned unsupported update manifest version ${manifest.formatVersion}`);
+				}
+				if (manifest.sessions.some((session) => !launchEnvironmentsEqual(session.launchEnv, worker.launchEnv))) {
+					throw new Error(`Worker ${worker.descriptor.workerId} returned an untrusted launch environment`);
 				}
 				if (
 					!manifest.sessions.some(
@@ -4516,7 +5062,20 @@ export class DaemonSupervisor {
 			createdAt: new Date().toISOString(),
 			sessions: responses.flatMap((manifest) => manifest.sessions),
 			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
+			...(handoff ? { handoff } : {}),
 		};
+		if (handoff) {
+			const capturedTargets = manifest.sessions.filter(
+				(session) =>
+					session.activeSessionId === handoff.target.activeSessionId &&
+					session.sessionId === handoff.target.sessionId &&
+					canonicalSessionPath(session.sessionFile) === canonicalSessionPath(handoff.target.sessionFile),
+			);
+			if (capturedTargets.length !== 1) {
+				await cancelAcknowledged();
+				throw new Error("Planned restart target was not captured exactly once under the quiescence fence");
+			}
+		}
 		// A worker that disconnected after preparing cancelled its checkpoint with
 		// the old client; a recovered replacement may have admitted inputs past the
 		// captured manifest. Abort before the manifest is persisted so the caller's
@@ -4539,6 +5098,30 @@ export class DaemonSupervisor {
 		// worker that no longer holds the checkpoint.
 		const commitClients = new Map(prepared.map((worker) => [worker, worker.updateRestartPrepareClient]));
 		for (const worker of prepared) worker.updateRestartPrepareClient = undefined;
+		let handoffClaimed = false;
+		const publishHandoffClaim = async () => {
+			if (!handoff || handoffClaimed) return;
+			await this.assertCurrentOwnership();
+			const owner = this.ownership?.record;
+			if (!owner) throw new Error("Daemon supervisor ownership is unavailable");
+			manifest.handoff = updatePlannedRestartHandoff(
+				this.plannedRestartAgentDir(),
+				this.socketPath,
+				handoff,
+				"prepared",
+				undefined,
+				{
+					claimedAt: new Date().toISOString(),
+					supervisorGeneration: owner.generation,
+					supervisorOwnerToken: owner.token,
+					supervisorPid: owner.pid,
+					...(owner.processStartId ? { supervisorProcessStartId: owner.processStartId } : {}),
+					supervisorSocketPath: owner.socketPath,
+				},
+			);
+			this.validateAndPersistUpdateManifest(manifest);
+			handoffClaimed = true;
+		};
 		const commitResults = await Promise.allSettled(
 			prepared.map(async (worker) => {
 				const client = commitClients.get(worker);
@@ -4553,16 +5136,34 @@ export class DaemonSupervisor {
 		const commitFailure = commitResults.find(
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
+		// A commit response is the durable quiescence boundary: the worker has closed
+		// every session and remains publication-fenced until the supervisor stops it.
+		// Publish before process teardown so a supervisor crash cannot strand the
+		// continuation between the last worker exit and the strict-claim write.
+		if (!commitFailure) await publishHandoffClaim();
+		let forcedStopResults: PromiseSettledResult<void>[] = [];
 		if (commitFailure) {
 			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
-			return manifest;
+			forcedStopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		} else {
+			const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
+			if (stopResults.some((result) => result.status === "rejected")) {
+				this.log("A committed update worker did not stop gracefully; forcing restart completion");
+				forcedStopResults = await Promise.allSettled(
+					prepared.map((worker) => this.stopWorker(worker, false, true)),
+				);
+			}
 		}
-		const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
-		if (stopResults.some((result) => result.status === "rejected")) {
-			this.log("A committed update worker did not stop gracefully; forcing restart completion");
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		if (!handoff) return manifest;
+		const failedStop = forcedStopResults.find(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (failedStop || this.workers.size > 0) {
+			throw new Error(
+				`Strict planned restart could not stop every worker: ${String(failedStop?.reason ?? "resident worker remains")}`,
+			);
 		}
+		await publishHandoffClaim();
 		return manifest;
 	}
 
@@ -4598,14 +5199,27 @@ export class DaemonSupervisor {
 		}
 		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		chmodSync(dirname(path), 0o700);
 		const tempPath = `${path}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+		const descriptor = openSync(tempPath, "w", 0o600);
+		try {
+			writeSync(descriptor, `${JSON.stringify(manifest)}\n`);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
 		chmodSync(tempPath, 0o600);
 		const validated = JSON.parse(readFileSync(tempPath, "utf8")) as DaemonUpdateRestartManifest;
 		if (!Array.isArray(validated.sessions) || validated.sessions.length !== manifest.sessions.length) {
 			throw new Error("Could not validate aggregate update manifest");
 		}
 		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(dirname(path), "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	}
 
 	/**

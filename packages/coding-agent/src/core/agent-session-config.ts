@@ -2,6 +2,46 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 
 export type AgentExecutionMode = "interactive" | "print" | "json" | "rpc" | "acp";
+/** Resource paths that may be replaced atomically on a live session. */
+export interface AgentSessionResourceConfig {
+	appendSystemPrompt?: string[];
+	contextDirectories?: string[];
+	extensions?: string[];
+	skills?: string[];
+	promptTemplates?: string[];
+	themes?: string[];
+}
+
+export const RESOURCE_CONFIG_KEYS = [
+	"appendSystemPrompt",
+	"contextDirectories",
+	"extensions",
+	"skills",
+	"promptTemplates",
+	"themes",
+] as const;
+
+export function isAgentSessionResourceConfig(value: unknown): value is AgentSessionResourceConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	if (Object.keys(record).some((key) => !(RESOURCE_CONFIG_KEYS as readonly string[]).includes(key))) return false;
+	return RESOURCE_CONFIG_KEYS.every((key) => {
+		const values = record[key];
+		return values === undefined || (Array.isArray(values) && values.every((entry) => typeof entry === "string"));
+	});
+}
+
+export function mergeAgentSessionResourceConfig(
+	base: AgentSessionRuntimeConfig | undefined,
+	override: AgentSessionResourceConfig,
+): AgentSessionRuntimeConfig {
+	const merged: AgentSessionRuntimeConfig = { ...(base ?? {}) };
+	for (const key of RESOURCE_CONFIG_KEYS) {
+		const value = override[key];
+		if (value !== undefined) merged[key] = [...value];
+	}
+	return merged;
+}
 
 export interface AgentSessionRuntimeConfig {
 	cwd?: string;
@@ -12,6 +52,7 @@ export interface AgentSessionRuntimeConfig {
 	apiKey?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
+	contextDirectories?: string[];
 	thinking?: ThinkingLevel;
 	models?: string[];
 	tools?: string[];
@@ -63,6 +104,7 @@ export function mergeAgentSessionRuntimeConfig(
 		apiKey: override.apiKey ?? base.apiKey,
 		systemPrompt: override.systemPrompt ?? base.systemPrompt,
 		appendSystemPrompt: cloneArray(override.appendSystemPrompt ?? base.appendSystemPrompt),
+		contextDirectories: cloneArray(override.contextDirectories ?? base.contextDirectories),
 		thinking: override.thinking ?? base.thinking,
 		models: cloneArray(override.models ?? base.models),
 		tools: cloneArray(override.tools ?? base.tools),
@@ -93,6 +135,7 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 	return {
 		...config,
 		appendSystemPrompt: cloneArray(config.appendSystemPrompt),
+		contextDirectories: cloneArray(config.contextDirectories),
 		models: cloneArray(config.models),
 		tools: cloneArray(config.tools),
 		extensions: cloneArray(config.extensions),

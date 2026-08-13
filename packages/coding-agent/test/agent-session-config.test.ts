@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
+import {
+	type AgentSessionRuntimeConfig,
+	mergeAgentSessionResourceConfig,
+	mergeAgentSessionRuntimeConfig,
+} from "../src/core/agent-session-config.js";
 
 describe("mergeAgentSessionRuntimeConfig", () => {
 	it("applies session overrides without mutating default config", () => {
@@ -167,5 +171,26 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 		expect(mergeAgentSessionRuntimeConfig({ telemetryDisabled: true }, {}).telemetryDisabled).toBe(true);
 		expect(mergeAgentSessionRuntimeConfig({}, { telemetryDisabled: true }).telemetryDisabled).toBe(true);
 		expect(mergeAgentSessionRuntimeConfig({}, {}).telemetryDisabled).toBeUndefined();
+	});
+});
+
+describe("mergeAgentSessionResourceConfig", () => {
+	it("replaces only supplied resource arrays, supports clearing, and clones values", () => {
+		const base: AgentSessionRuntimeConfig = {
+			cwd: "/repo",
+			extensions: ["old-extension"],
+			skills: ["old-skills"],
+			contextDirectories: ["old-context"],
+		};
+		const extensions = ["new-extension"];
+		const merged = mergeAgentSessionResourceConfig(base, { extensions, skills: [] });
+		expect(merged).toEqual({
+			cwd: "/repo",
+			extensions: ["new-extension"],
+			skills: [],
+			contextDirectories: ["old-context"],
+		});
+		expect(merged.extensions).not.toBe(extensions);
+		expect(base.extensions).toEqual(["old-extension"]);
 	});
 });

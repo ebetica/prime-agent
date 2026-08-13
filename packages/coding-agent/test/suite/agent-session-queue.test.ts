@@ -372,32 +372,41 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it.each([
-		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort() },
+		// An ordinary abort settles to idle and the backlog resumes in order, so the
+		// queued follow-up is delivered rather than left waiting for another prompt.
+		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort(), resumes: true },
+		// A restart abort must leave it queued: the manifest carries queued input
+		// across the replacement instead of starting a turn during teardown.
 		{
 			name: "abortForUpdateRestart",
 			abort: (harness: Harness) => harness.session.abortForUpdateRestart(),
+			resumes: false,
 		},
-	])("cancels scheduled post-compaction continuation at $name without dropping queued input", async ({ abort }) => {
-		vi.useFakeTimers();
-		const harness = await createAutoRefineHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as AutoRefineInternals;
-		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+	])(
+		"cancels scheduled post-compaction continuation at $name without dropping queued input",
+		async ({ abort, resumes }) => {
+			vi.useFakeTimers();
+			const harness = await createAutoRefineHarness();
+			harnesses.push(harness);
+			const internals = harness.session as unknown as AutoRefineInternals;
+			const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 
-		try {
-			internals._schedulePostCompactionContinue();
-			await harness.session.followUp("queued across abort");
+			try {
+				internals._schedulePostCompactionContinue();
+				await harness.session.followUp("queued across abort");
 
-			abort(harness);
-			await vi.advanceTimersByTimeAsync(100);
+				abort(harness);
+				await vi.advanceTimersByTimeAsync(100);
 
-			expect(continueAgent).not.toHaveBeenCalled();
-			expect(internals._postCompactionContinuationScheduled).toBe(false);
-			expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
+				expect(continueAgent).not.toHaveBeenCalled();
+				expect(internals._postCompactionContinuationScheduled).toBe(false);
+				expect(harness.session.getFollowUpMessages()).toEqual(resumes ? [] : ["queued across abort"]);
+				expect(getUserTexts(harness)).toEqual(resumes ? ["queued across abort"] : []);
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
 		vi.useFakeTimers();
@@ -1649,6 +1658,47 @@ describe("AgentSession queue characterization", () => {
 		dispatchGate.resolve();
 		await harness.session.waitForIdle();
 		expect(getUserTexts(harness)).toEqual(["handed off"]);
+		expect(getAssistantTexts(harness)).toEqual(["delivered"]);
+	});
+
+	it("cancels exactly one queued action by stable identity", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("survivors delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("same", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("same", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("last", undefined, { resumeIfIdle: true });
+
+		const actions = harness.session.getQueuedUserActions();
+		expect(actions.map((action) => action.text)).toEqual(["same", "same", "last"]);
+		expect(new Set(actions.map((action) => action.id)).size).toBe(3);
+		expect(harness.session.cancelQueuedAction(actions[1]!.id)).toBe(true);
+		expect(harness.session.cancelQueuedAction(actions[1]!.id)).toBe(false);
+		expect(harness.session.getQueuedUserActions()).toEqual([actions[0], actions[2]]);
+
+		pause.release();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["same", "last"]);
+	});
+
+	it("refuses cancellation after the exact action leaves the queue", async () => {
+		const hook = gatedHook({ prompt: "claimed" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("claimed", undefined, { resumeIfIdle: true });
+		const [action] = harness.session.getQueuedUserActions();
+		expect(action).toBeDefined();
+
+		pause.release();
+		await hook.reached;
+		expect(harness.session.cancelQueuedAction(action!.id)).toBe(false);
+		hook.release();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["claimed"]);
 		expect(getAssistantTexts(harness)).toEqual(["delivered"]);
 	});
 

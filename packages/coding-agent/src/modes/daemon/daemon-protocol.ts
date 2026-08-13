@@ -6,7 +6,7 @@ import type {
 	AgentSessionMessageSafetyStatus,
 } from "../../core/agent-messages.js";
 import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
-import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import type { AgentSessionResourceConfig, AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -60,8 +60,14 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+// Revision 17 adds daemon-side atomic idle admission for reloads.
+// Revision 18 adds stable queued-user-action identities and atomic cancellation.
+// Revision 19 adds transactional live resource-config replacement.
+// Revision 20 adds authenticated, durable planned-restart handoffs.
+// Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
+// Revision 22 preserves immutable worker launch environment across planned restarts.
+export const DAEMON_SCHEMA_REVISION = 22;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-eb48ac5a9731";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -100,7 +106,12 @@ export type DaemonServerCapability =
 	| "transient_bash"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
-	| "queue_message_mutation";
+	| "queue_message_mutation"
+	| "atomic_reload"
+	| "atomic_resource_reload"
+	| "queued_action_cancellation"
+	| "planned_restart_handoff"
+	| "planned_restart_handoff_lifecycle";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -128,6 +139,11 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"client_owned_sessions",
 ];
 
+export const QUEUED_ACTION_CANCELLATION_COMMAND_TYPES = [
+	"get_queued_user_actions",
+	"cancel_queued_action",
+] as const satisfies readonly DaemonCommand["type"][];
+
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"delete_rlm_subagent",
@@ -139,6 +155,11 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"queue_message_mutation",
+	"atomic_reload",
+	"atomic_resource_reload",
+	"queued_action_cancellation",
+	"planned_restart_handoff",
+	"planned_restart_handoff_lifecycle",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -203,10 +224,16 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+const RESTART_LAUNCH_ENV_KEYS = new Set(["PATH", "RECURSE_MODEL_POLICY", "RECURSE_SAFETY_DIR", "RLM_MAX_DEPTH"]);
+
+export function isDaemonRestartLaunchEnvKey(key: string): boolean {
+	return RESTART_LAUNCH_ENV_KEYS.has(key);
+}
+
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
-		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_")) {
+		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_") && isDaemonRestartLaunchEnvKey(key)) {
 			env[key] = value;
 		}
 	}
@@ -304,7 +331,7 @@ export interface DaemonAttachResult {
 	};
 }
 
-export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 1;
+export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 2;
 
 export interface DaemonUpdateRestartQueue {
 	actions: SessionActionRecoverySnapshot;
@@ -318,6 +345,8 @@ export interface DaemonUpdateRestartSession {
 	cwd: string;
 	config: AgentSessionRuntimeConfig;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
+	/** Trusted process launch overrides, distinct from allowlisted client identity env. */
+	launchEnv?: Record<string, string>;
 	clientEnv?: Record<string, string>;
 	queue: DaemonUpdateRestartQueue;
 	shouldResume: boolean;
@@ -329,11 +358,87 @@ export interface DaemonUpdateRestartSession {
 	hadAcceptedPromptInFlight: boolean;
 }
 
+export interface DaemonPlannedRestartTarget {
+	activeSessionId: string;
+	sessionId: string;
+	sessionFile: string;
+}
+
+export type DaemonPlannedRestartHandoffState = "registered" | "prepared" | "delivered" | "completed" | "failed";
+
+export interface DaemonPlannedRestartClaim {
+	claimedAt: string;
+	supervisorGeneration: string;
+	supervisorOwnerToken: string;
+	supervisorPid: number;
+	supervisorProcessStartId?: string;
+	supervisorSocketPath: string;
+}
+
+export interface DaemonPlannedRestartHandoff {
+	requestId: string;
+	target: DaemonPlannedRestartTarget;
+	message: string;
+	actionId: string;
+	state: DaemonPlannedRestartHandoffState;
+	createdAt: string;
+	updatedAt: string;
+	claim?: DaemonPlannedRestartClaim;
+	completion?: DaemonPlannedRestartCompletion;
+	error?: string;
+}
+
+export interface DaemonPlannedRestartRestoredSession {
+	sourceActiveSessionId: string;
+	restoredActiveSessionId: string;
+	sessionId: string;
+}
+
+export interface DaemonPlannedRestartCompletion {
+	requestId: string;
+	actionId: string;
+	completedAt: string;
+	manifestDigest: string;
+	predecessor: {
+		pid: number;
+		processStartId?: string;
+		supervisorGeneration: string;
+		supervisorOwnerToken: string;
+	};
+	successor: {
+		pid: number;
+		processStartId?: string;
+		supervisorGeneration: string;
+		supervisorOwnerToken: string;
+	};
+	counts: { total: number; restored: number; resumed: number; failed: number };
+	restoredSessions: DaemonPlannedRestartRestoredSession[];
+	discardedActiveSessionIds: string[];
+	continuation: {
+		sessionId: string;
+		restoredActiveSessionId: string;
+		admissionStatus: "admitted" | "already_admitted";
+	};
+	acknowledgementToken: string;
+}
+
+export interface DaemonPlannedRestartLifecycleResult {
+	status: "acknowledged" | "already_acknowledged" | "cancelled" | "already_cancelled";
+}
+
+export interface DaemonPlannedRestartBlocker {
+	activeSessionId: string;
+	sessionId: string;
+	sessionName?: string;
+	operation: "turn" | "bash" | "compaction" | "retry" | "rlm_child" | "queued_action" | "scheduled_job";
+}
+
 export interface DaemonUpdateRestartManifest {
 	formatVersion: typeof DAEMON_UPDATE_RESTART_FORMAT_VERSION;
 	createdAt: string;
 	sessions: DaemonUpdateRestartSession[];
 	discardedActiveSessionIds?: string[];
+	handoff?: DaemonPlannedRestartHandoff;
 }
 
 export type DaemonSavedSessionListCommand =
@@ -459,6 +564,12 @@ export type DaemonCommand =
 	| { id?: string; type: "restore_actions"; activeSessionId: string; snapshot: SessionActionRecoverySnapshot }
 	| {
 			id?: string;
+			type: "restore_planned_restart_handoff";
+			activeSessionId: string;
+			requestId: string;
+	  }
+	| {
+			id?: string;
 			type: "append_custom_message";
 			activeSessionId: string;
 			message: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
@@ -522,6 +633,8 @@ export type DaemonCommand =
 			expectedText: string;
 			mutation: QueuedMessageMutation;
 	  }
+	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
+	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -553,7 +666,7 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
-	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
+	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string; ifIdle?: boolean }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
@@ -577,7 +690,13 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_branch_summary"; activeSessionId: string }
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
 	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
-	| { id?: string; type: "reload"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "reload";
+			activeSessionId: string;
+			ifIdle?: boolean;
+			resources?: AgentSessionResourceConfig;
+	  }
 	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
@@ -614,7 +733,28 @@ export type DaemonCommand =
 			response: DaemonExtensionUIResponse;
 	  }
 	| { id?: string; type: "ack_result"; commandId: string }
-	| { id?: string; type: "prepare_update_restart" }
+	| {
+			id?: string;
+			type: "register_planned_restart_handoff";
+			requestId: string;
+			activeSessionId: string;
+			workerToken: string;
+			message: string;
+	  }
+	| {
+			id?: string;
+			type: "cancel_planned_restart_handoff";
+			requestId: string;
+			activeSessionId: string;
+			workerToken: string;
+	  }
+	| {
+			id?: string;
+			type: "acknowledge_planned_restart_handoff";
+			requestId: string;
+			acknowledgementToken: string;
+	  }
+	| { id?: string; type: "prepare_update_restart"; handoffRequestId?: string }
 	| { id?: string; type: "retry_worker"; activeSessionId: string }
 	| { id?: string; type: "restart" }
 	| { id?: string; type: "shutdown"; force?: boolean };
@@ -634,6 +774,16 @@ const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
 	capability: "session_input_admission",
 } as const;
+const ATOMIC_RELOAD_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 14,
+	capability: "atomic_reload",
+} as const;
+const ATOMIC_RESOURCE_RELOAD_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 16,
+	capability: "atomic_resource_reload",
+} as const;
 const PROMPT_ADMISSION_CANCELLATION_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 8,
@@ -646,6 +796,21 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
+} as const;
+const QUEUED_ACTION_CANCELLATION_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 15,
+	capability: "queued_action_cancellation",
+} as const;
+const PLANNED_RESTART_HANDOFF_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 17,
+	capability: "planned_restart_handoff",
+} as const;
+const PLANNED_RESTART_LIFECYCLE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 18,
+	capability: "planned_restart_handoff_lifecycle",
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
@@ -669,6 +834,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
 	restore_actions: LEGACY_DAEMON_COMMAND,
+	restore_planned_restart_handoff: PLANNED_RESTART_HANDOFF_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
@@ -697,6 +863,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
+	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
+	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
+
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
@@ -745,6 +914,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_tool_definition: LEGACY_DAEMON_COMMAND,
 	set_session_entry_label: LEGACY_DAEMON_COMMAND,
 	extension_ui_response: LEGACY_DAEMON_COMMAND,
+	register_planned_restart_handoff: PLANNED_RESTART_HANDOFF_COMMAND,
+	cancel_planned_restart_handoff: PLANNED_RESTART_LIFECYCLE_COMMAND,
+	acknowledge_planned_restart_handoff: PLANNED_RESTART_LIFECYCLE_COMMAND,
 	prepare_update_restart: LEGACY_DAEMON_COMMAND,
 	retry_worker: LEGACY_DAEMON_COMMAND,
 	restart: LEGACY_DAEMON_COMMAND,
@@ -759,8 +931,17 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if (carriesTelemetryPolicy) {
 		return [TELEMETRY_POLICY_COMMAND, compatibility];
 	}
+	if (command.type === "prepare_update_restart" && command.handoffRequestId !== undefined) {
+		return [PLANNED_RESTART_HANDOFF_COMMAND, compatibility];
+	}
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		return [PROMPT_ADMISSION_CANCELLATION_COMMAND, compatibility];
+	}
+	if (command.type === "reload") {
+		const requirements: DaemonCommandCompatibility[] = [];
+		if (command.ifIdle === true) requirements.push(ATOMIC_RELOAD_COMMAND);
+		if (command.resources !== undefined) requirements.push(ATOMIC_RESOURCE_RELOAD_COMMAND);
+		return [...requirements, compatibility];
 	}
 	return [compatibility];
 }
@@ -777,6 +958,8 @@ export type DaemonResponse =
 	  };
 
 export type DaemonErrorInfo =
+	| { code: "atomic_resource_reload_restart_required" }
+	| { code: "session_reload_busy" }
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
@@ -1047,6 +1230,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
+	"get_queued_user_actions",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",

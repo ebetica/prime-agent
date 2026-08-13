@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	collectDaemonLaunchEnv,
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
@@ -19,6 +20,7 @@ import {
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 
@@ -42,6 +44,68 @@ describe("daemon protocol helpers", () => {
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("keeps credential variables out of automatically collected launch overrides", () => {
+		expect(
+			collectDaemonLaunchEnv({
+				PATH: "/trusted/bin",
+				RECURSE_MODEL_POLICY: "policy",
+				ANTHROPIC_API_KEY: "secret",
+				SESSION_TOKEN: "secret",
+				GITHUB_PAT: "secret",
+				GOOGLE_APPLICATION_CREDENTIALS: "/secret.json",
+				PGPASSFILE: "/secret",
+				NETRC: "/secret",
+				NPM_CONFIG_REGISTRY_AUTH: "secret",
+				PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "internal",
+			}),
+		).toEqual({ PATH: "/trusted/bin", RECURSE_MODEL_POLICY: "policy" });
+	});
+
+	it("requires atomic reload compatibility only when idle admission is requested", () => {
+		expect(
+			getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1", ifIdle: true }),
+		).toContainEqual({ minProtocol: 7, minSchemaRevision: 14, capability: "atomic_reload" });
+		expect(getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1" })).toEqual([
+			{ minProtocol: 7 },
+		]);
+	});
+
+	it("separately gates transactional resource replacement", () => {
+		const resources = { contextDirectories: ["/tmp/context"], extensions: ["extension.ts"] };
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "reload",
+				activeSessionId: "active-1",
+				ifIdle: true,
+				resources,
+			}),
+		).toEqual(
+			expect.arrayContaining([
+				{ minProtocol: 7, minSchemaRevision: 14, capability: "atomic_reload" },
+				{ minProtocol: 7, minSchemaRevision: 16, capability: "atomic_resource_reload" },
+			]),
+		);
+		expect(
+			getDaemonCommandCompatibilities({ type: "reload", activeSessionId: "active-1", resources: {} }),
+		).toContainEqual({ minProtocol: 7, minSchemaRevision: 16, capability: "atomic_resource_reload" });
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("atomic_resource_reload");
+	});
+
+	it("capability-gates durable planned restart handoffs", () => {
+		const compatibility = { minProtocol: 7, minSchemaRevision: 17, capability: "planned_restart_handoff" };
+		expect(DAEMON_COMMAND_COMPATIBILITY.register_planned_restart_handoff).toEqual(compatibility);
+		expect(DAEMON_COMMAND_COMPATIBILITY.restore_planned_restart_handoff).toEqual(compatibility);
+		expect(
+			getDaemonCommandCompatibilities({ type: "prepare_update_restart", handoffRequestId: "restart-1" }),
+		).toContainEqual(compatibility);
+		expect(getDaemonCommandCompatibilities({ type: "prepare_update_restart" })).toEqual([{ minProtocol: 7 }]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff");
+		const lifecycle = { minProtocol: 7, minSchemaRevision: 18, capability: "planned_restart_handoff_lifecycle" };
+		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_planned_restart_handoff).toEqual(lifecycle);
+		expect(DAEMON_COMMAND_COMPATIBILITY.acknowledge_planned_restart_handoff).toEqual(lifecycle);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff_lifecycle");
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
@@ -136,6 +200,21 @@ describe("daemon protocol helpers", () => {
 		// ignore unknown values, so no capability gate is needed; the revision
 		// lets version probes distinguish daemons with the old semantics.
 		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(16);
+	});
+
+	it("capability-gates queued action identity and cancellation", () => {
+		expect(QUEUED_ACTION_CANCELLATION_COMMAND_TYPES).toEqual(["get_queued_user_actions", "cancel_queued_action"]);
+		for (const command of QUEUED_ACTION_CANCELLATION_COMMAND_TYPES) {
+			expect(DAEMON_COMMAND_COMPATIBILITY[command]).toEqual({
+				minProtocol: 7,
+				minSchemaRevision: 15,
+				capability: "queued_action_cancellation",
+			});
+		}
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queued_action_cancellation");
+		// A new daemon keeps the old queue snapshot command available to clients
+		// that do not negotiate the optional identity surface.
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_queue).toEqual({ minProtocol: 7 });
 	});
 
 	it("keeps refine failure events backward-compatible on the existing session event channel", () => {

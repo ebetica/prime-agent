@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
@@ -64,6 +65,48 @@ interface SavedRlmSubagentRegistryEntry {
 	childId?: unknown;
 	sessionFile?: unknown;
 	status?: unknown;
+}
+
+const INTERRUPTED_TOOL_RESULT =
+	"Tool execution was interrupted by worker recovery and was not replayed. Inspect external side effects before retrying.";
+
+/**
+ * Close the trailing tool batch before a recovered worker resumes its transcript.
+ *
+ * A worker crash can persist an assistant tool call without its result. Replaying
+ * the tool would guess at side effects and, for an RLM admission, could attach an
+ * unrelated child. A synthetic terminal result preserves provider ordering and
+ * lets the replacement runtime continue without waiting on the dead execution.
+ */
+export function appendInterruptedToolResults(sessionManager: SessionManager): string[] {
+	const messages = sessionManager.buildSessionContext().messages;
+	let assistantIndex = messages.length - 1;
+	while (assistantIndex >= 0 && messages[assistantIndex]?.role === "toolResult") {
+		assistantIndex--;
+	}
+	const assistant = messages[assistantIndex];
+	if (assistant?.role !== "assistant") return [];
+	const trailing = messages.slice(assistantIndex + 1);
+	if (trailing.some((message) => message.role !== "toolResult")) return [];
+
+	const completed = new Set(
+		trailing.flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
+	);
+	const pending = assistant.content.filter(
+		(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+			block.type === "toolCall" && !completed.has(block.id),
+	);
+	for (const toolCall of pending) {
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT }],
+			isError: true,
+			timestamp: Date.now(),
+		});
+	}
+	return pending.map((toolCall) => toolCall.id);
 }
 
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
@@ -265,8 +308,10 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
-			case "mark_interrupted":
-				SessionManager.open(request.sessionPath).appendCustomMessageEntry(
+			case "mark_interrupted": {
+				const sessionManager = SessionManager.open(request.sessionPath);
+				appendInterruptedToolResults(sessionManager);
+				sessionManager.appendCustomMessageEntry(
 					"prime-agent.worker_recovery",
 					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
 					false,
@@ -277,6 +322,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				);
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				return;
+			}
 			case "shutdown":
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
 				setImmediate(() => process.exit(0));

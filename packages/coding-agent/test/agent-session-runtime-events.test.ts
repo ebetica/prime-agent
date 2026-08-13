@@ -105,6 +105,36 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		runtimeHost.setRebindSession(undefined);
 	});
 
+	it("invalidates captured extension contexts only after a prepared reload commits", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		const oldRunner = runtimeHost.session.extensionRunner;
+		const prepared = await runtimeHost.session.prepareReload({ contextDirectories: [] });
+
+		expect(oldRunner.createContext().cwd).toBe(runtimeHost.session.sessionManager.getCwd());
+		prepared.commit();
+		expect(() => oldRunner.createContext().cwd).toThrow(
+			"This extension ctx is stale after session replacement or reload.",
+		);
+	});
+
+	it("restores extension lifecycle and keeps old contexts valid when a prepared reload rolls back", async () => {
+		const phases: string[] = [];
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.on("session_shutdown", () => {
+				phases.push("shutdown:reload");
+			});
+		});
+		const oldRunner = runtimeHost.session.extensionRunner;
+		phases.length = 0;
+
+		const prepared = await runtimeHost.session.prepareReload({ contextDirectories: [] });
+		await prepared.rollback();
+
+		expect(phases).toEqual(["shutdown:reload", "shutdown:reload"]);
+		expect(oldRunner.createContext().cwd).toBe(runtimeHost.session.sessionManager.getCwd());
+		await expect(runtimeHost.session.prompt("still usable")).resolves.toBeUndefined();
+	});
+
 	it("releases a replacement lease when current-session teardown fails", async () => {
 		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
 		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "runtime-events");
