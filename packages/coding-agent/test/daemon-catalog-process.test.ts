@@ -4,13 +4,9 @@ import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import {
-<<<<<<< HEAD
 	appendInterruptedToolResults,
 	listSavedSessionSiblings,
-=======
-	listSavedSessionSiblings,
 	reconcileInterruptedRlmChild,
->>>>>>> a5bccfca (fix(coding-agent): reconcile crashed RLM children)
 	resolveCatalogSessionMatch,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 

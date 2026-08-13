@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-<<<<<<< HEAD
+
 import {
 	chmodSync,
 	closeSync,
@@ -22,10 +22,6 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
-=======
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
->>>>>>> 0da9f6f3 (fix(coding-agent): compact RLM child registry state)
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
