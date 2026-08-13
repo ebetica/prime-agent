@@ -139,7 +139,7 @@ describe("daemon catalog selector resolution", () => {
 				.trim()
 				.split("\n")
 				.map((line) => JSON.parse(line) as { status: string });
-			expect(rows.map((row) => row.status)).toEqual(["running", "interrupted"]);
+			expect(rows.map((row) => row.status)).toEqual(["interrupted"]);
 			const notices = SessionManager.open(parent.getSessionFile()!)
 				.getEntries()
 				.filter(

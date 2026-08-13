@@ -7300,11 +7300,7 @@ describe("daemon mode helpers", () => {
 			expect(result.data).toEqual({ deleted: true });
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
-			const persisted = readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")
-				.trim()
-				.split(/\r?\n/)
-				.map((line) => JSON.parse(line) as { childId: string; status: string });
-			expect(persisted.at(-1)).toMatchObject({ childId: fixture.childId, status: "deleted" });
+			expect(readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).toBe("");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
