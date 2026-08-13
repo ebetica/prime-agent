@@ -5703,6 +5703,38 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rejects malformed worker recovery facts before mutating transcripts", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-malformed-worker-recovery-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				applyWorkerRecovery(
+					command: Extract<DaemonCommand, { type: "create" }>,
+					root: ActiveSessionState,
+				): Promise<void>;
+			};
+			const root = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const before = readFileSync(fixture.childSessionFile, "utf8");
+			await expect(
+				internals.applyWorkerRecovery(
+					{
+						type: "create",
+						workerRecovery: {
+							version: 1,
+							generation: "not-a-generation",
+							interrupted: [],
+						},
+					},
+					root,
+				),
+			).rejects.toThrow("malformed worker recovery payload");
+			expect(readFileSync(fixture.childSessionFile, "utf8")).toBe(before);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rehydrates completed children without rewriting their completed registry entry", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-idempotent-rlm-hydration-"));
 		try {
