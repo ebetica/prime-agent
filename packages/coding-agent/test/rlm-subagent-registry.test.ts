@@ -73,6 +73,16 @@ describe("RLM subagent registry", () => {
 		expect((await readRlmSubagentRegistry(path))[0]?.status).toBe("interrupted");
 	});
 
+	it("keeps non-owner reads non-mutating during legacy compaction", async () => {
+		const path = registry();
+		const first = entry("child-1", "running");
+		const completed = { ...first, status: "completed" as const, updatedAt: "completed" };
+		const legacy = `${JSON.stringify(first)}\n${JSON.stringify(completed)}\n`;
+		writeFileSync(path, legacy);
+		expect(await readRlmSubagentRegistry(path, { compact: false })).toEqual([completed]);
+		expect(readFileSync(path, "utf8")).toBe(legacy);
+	});
+
 	it("fails closed on malformed non-tail rows", async () => {
 		const path = registry();
 		writeFileSync(path, `${JSON.stringify(entry("live", "running"))}\nnot json\n`);
