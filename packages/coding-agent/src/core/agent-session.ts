@@ -1258,6 +1258,8 @@ export class AgentSession {
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, AgentSession>();
+	/** Durable daemon registry truth for a passively hydrated child. */
+	_persistedRlmTerminalStatus?: "completed" | "interrupted";
 	private _deletedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
@@ -9609,9 +9611,12 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Status of a direct RLM child run, while the run is still tracked. */
+	/** Status of a direct RLM child, including a hydrated durable terminal state. */
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
-		return this._activeRlmChildRuns.get(childId)?.status;
+		const active = this._activeRlmChildRuns.get(childId)?.status;
+		if (active) return active;
+		const retained = this._rlmChildSessions.get(childId)?._persistedRlmTerminalStatus;
+		return retained === "interrupted" ? "error" : retained === "completed" ? "done" : undefined;
 	}
 
 	private async _currentActiveSessionId(): Promise<string | undefined> {
@@ -9691,7 +9696,7 @@ export class AgentSession {
 				session_name:
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
-				status: "completed",
+				status: childSession._persistedRlmTerminalStatus === "interrupted" ? "error" : "completed",
 			});
 			recorded.add(childId);
 		}
@@ -9973,24 +9978,25 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
-		// A child can finish concurrently while the parent is (or has) torn down; don't
-		// resurrect the map (it would never be disposed), just drop the child now.
-		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) {
-			return false;
-		}
-		if (this._subagentRuntimeHost?.completeRlmSubagentRuntime?.(childId, session) === false) {
-			return false;
-		}
-		if (this._disposed || this._disposing) {
-			void session.disposeAsync().catch(() => undefined);
-			return false;
-		}
-		this._rlmChildSessions.set(childId, session);
-		if (unsubscribe) {
-			this._rlmChildUnsubscribes.set(childId, unsubscribe);
-		}
-		return true;
+	registerRlmChildSession(
+		childId: string,
+		session: AgentSession,
+		unsubscribe?: () => void,
+	): boolean | Promise<boolean> {
+		const retain = (): boolean => {
+			if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) return false;
+			if (this._disposed || this._disposing) {
+				void session.disposeAsync().catch(() => undefined);
+				return false;
+			}
+			this._rlmChildSessions.set(childId, session);
+			if (unsubscribe) this._rlmChildUnsubscribes.set(childId, unsubscribe);
+			return true;
+		};
+		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) return false;
+		const completion = this._subagentRuntimeHost?.completeRlmSubagentRuntime?.(childId, session);
+		if (completion instanceof Promise) return completion.then((completed) => completed !== false && retain());
+		return completion !== false && retain();
 	}
 
 	/** Stop retaining an idle daemon child without deleting its durable registry row. */
@@ -10400,7 +10406,7 @@ export class AgentSession {
 						}),
 					);
 				}
-				if (!this.registerRlmChildSession(run.id, child)) {
+				if (!(await this.registerRlmChildSession(run.id, child))) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")

@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+
 import {
 	chmodSync,
 	closeSync,
@@ -21,7 +22,6 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -113,6 +113,11 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
+	mutateRlmSubagentRegistry,
+	type PersistedRlmSubagentRegistryEntry,
+	readRlmSubagentRegistry,
+} from "../../core/rlm-subagent-registry.js";
+import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
@@ -147,6 +152,7 @@ import {
 	resolveActiveSessionState,
 } from "./active-session-state.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
+import { appendInterruptedToolResults, reconcileInterruptedRlmChild } from "./daemon-catalog-process.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
@@ -394,25 +400,6 @@ interface BoundSupervisorGenerationClaim {
 }
 
 const RLM_SUBAGENT_REGISTRY_FILE = "rlm-subagents.jsonl";
-
-interface PersistedRlmSubagentRegistryEntry {
-	type: "rlm_subagent";
-	childId: string;
-	sessionName: string;
-	sessionDir: string;
-	sessionFile: string;
-	parentSessionId: string;
-	parentSessionFile?: string;
-	rlmDepth?: number;
-	rlmMaxDepth?: number;
-	rlmParentNodeId?: string;
-	prompt?: string;
-	spawnCode?: string;
-	model?: { provider: string; modelId: string };
-	status: "running" | "completed" | "deleted";
-	createdAt: number;
-	updatedAt: string;
-}
 
 type PassiveRlmRoot =
 	| { rootParentState: ActiveSessionState; rootInfo?: never }
@@ -916,25 +903,21 @@ export class AgentDaemon {
 		return join(artifactDir, RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
-	private appendRlmSubagentRegistryEntry(
+	private async appendRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
-	): boolean {
+	): Promise<boolean> {
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
-		if (!path) {
-			return true;
-		}
+		if (!path) return true;
 		try {
-			mkdirSync(dirname(path), { recursive: true });
-			const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-			const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-			const handle = openSync(path, "a");
-			try {
-				writeSync(handle, `${separator}${JSON.stringify(entry)}\n`);
-				fsyncSync(handle);
-			} finally {
-				closeSync(handle);
-			}
+			await mutateRlmSubagentRegistry(path, (latest) => {
+				const current = latest.get(entry.childId);
+				const allowed =
+					(entry.status === "running" && !current) ||
+					(entry.status === "completed" && current?.status === "running") ||
+					(entry.status === "interrupted" && (current?.status === "running" || current?.status === "interrupted"));
+				return { result: undefined, ...(allowed ? { entry } : {}) };
+			});
 			return true;
 		} catch (error) {
 			this.log(
@@ -944,7 +927,7 @@ export class AgentDaemon {
 		}
 	}
 
-	private recordRlmSubagentRegistryEntry(
+	private async recordRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		input: {
 			childId: string;
@@ -960,9 +943,9 @@ export class AgentDaemon {
 			status: PersistedRlmSubagentRegistryEntry["status"];
 			createdAt?: number;
 		},
-	): boolean {
+	): Promise<boolean> {
 		const parentSession = parentState.runtime.session;
-		return this.appendRlmSubagentRegistryEntry(parentState, {
+		return await this.appendRlmSubagentRegistryEntry(parentState, {
 			type: "rlm_subagent",
 			childId: input.childId,
 			sessionName: input.sessionName,
@@ -983,81 +966,30 @@ export class AgentDaemon {
 	}
 
 	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void> {
-		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-			(entry) => entry.childId === childId,
-		);
-		if (!latest || latest.status === "deleted") {
-			return;
-		}
-		if (
-			!this.appendRlmSubagentRegistryEntry(parentState, {
-				...latest,
-				status: "deleted",
-				updatedAt: new Date().toISOString(),
-			})
-		) {
-			throw new Error(`Failed to persist deletion for RLM subagent ${childId}`);
-		}
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path) return;
+		await mutateRlmSubagentRegistry(path, (latest) => ({
+			result: undefined,
+			...(latest.has(childId) ? { deleteChildId: childId } : {}),
+		}));
 	}
 
 	private readLatestRlmSubagentRegistry(
 		parentState: ActiveSessionState,
-		throwOnReadError = false,
 	): Promise<PersistedRlmSubagentRegistryEntry[]> {
-		return this.readLatestRlmSubagentRegistryPath(
-			this.rlmSubagentRegistryPath(parentState.runtime.session),
-			throwOnReadError,
-		);
+		return this.readLatestRlmSubagentRegistryPath(this.rlmSubagentRegistryPath(parentState.runtime.session));
 	}
 
 	private async readLatestRlmSubagentRegistryPath(
 		path: string | undefined,
-		throwOnReadError = false,
 	): Promise<PersistedRlmSubagentRegistryEntry[]> {
-		if (!path) {
-			return [];
-		}
-		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
-		let lines: string[];
+		if (!path) return [];
 		try {
-			lines = (await readFile(path, "utf8")).split(/\r?\n/);
+			return await readRlmSubagentRegistry(path);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				return [];
-			}
 			this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
-			if (throwOnReadError) {
-				throw error;
-			}
-			return [];
+			throw error;
 		}
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				continue;
-			}
-			try {
-				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
-				if (
-					entry.type !== "rlm_subagent" ||
-					typeof entry.childId !== "string" ||
-					typeof entry.sessionName !== "string" ||
-					typeof entry.sessionDir !== "string" ||
-					typeof entry.sessionFile !== "string" ||
-					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
-					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
-				) {
-					continue;
-				}
-				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
-			} catch (error) {
-				this.log(
-					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-		return [...latest.values()];
 	}
 
 	private rlmSubagentRegistryPathForEntry(entry: PersistedRlmSubagentRegistryEntry, info: SessionInfo): string {
@@ -1227,7 +1159,7 @@ export class AgentDaemon {
 		launchEnv?: Record<string, string>,
 		onStateCreated?: (state: ActiveSessionState) => void,
 		runtimeOpenGuard?: RuntimeOpenGuard,
-		onStateBound?: (state: ActiveSessionState) => void,
+		onStateBound?: (state: ActiveSessionState) => void | Promise<void>,
 		restoreActiveSessionId?: string,
 	): Promise<ActiveSessionState> {
 		const desiredActiveSessionId =
@@ -1276,7 +1208,7 @@ export class AgentDaemon {
 					throw new RuntimeOpenCancelledError();
 				}
 			}
-			onStateBound?.(state);
+			await onStateBound?.(state);
 		} catch (error) {
 			state.unsubscribe?.();
 			this.sessions.delete(state.activeSessionId);
@@ -1333,6 +1265,69 @@ export class AgentDaemon {
 		if (this.cronStore.registerSessionArtifact(session.sessionId, artifactDir)) {
 			this.cronStore.recoverSessionArtifact(session.sessionId);
 			this.cronScheduler.wake();
+		}
+	}
+
+	private async applyWorkerRecovery(
+		command: Extract<DaemonCommand, { type: "create" }>,
+		root: ActiveSessionState,
+	): Promise<void> {
+		const recovery = command.workerRecovery;
+		if (!recovery) return;
+		if (
+			recovery.version !== 1 ||
+			!/^[0-9a-f]{64}$/.test(recovery.generation) ||
+			!Array.isArray(recovery.interrupted) ||
+			recovery.interrupted.length > 256
+		)
+			throw new Error("Unsupported or malformed worker recovery payload");
+		const rootFile = root.runtime.session.sessionFile;
+		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
+		const rootPath = resolve(rootFile);
+		for (const item of recovery.interrupted) {
+			if (
+				typeof item.activeSessionId !== "string" ||
+				item.activeSessionId.length === 0 ||
+				item.activeSessionId.length > 256 ||
+				typeof item.sessionFile !== "string" ||
+				item.sessionFile.length === 0 ||
+				item.sessionFile.length > 4096 ||
+				!Array.isArray(item.operations) ||
+				item.operations.length > 32 ||
+				item.operations.some(
+					(operation) => typeof operation !== "string" || operation.length === 0 || operation.length > 256,
+				)
+			) {
+				throw new Error("Malformed worker recovery target");
+			}
+			const sessionFile = resolve(item.sessionFile);
+			let cursor = sessionFile;
+			let owned = cursor === rootPath;
+			for (let depth = 0; !owned && depth < 256; depth++) {
+				const header = SessionManager.open(cursor).getHeader();
+				if (!header?.parentSession) break;
+				cursor = resolve(dirname(cursor), header.parentSession);
+				owned = cursor === rootPath;
+			}
+			if (!owned) throw new Error("Worker recovery target is outside its owned root");
+			const target = SessionManager.open(sessionFile);
+			appendInterruptedToolResults(target);
+			await reconcileInterruptedRlmChild(sessionFile);
+			const exists = target
+				.getEntries()
+				.some(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "prime-agent.worker_recovery" &&
+						(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
+				);
+			if (!exists)
+				target.appendCustomMessageEntryWithRollback(
+					"prime-agent.worker_recovery",
+					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+					false,
+					{ generation: recovery.generation, activeSessionId: item.activeSessionId, operations: item.operations },
+				);
 		}
 	}
 
@@ -2244,7 +2239,7 @@ export class AgentDaemon {
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
-			completeRlmSubagentRuntime: (childId, session) => {
+			completeRlmSubagentRuntime: async (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
@@ -2253,10 +2248,10 @@ export class AgentDaemon {
 						candidate.runtime.session === session,
 				);
 				if (!state?.runtime.session.sessionFile) return false;
-				if (state.runtime.metadata.rehydratedCompleted) return true;
+				if (state.runtime.metadata.rehydratedTerminalStatus) return true;
 				const metadata = state.runtime.metadata;
 				const model = session.model;
-				return this.recordRlmSubagentRegistryEntry(parentState, {
+				return await this.recordRlmSubagentRegistryEntry(parentState, {
 					childId,
 					sessionName: session.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
@@ -2303,7 +2298,7 @@ export class AgentDaemon {
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === childId,
 				);
-				const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
+				const persisted = (await this.readLatestRlmSubagentRegistry(parentState)).find(
 					(entry) => entry.childId === childId,
 				);
 				const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
@@ -2419,12 +2414,12 @@ export class AgentDaemon {
 				stateRef = state;
 			},
 			() => options.parentSession.getRlmChildRunStatus(options.id) !== "cancelled",
-			() => {
+			async () => {
 				if (runtime.session.sessionName !== options.sessionName) {
 					runtime.session.setSessionName(options.sessionName);
 				}
 				if (runtime.session.sessionFile) {
-					this.recordRlmSubagentRegistryEntry(parentState, {
+					await this.recordRlmSubagentRegistryEntry(parentState, {
 						childId: options.id,
 						sessionName: options.sessionName,
 						sessionDir: options.sessionDir,
@@ -2542,7 +2537,11 @@ export class AgentDaemon {
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
 					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(childId, state.runtime.session, unsubscribeChild)
+					(await parentState.runtime.session.registerRlmChildSession(
+						childId,
+						state.runtime.session,
+						unsubscribeChild,
+					))
 				) {
 					throw error;
 				}
@@ -2803,7 +2802,7 @@ export class AgentDaemon {
 							: {}),
 						rlmChildId: entry.childId,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
-						rehydratedCompleted: true,
+						rehydratedTerminalStatus: entry.status === "interrupted" ? "interrupted" : "completed",
 						...(entry.prompt ? { prompt: entry.prompt } : {}),
 						...(entry.spawnCode ? { spawnCode: entry.spawnCode } : {}),
 						sessionDir: entry.sessionDir,
@@ -2824,7 +2823,8 @@ export class AgentDaemon {
 			);
 			// The session transcript is authoritative for mutable metadata such as a
 			// later user-assigned name; the registry value is only the spawn snapshot.
-			if (!parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session)) {
+			runtime.session._persistedRlmTerminalStatus = entry.status === "interrupted" ? "interrupted" : "completed";
+			if (!(await parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session))) {
 				await this.closeSession(state, "replaced");
 				throw new RuntimeOpenCancelledError();
 			}
@@ -3615,6 +3615,7 @@ export class AgentDaemon {
 
 			case "create": {
 				const state = await this.createRuntime(command);
+				await this.applyWorkerRecovery(command, state);
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
 

@@ -464,6 +464,12 @@ export type DaemonCommand =
 	| ({
 			id?: string;
 			type: "create";
+			/** Supervisor-only durable recovery suffix; workers must reject unknown versions. */
+			workerRecovery?: {
+				version: 1;
+				generation: string;
+				interrupted: Array<{ activeSessionId: string; sessionFile: string; operations: string[] }>;
+			};
 			sessionPath?: string;
 			continueRecent?: boolean;
 			noSession?: boolean;
