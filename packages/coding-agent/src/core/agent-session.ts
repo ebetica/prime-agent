@@ -5498,8 +5498,10 @@ export class AgentSession {
 	/**
 	 * The admission checks that also bind internal admission. Restoring queued work
 	 * and promoting it once the agent reaches idle both run while the input pump is
-	 * still suspended by an abort, so the suspended-pump gate above belongs to the
-	 * public and direct-turn entry points alone.
+	 * still suspended by an abort, so the suspended-pump gate above is enforced on
+	 * the direct-turn path rather than on admission itself. Queueing entry points
+	 * (steer, followUp, agent messages) deliberately stay admissible so a backlog
+	 * survives an abort and reaches the restart manifest.
 	 */
 	private _assertSessionActionAdmissionOpen(): void {
 		if (this._resourceReloadInProgress) {

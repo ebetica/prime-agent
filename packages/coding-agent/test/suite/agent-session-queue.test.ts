@@ -77,18 +77,6 @@ function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = 
 	return createHarness({ ...options, persistSession: true });
 }
 
-function userTextsFromAgent(harness: Harness): string[] {
-	return harness.session.agent.state.messages
-		.filter((message) => message.role === "user")
-		.flatMap((message) =>
-			typeof message.content === "string"
-				? [message.content]
-				: message.content
-						.filter((part): part is { type: "text"; text: string } => part.type === "text")
-						.map((part) => part.text),
-		);
-}
-
 function agentPromptText(id: string, body: string): string {
 	return `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${id}\n\n${body}`;
 }
@@ -413,7 +401,7 @@ describe("AgentSession queue characterization", () => {
 				expect(continueAgent).not.toHaveBeenCalled();
 				expect(internals._postCompactionContinuationScheduled).toBe(false);
 				expect(harness.session.getFollowUpMessages()).toEqual(resumes ? [] : ["queued across abort"]);
-				expect(userTextsFromAgent(harness)).toEqual(resumes ? ["queued across abort"] : []);
+				expect(getUserTexts(harness)).toEqual(resumes ? ["queued across abort"] : []);
 			} finally {
 				vi.useRealTimers();
 			}
