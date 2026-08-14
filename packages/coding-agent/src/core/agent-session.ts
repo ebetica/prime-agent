@@ -192,6 +192,7 @@ import {
 	isWorkerRecoveryDetails,
 	PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
 	PLANNED_RESTART_INTENT_CUSTOM_TYPE,
+	type RlmAutomaticParentReportMessage,
 	WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE,
 	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
 	type WorkerRecoveryDetails,
@@ -4251,6 +4252,18 @@ export class AgentSession {
 	/** Current session display name, if set */
 	get sessionName(): string | undefined {
 		return this.sessionManager.getSessionName();
+	}
+
+	get automaticParentReportsMuteState(): { muted: boolean; revision: number } {
+		return this.sessionManager.getAutomaticParentReportsMuteState();
+	}
+
+	setAutomaticParentReportsMuted(muted: boolean): { muted: boolean; revision: number } {
+		return this.sessionManager.setAutomaticParentReportsMuted(muted);
+	}
+
+	toggleAutomaticParentReportsMuted(): { muted: boolean; revision: number } {
+		return this.setAutomaticParentReportsMuted(!this.automaticParentReportsMuteState.muted);
 	}
 
 	get goalState(): GoalState {
@@ -10378,19 +10391,11 @@ export class AgentSession {
 			onSessionPublished: publishChildSession,
 		};
 
-		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
-			const childController = childSession?._agentMessageController;
-			if (childController) {
-				try {
-					await childController.sendAgentMessage({
-						target: this.sessionId,
-						message: message.content as string,
-					});
-					return;
-				} catch {
-					// An unattributed notice beats silence, so fall through to the injected path.
-				}
-			}
+		const deliverTerminalMessageToParent = async (message: RlmAutomaticParentReportMessage): Promise<void> => {
+			// This synchronous read is the automatic-report admission point. A mute
+			// command that completes first suppresses the report; a report admitted
+			// first is not retroactively withdrawn.
+			if (childSession?.automaticParentReportsMuteState.muted) return;
 			await this._promptInjectedMessage(message.content as string, message, {
 				streamingBehavior: "followUp",
 				queueIfBusy: true,

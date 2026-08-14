@@ -180,6 +180,11 @@ export function createRlmChildTerminalNoticeMessage(
 	};
 }
 
+/** Closed inventory of platform-authored child-to-parent automatic reports. */
+export type RlmAutomaticParentReportMessage =
+	| ReturnType<typeof createRlmChildFailureMessage>
+	| ReturnType<typeof createRlmChildTerminalNoticeMessage>;
+
 /**
  * Message type for bash executions via the ! command.
  */

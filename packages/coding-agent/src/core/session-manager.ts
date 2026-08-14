@@ -186,6 +186,8 @@ export interface LabelEntry extends SessionEntryBase {
 export interface SessionInfoEntry extends SessionEntryBase {
 	type: "session_info";
 	name?: string;
+	automaticParentReportsMuted?: boolean;
+	automaticParentReportsMuteRevision?: number;
 }
 
 // On-disk lifecycle. "archived" replaces legacy "sleep" (normalized on read).
@@ -292,6 +294,9 @@ export interface SessionInfo {
 	cwd: string;
 	/** User-defined display name from session_info entries. */
 	name?: string;
+	/** Child-to-parent automatic report policy; old sessions default to unmuted revision zero. */
+	automaticParentReportsMuted?: boolean;
+	automaticParentReportsMuteRevision?: number;
 	/** Latest persisted lifecycle state from session_state entries. */
 	state?: SessionState;
 	/** Path to the parent session (if this session was forked). */
@@ -1025,6 +1030,8 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let firstMessage = "";
 		let allMessagesText = "";
 		let name: string | undefined;
+		let automaticParentReportsMuted: boolean | undefined;
+		let automaticParentReportsMuteRevision: number | undefined;
 		let state: SessionState | undefined;
 		let agentStatus: AgentStatus | undefined;
 		let lastActivityTime: number | undefined;
@@ -1062,7 +1069,11 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			// Extract session name (use latest, including explicit clears)
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
+				if ("name" in infoEntry) name = infoEntry.name?.trim() || undefined;
+				if (typeof infoEntry.automaticParentReportsMuted === "boolean") {
+					automaticParentReportsMuted = infoEntry.automaticParentReportsMuted;
+					automaticParentReportsMuteRevision = infoEntry.automaticParentReportsMuteRevision ?? 0;
+				}
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
@@ -1113,6 +1124,8 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			id: header.id,
 			cwd,
 			name,
+			automaticParentReportsMuted,
+			automaticParentReportsMuteRevision,
 			state,
 			parentSessionPath,
 			rlmDepth,
@@ -1623,6 +1636,39 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	setAutomaticParentReportsMuted(muted: boolean): { muted: boolean; revision: number } {
+		const current = this.getAutomaticParentReportsMuteState();
+		if (current.muted === muted) return current;
+		const next = { muted, revision: current.revision + 1 };
+		const entry: SessionInfoEntry = {
+			type: "session_info",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			automaticParentReportsMuted: next.muted,
+			automaticParentReportsMuteRevision: next.revision,
+		};
+		this._appendEntryWithRollback(() => {
+			this._appendEntry(entry);
+			return entry.id;
+		});
+		return next;
+	}
+
+	getAutomaticParentReportsMuteState(): { muted: boolean; revision: number } {
+		const entries = this.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type === "session_info" && typeof entry.automaticParentReportsMuted === "boolean") {
+				return {
+					muted: entry.automaticParentReportsMuted,
+					revision: entry.automaticParentReportsMuteRevision ?? 0,
+				};
+			}
+		}
+		return { muted: false, revision: 0 };
+	}
+
 	/** Append a session lifecycle state entry. Returns entry id. */
 	appendSessionState(state: SessionState): string {
 		const entry: SessionStateEntry = {
@@ -1643,7 +1689,7 @@ export class SessionManager {
 		const entries = this.getEntries();
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
-			if (entry.type === "session_info") {
+			if (entry.type === "session_info" && "name" in entry) {
 				return entry.name?.trim() || undefined;
 			}
 		}
