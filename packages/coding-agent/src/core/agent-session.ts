@@ -62,9 +62,11 @@ import {
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessageReceipt,
+	type AgentSessionMessageSendAdmission,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	createAgentSessionMessageId,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
@@ -959,6 +961,8 @@ type GoalSlashCommand =
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
 
+import { type AcceptedAgentMessageIdentity, AcceptedAgentMessageIndex } from "./accepted-agent-message-index.js";
+import { ParentAgentMessageOutbox } from "./parent-agent-message-outbox.js";
 import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
 
 export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
@@ -1007,6 +1011,21 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+
+function isDefinitiveAgentMessageRejection(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return [
+		"Agent messaging is paused",
+		"rate limit exceeded",
+		"queue capacity",
+		"was not queued",
+		"was not accepted",
+		"Target session is closing",
+		"Target session changed",
+		"cannot target the sending session",
+		"No parent matches",
+	].some((fragment) => error.message.includes(fragment));
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -1258,6 +1277,15 @@ export class AgentSession {
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
+	/**
+	 * Child-to-parent sends linearize here before touching the daemon. Closing this
+	 * gate after the child turn settles prevents a late background cell from racing
+	 * the single terminal outcome. The set contains only currently admitted sends.
+	 */
+	private _parentSendAdmissionOpen = true;
+	private readonly _admittedParentSends = new Set<Promise<void>>();
+	private _parentMessageOutbox?: ParentAgentMessageOutbox;
+	private _acceptedAgentMessageIndex?: AcceptedAgentMessageIndex;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _pendingRlmSubagentSessionNames = new Set<string>();
@@ -1377,6 +1405,18 @@ export class AgentSession {
 			this._rlmDepth > 0 && this.sessionManager.getBranch().some((entry) => entry.type === "message")
 				? undefined
 				: false;
+		const acceptedMessageStateDir = this.sessionManager.getSessionArtifactDir() ?? this._rlmSessionDir;
+		if (acceptedMessageStateDir) {
+			this._acceptedAgentMessageIndex = new AcceptedAgentMessageIndex(acceptedMessageStateDir);
+			queueMicrotask(() => void this._recoverAcceptedAgentMessages());
+		}
+		if (this._rlmDepth > 0 && this._rlmSessionDir) {
+			this._parentMessageOutbox = new ParentAgentMessageOutbox(this._rlmSessionDir);
+			this._parentSendAdmissionOpen = !this._parentMessageOutbox.isClosed();
+			if (this._parentMessageOutbox.pending().length > 0) {
+				setTimeout(() => void this._recoverPendingParentAgentMessages(), 0);
+			}
+		}
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
 		this._autonomousState = createAutonomousRuntimeState(config.autonomous, {
 			cwd: this._cwd,
@@ -3132,9 +3172,13 @@ export class AgentSession {
 				if (typeof payload.message !== "string") {
 					throw new Error("agent_message.send message must be a string");
 				}
+				if (payload.id !== undefined && typeof payload.id !== "string") {
+					throw new Error("agent_message.send id must be a string");
+				}
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
+					id: payload.id as string | undefined,
 				});
 			}
 			default:
@@ -3404,6 +3448,9 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "message_end" && (event.message.role === "user" || event.message.role === "custom")) {
+			if (isAgentSessionMessage(event.message)) {
+				this.rememberAcceptedAgentMessage(event.message, "delivered", false);
+			}
 			for (const action of this._actionStore.actionsForMessage(event.message)) {
 				const record =
 					action.payload.kind === "turn"
@@ -6554,6 +6601,73 @@ export class AgentSession {
 		return this._actionStore.unfinishedActions().length;
 	}
 
+	/**
+	 * Locate a durable or still-live admitted agent message by its stable id.
+	 * Current context is bounded by compaction and the action store is O(live).
+	 */
+	findAcceptedAgentMessage(id: string): AcceptedAgentMessageIdentity | undefined {
+		const durable = this._acceptedAgentMessageIndex?.find(id);
+		if (durable) return durable;
+		for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+			const message = this.messages[index];
+			if (message && isAgentSessionMessage(message) && message.details.id === id) {
+				return {
+					id,
+					message: message.details.message,
+					fromSessionId: message.details.from?.sessionId,
+					status: "delivered",
+					acceptedMessage: message,
+					needsDelivery: false,
+					senderAcknowledged: false,
+				};
+			}
+		}
+		return undefined;
+	}
+
+	rememberAcceptedAgentMessage(
+		message: AgentSessionMessage,
+		status: "queued" | "delivered",
+		needsDelivery = true,
+	): void {
+		this._acceptedAgentMessageIndex?.remember({
+			id: message.details.id,
+			message: message.details.message,
+			fromSessionId: message.details.from?.sessionId,
+			status,
+			acceptedMessage: message,
+			needsDelivery,
+			senderAcknowledged: false,
+		});
+	}
+
+	forgetAcceptedAgentMessage(id: string): void {
+		this._acceptedAgentMessageIndex?.forget(id);
+	}
+
+	private async _recoverAcceptedAgentMessages(): Promise<void> {
+		const index = this._acceptedAgentMessageIndex;
+		if (!index) return;
+		for (const entry of index.entries()) {
+			if (this.messages.some((message) => isAgentSessionMessage(message) && message.details.id === entry.id)) {
+				index.remember({ ...entry, status: "delivered", needsDelivery: false });
+				continue;
+			}
+			if (!entry.needsDelivery) continue;
+			if (
+				this._actionStore.unfinishedActions().some((action) => {
+					if (action.payload.kind !== "turn") return false;
+					const message = action.payload.customMessage;
+					return message !== undefined && isAgentSessionMessage(message) && message.details.id === entry.id;
+				})
+			)
+				continue;
+			await this.queueAgentMessagePrompt(entry.acceptedMessage.content, "steer", entry.acceptedMessage).catch(
+				() => undefined,
+			);
+		}
+	}
+
 	get isQueuedWorkSuspended(): boolean {
 		return this._sessionInputPumpSuspended;
 	}
@@ -9226,31 +9340,13 @@ export class AgentSession {
 					roster: async () =>
 						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
+					admitAgentMessageSend: () => this._admitParentAgentMessageSend(),
 					sendAgentMessage: async (input) => {
-						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
+						return (await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
 							message: input.message,
+							id: input.id ?? createAgentSessionMessageId(),
 						})) as AgentSessionMessageReceipt;
-						if (this._rlmDepth > 0) {
-							let addressedParent = input.receiverRole === "parent";
-							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
-								try {
-									const roster = await this._agentMessageController.roster();
-									addressedParent = roster.entries.some(
-										(entry) =>
-											entry.relationship === "parent" &&
-											(entry.id === input.target || entry.name === input.target),
-									);
-								} catch {
-									addressedParent = false;
-								}
-							}
-							if (addressedParent) {
-								this._repliedToParentSinceTask = true;
-								this._parentReplyCount += 1;
-							}
-						}
-						return receipt;
 					},
 				}),
 			);
@@ -9590,6 +9686,167 @@ export class AgentSession {
 
 	get repliedToParentSinceTask(): boolean | undefined {
 		return this._repliedToParentSinceTask;
+	}
+
+	/** Admit a parent reply synchronously, before selector resolution or transport awaits. */
+	private _admitParentAgentMessageSend(): AgentSessionMessageSendAdmission {
+		if (!this._parentSendAdmissionOpen) {
+			throw new Error("Child-to-parent send rejected: child execution has closed send admission");
+		}
+		const id = createAgentSessionMessageId();
+		let settle!: () => void;
+		const settlement = new Promise<void>((resolve) => {
+			settle = resolve;
+		});
+		this._admittedParentSends.add(settlement);
+		let settled = false;
+		const finish = (committed: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (committed) {
+				this._repliedToParentSinceTask = true;
+				this._parentReplyCount += 1;
+			}
+			this._admittedParentSends.delete(settlement);
+			settle();
+		};
+		return {
+			id,
+			commit: (message) => {
+				if (!this._parentMessageOutbox) {
+					const sessionDir = this._ensureRlmSessionDir() ?? this._createEphemeralRlmSessionDir();
+					this._parentMessageOutbox = new ParentAgentMessageOutbox(sessionDir);
+				}
+				this._parentMessageOutbox.commit(id, message);
+			},
+			resolve: async (receipt) => {
+				try {
+					this._parentMessageOutbox?.markDelivered(id, receipt);
+					if (this._agentMessageController?.acknowledgeAgentMessage) {
+						await this._agentMessageController.acknowledgeAgentMessage(receipt);
+						this._parentMessageOutbox?.markAcknowledged(id);
+					}
+				} catch {
+					// A delivered row stays durable until receiver acknowledgement can replay.
+				}
+				finish(true);
+			},
+			reject: (error, transportStarted = false) => {
+				const definitelyRejected = !transportStarted || isDefinitiveAgentMessageRejection(error);
+				if (!definitelyRejected) {
+					// The receiver may have committed before the transport failed. Keep
+					// the stable-id row for replay and suppress a competing fallback.
+					finish(true);
+					return;
+				}
+				try {
+					this._parentMessageOutbox?.settle(id);
+					finish(false);
+				} catch {
+					// A durable row whose rejection cannot be recorded still owns the
+					// eventual reply, so a fallback must not race its recovery.
+					finish(true);
+				}
+			},
+		};
+	}
+
+	private async _sendDurableParentAgentMessage(
+		target: string,
+		message: string,
+	): Promise<"committed" | "ambiguous" | "rejected"> {
+		const controller = this._agentMessageController;
+		if (!controller) return "rejected";
+		if (!this._parentMessageOutbox) {
+			const sessionDir = this._ensureRlmSessionDir() ?? this._createEphemeralRlmSessionDir();
+			this._parentMessageOutbox = new ParentAgentMessageOutbox(sessionDir);
+		}
+		const id = createAgentSessionMessageId();
+		this._parentMessageOutbox.commit(id, message);
+		try {
+			const receipt = await controller.sendAgentMessage({ target, message, receiverRole: "parent", id });
+			this._parentMessageOutbox.markDelivered(id, receipt);
+			try {
+				if (controller.acknowledgeAgentMessage) {
+					await controller.acknowledgeAgentMessage(receipt);
+					this._parentMessageOutbox.markAcknowledged(id);
+				}
+			} catch {
+				// Recovery retries acknowledgement without redelivering the message.
+			}
+			return "committed";
+		} catch (error) {
+			if (!isDefinitiveAgentMessageRejection(error)) return "ambiguous";
+			this._parentMessageOutbox.settle(id);
+			return "rejected";
+		}
+	}
+
+	private async _recoverPendingParentAgentMessages(): Promise<void> {
+		const outbox = this._parentMessageOutbox;
+		const controller = this._agentMessageController;
+		if (!outbox || !controller?.roster) return;
+		for (const entry of outbox.pending()) {
+			if (entry.state === "acknowledged") {
+				outbox.settle(entry.id);
+				this._repliedToParentSinceTask = true;
+				this._parentReplyCount += 1;
+				continue;
+			}
+			if (entry.state === "delivered") {
+				this._repliedToParentSinceTask = true;
+				this._parentReplyCount += 1;
+				try {
+					if (!controller.acknowledgeAgentMessage) continue;
+					await controller.acknowledgeAgentMessage({
+						id: entry.id,
+						source: "agent_message",
+						target: {
+							activeSessionId: entry.targetActiveSessionId ?? "",
+							sessionId: entry.targetSessionId ?? "",
+						},
+						message: entry.message,
+						deliveryStatus: "delivered",
+					});
+					outbox.markAcknowledged(entry.id);
+				} catch {
+					// Keep the delivered row for the next bounded recovery attempt.
+				}
+				continue;
+			}
+			try {
+				const roster = await controller.roster();
+				const parents = roster.entries.filter((candidate) => candidate.relationship === "parent");
+				if (parents.length !== 1) return;
+				const receipt = await controller.sendAgentMessage({
+					target: parents[0]!.id,
+					message: entry.message,
+					receiverRole: "parent",
+					id: entry.id,
+				});
+				outbox.markDelivered(entry.id, receipt);
+				try {
+					if (controller.acknowledgeAgentMessage) {
+						await controller.acknowledgeAgentMessage(receipt);
+						outbox.markAcknowledged(entry.id);
+					}
+				} catch {
+					// Keep the delivered row so receiver acknowledgement can replay.
+				}
+				this._repliedToParentSinceTask = true;
+				this._parentReplyCount += 1;
+			} catch {
+				// Keep the durable row for the next hydration; recovery is bounded to
+				// one attempt per live entry during this session start.
+			}
+		}
+	}
+
+	/** Close child-to-parent admission at the terminal linearization point and drain admitted sends. */
+	private async _closeParentSendAdmissionAndWait(): Promise<void> {
+		this._parentMessageOutbox?.closeAdmission();
+		this._parentSendAdmissionOpen = false;
+		await Promise.all([...this._admittedParentSends]);
 	}
 
 	getCurrentRecap(): string | undefined {
@@ -10396,12 +10653,20 @@ export class AgentSession {
 			// command that completes first suppresses the report; a report admitted
 			// first is not retroactively withdrawn.
 			if (childSession?.automaticParentReportsMuteState.muted) return;
+			const childController = childSession?._agentMessageController;
+			if (childController && childSession) {
+				const outcome = await childSession._sendDurableParentAgentMessage(
+					this.sessionId,
+					message.content as string,
+				);
+				if (outcome !== "rejected") return;
+			}
 			await this._promptInjectedMessage(message.content as string, message, {
 				streamingBehavior: "followUp",
 				queueIfBusy: true,
 				returnAfterAccepted: true,
 				suppressAutonomousContinuation: true,
-			}).catch(() => undefined);
+			});
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
@@ -10502,16 +10767,18 @@ export class AgentSession {
 				};
 				throwIfCancelled();
 				const parentReplyCountBeforeRun = child._parentReplyCount;
-				await child.promptAndWait(content, {
-					expandPromptTemplates: false,
-					source: "extension",
-					customMessage: spawnMessage,
-				});
+				try {
+					await child.promptAndWait(content, {
+						expandPromptTemplates: false,
+						source: "extension",
+						customMessage: spawnMessage,
+					});
+				} finally {
+					// The child turn settling closes admission before any observable terminal
+					// transition. Every send admitted before this point settles first.
+					await child._closeParentSendAdmissionAndWait();
+				}
 				if (run.error) throw new Error(run.error);
-				run.status = "done";
-				durationMs = Date.now() - startedAt;
-				activity = undefined;
-				emitChildUpdate();
 				if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
 					const lastAssistantText = child.getLastAssistantText();
 					await deliverTerminalMessageToParent(
@@ -10532,6 +10799,13 @@ export class AgentSession {
 						await child.disposeAsync().catch(() => undefined);
 					}
 				}
+				child._parentMessageOutbox?.clearAcknowledged();
+				// This is the only successful terminal transition: execution, admitted
+				// replies, terminal notification, and durable child registration are settled.
+				run.status = "done";
+				durationMs = Date.now() - startedAt;
+				activity = undefined;
+				emitChildUpdate();
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
 				run.publication.reject(runError);
@@ -10539,9 +10813,7 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
-				durationMs = Date.now() - startedAt;
-				activity = undefined;
-				emitChildUpdate();
+				if (childSession) await childSession._closeParentSendAdmissionAndWait();
 				if (!run.detachedDeletion) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
@@ -10550,7 +10822,7 @@ export class AgentSession {
 								sessionName,
 								error: run.error ?? "unknown error",
 							}),
-						);
+						).catch(() => undefined);
 					} else if (run.status === "cancelled") {
 						await deliverTerminalMessageToParent(
 							createRlmChildTerminalNoticeMessage({
@@ -10559,7 +10831,7 @@ export class AgentSession {
 								sessionName,
 								reason: run.error,
 							}),
-						);
+						).catch(() => undefined);
 					}
 				}
 				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
@@ -10591,6 +10863,9 @@ export class AgentSession {
 						// A failed best-effort retry remains available through the retained cleanup maps.
 					}
 				}
+				durationMs = Date.now() - startedAt;
+				activity = undefined;
+				emitChildUpdate();
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
 					try {

@@ -2926,9 +2926,12 @@ export class AgentDaemon {
 				this.sendAgentSessionMessage({
 					targetSelector: input.target,
 					message: input.message,
+					messageId: input.id,
 					fromState: requireCurrentState(),
 					origin: "agent",
 				}),
+			acknowledgeAgentMessage: (receipt) =>
+				this.acknowledgeAgentSessionMessage(receipt, requireCurrentState().runtime.session.sessionId),
 		};
 	}
 
@@ -3465,6 +3468,7 @@ export class AgentDaemon {
 					const receipt = await this.sendAgentSessionMessage({
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
+						messageId: command.messageId,
 						sender: command.sender,
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
 						origin: "agent",
@@ -4074,6 +4078,18 @@ export class AgentDaemon {
 				return success(command.id, "resume_queue");
 			}
 
+			case "acknowledge_message": {
+				const targetState = this.getSessionState(command.activeSessionId);
+				await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
+					const accepted = targetState.runtime.session.findAcceptedAgentMessage(command.messageId);
+					if (accepted && accepted.fromSessionId !== command.senderSessionId) {
+						throw new Error("Agent-message acknowledgement sender mismatch");
+					}
+					targetState.runtime.session.forgetAcceptedAgentMessage(command.messageId);
+				});
+				return success(command.id, command.type, { acknowledged: true });
+			}
+			case "send_idempotent_message":
 			case "send_message": {
 				const fromState = command.fromActiveSessionId
 					? this.getSessionState(command.fromActiveSessionId)
@@ -4081,6 +4097,7 @@ export class AgentDaemon {
 				const receipt = await this.sendAgentSessionMessage({
 					targetSelector: command.targetActiveSessionId,
 					message: command.message,
+					messageId: command.messageId,
 					fromState,
 					clientId: client.id,
 					senderKey: this.createCliAgentMessageSenderKey(),
@@ -5557,6 +5574,7 @@ export class AgentDaemon {
 	private async sendAgentSessionMessage(options: {
 		targetSelector: string;
 		message: string;
+		messageId?: string;
 		fromState?: ActiveSessionState;
 		sender?: AgentSessionMessageSender;
 		clientId?: string;
@@ -5603,7 +5621,12 @@ export class AgentDaemon {
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
 							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message);
+							return this.sendRemoteAgentSessionMessage(
+								options.fromState,
+								targetSelector,
+								message,
+								options.messageId,
+							);
 						} else {
 							throw error;
 						}
@@ -5617,17 +5640,8 @@ export class AgentDaemon {
 		if (options.origin === "agent" && options.fromState) {
 			this.assertAgentFamilyReachable(options.fromState, targetState);
 		}
-		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
-		const senderKey =
-			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
-		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
-		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
-		if (!rateLimit.ok) {
-			releaseQueueSlot();
-			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
-		}
 		const payload: AgentSessionMessagePayload = {
-			id: createAgentSessionMessageId(),
+			id: options.messageId ?? createAgentSessionMessageId(),
 			source: AGENT_MESSAGE_SOURCE,
 			message,
 			from:
@@ -5636,10 +5650,32 @@ export class AgentDaemon {
 			fromRelationship: this.agentMessageRelationship(options.fromState, targetState),
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
+		const senderKey =
+			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
+		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
+		const replay = targetState.runtime.session.findAcceptedAgentMessage?.(payload.id);
+		if (replay) {
+			if (replay.message !== payload.message || replay.fromSessionId !== payload.from?.sessionId) {
+				throw new Error(`Agent message id collision: ${payload.id}`);
+			}
+			return createAgentSessionMessageReceipt(payload, replay.status);
+		}
+		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
+		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
+		if (!rateLimit.ok) {
+			releaseQueueSlot();
+			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
+		}
 		try {
 			const { status } = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
-				if (this.agentMessagesPaused) {
-					throw new Error("Agent messaging is paused");
+				if (this.agentMessagesPaused) throw new Error("Agent messaging is paused");
+				const existing = targetState.runtime.session.findAcceptedAgentMessage?.(payload.id);
+				if (existing) {
+					if (existing.message !== payload.message || existing.fromSessionId !== payload.from?.sessionId) {
+						throw new Error(`Agent message id collision: ${payload.id}`);
+					}
+					this.agentMessageRateLimiter.refund(rateLimitKey);
+					return { status: existing.status };
 				}
 				if (
 					!this.sessions.has(targetState.activeSessionId) ||
@@ -5657,8 +5693,40 @@ export class AgentDaemon {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
 		} finally {
-			// Error-path backstop; success paths release inside acceptAgentSessionMessage.
 			releaseQueueSlot();
+		}
+	}
+
+	private async acknowledgeAgentSessionMessage(
+		receipt: AgentSessionMessageReceipt,
+		senderSessionId: string,
+	): Promise<void> {
+		const target = this.sessions.get(receipt.target.activeSessionId);
+		if (target?.runtime.session.sessionId === receipt.target.sessionId) {
+			await this.withAgentMessageTargetLock(target.activeSessionId, async () => {
+				const accepted = target.runtime.session.findAcceptedAgentMessage(receipt.id);
+				if (accepted && accepted.fromSessionId !== senderSessionId) {
+					throw new Error("Agent-message acknowledgement sender mismatch");
+				}
+				target.runtime.session.forgetAcceptedAgentMessage(receipt.id);
+			});
+			return;
+		}
+		const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		if (!supervisorSocketPath) throw new Error("Agent-message receiver is not resident");
+		const client = new DaemonClient(supervisorSocketPath);
+		try {
+			await client.connect(1000);
+			await client.waitForHello(1000);
+			const response = await client.request({
+				type: "acknowledge_message",
+				activeSessionId: receipt.target.activeSessionId,
+				messageId: receipt.id,
+				senderSessionId,
+			});
+			if (!response.success) throw deserializeDaemonError(response);
+		} finally {
+			client.close();
 		}
 	}
 
@@ -5666,6 +5734,7 @@ export class AgentDaemon {
 		fromState: ActiveSessionState,
 		targetSelector: string,
 		message: string,
+		messageId?: string,
 	): Promise<AgentSessionMessageReceipt> {
 		const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 		if (!supervisorSocketPath) {
@@ -5679,16 +5748,23 @@ export class AgentDaemon {
 			try {
 				await client.connect(1000);
 				await client.waitForHello(1000);
-				const response = await client.request(
-					{
-						type: "send_message",
-						targetActiveSessionId: targetSelector,
-						message,
-						fromActiveSessionId: fromState.activeSessionId,
-						agentOrigin: true,
-					},
-					30_000,
-				);
+				const command = messageId
+					? {
+							type: "send_idempotent_message" as const,
+							targetActiveSessionId: targetSelector,
+							message,
+							messageId,
+							fromActiveSessionId: fromState.activeSessionId,
+							agentOrigin: true,
+						}
+					: {
+							type: "send_message" as const,
+							targetActiveSessionId: targetSelector,
+							message,
+							fromActiveSessionId: fromState.activeSessionId,
+							agentOrigin: true,
+						};
+				const response = await client.request(command, 30_000);
 				receivedResponse = true;
 				if (!response.success) {
 					throw deserializeDaemonError(response);
@@ -5735,9 +5811,13 @@ export class AgentDaemon {
 		const prompt = message.content;
 
 		if (shouldQueue) {
-			const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior, message);
-			if (!didQueue) {
-				throw new Error("Agent message was not queued");
+			session.rememberAcceptedAgentMessage?.(message, "queued");
+			try {
+				const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior, message);
+				if (!didQueue) throw new Error("Agent message was not queued");
+			} catch (error) {
+				session.forgetAcceptedAgentMessage?.(message.details.id);
+				throw error;
 			}
 			// The queued message now counts in unfinishedActionCount.
 			releaseReservation();
@@ -5748,6 +5828,8 @@ export class AgentDaemon {
 		}
 
 		this.agentMessageAcceptingTargets.add(targetState.activeSessionId);
+		session.rememberAcceptedAgentMessage?.(message, "delivered");
+		let accepted = false;
 		let preflightFailed = false;
 		let preflightQueued = false;
 		try {
@@ -5771,9 +5853,13 @@ export class AgentDaemon {
 			if (preflightFailed) {
 				throw new Error("Agent message was not accepted");
 			}
+			const status = preflightQueued ? "queued" : "delivered";
+			session.rememberAcceptedAgentMessage?.(message, status, preflightQueued);
+			accepted = true;
 			releaseReservation();
-			return { status: preflightQueued ? "queued" : "delivered" };
+			return { status };
 		} finally {
+			if (!accepted) session.forgetAcceptedAgentMessage?.(message.details.id);
 			this.agentMessageAcceptingTargets.delete(targetState.activeSessionId);
 		}
 	}
