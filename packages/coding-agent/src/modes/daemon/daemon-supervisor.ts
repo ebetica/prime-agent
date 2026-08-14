@@ -3333,12 +3333,12 @@ export class DaemonSupervisor {
 
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
+		if (killWorkerProcess) signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		const durableRecovery = worker.descriptor.createCommand.workerRecovery;
 		if (durableRecovery) {
 			worker.pendingRecovery = durableRecovery;
 			return;
 		}
-		if (killWorkerProcess) signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		const terminatedBackgroundProcesses = orphanProcessJournalPath
 			? await terminateActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)
