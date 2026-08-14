@@ -988,7 +988,7 @@ export class DaemonSupervisor {
 
 	private loadPreparedLaunchEnvironments(): Map<string, Record<string, string>> {
 		const environments = new Map<string, Record<string, string>>();
-		const agentDir = this.defaultSessionConfig.agentDir;
+		const agentDir = this.defaultSessionConfig?.agentDir;
 		if (!agentDir) return environments;
 		try {
 			const manifestPath = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);

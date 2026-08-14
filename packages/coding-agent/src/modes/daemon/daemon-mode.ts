@@ -4457,7 +4457,7 @@ export class AgentDaemon {
 				}
 				await session.setModel(model, {
 					waitForExtensions: !(session.isStreaming || session.isCompacting),
-					onlyIfIdle: command.ifIdle === true,
+					...(command.ifIdle === true ? { onlyIfIdle: true } : {}),
 				});
 				return success(command.id, "set_model", model);
 			}
