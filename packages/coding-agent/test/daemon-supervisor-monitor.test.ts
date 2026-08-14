@@ -3132,6 +3132,7 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: string;
 				recoveryJournalPath: string;
 				orphanProcessJournalPath: string;
+				createCommand: { workerRecovery?: RecoveryWorker["pendingRecovery"] };
 			};
 			pendingRecovery?: {
 				version: 1;
@@ -3180,6 +3181,7 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: "root-active",
 				recoveryJournalPath: journalPath,
 				orphanProcessJournalPath: orphanJournalPath,
+				createCommand: {},
 			},
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -3208,6 +3210,12 @@ describe("daemon worker supervisor monitoring", () => {
 					},
 				],
 			});
+			const durableRecovery = worker.pendingRecovery;
+			expect(durableRecovery).toBeDefined();
+			worker.descriptor.createCommand.workerRecovery = durableRecovery;
+			worker.pendingRecovery = undefined;
+			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			expect(worker.pendingRecovery).toBe(durableRecovery);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
