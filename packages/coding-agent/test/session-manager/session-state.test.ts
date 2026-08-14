@@ -259,4 +259,41 @@ describe("SessionManager session state", () => {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+
+	it("persists monotonic automatic parent report mute state without changing the session name", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-report-mute-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+			session.appendSessionInfo("child");
+
+			expect(session.getAutomaticParentReportsMuteState()).toEqual({ muted: false, revision: 0 });
+			const internals = session as unknown as { _persist(entry: unknown): void };
+			const persist = internals._persist;
+			internals._persist = () => {
+				throw new Error("disk full");
+			};
+			expect(() => session.setAutomaticParentReportsMuted(true)).toThrow("disk full");
+			expect(session.getAutomaticParentReportsMuteState()).toEqual({ muted: false, revision: 0 });
+			internals._persist = persist;
+			expect(session.setAutomaticParentReportsMuted(true)).toEqual({ muted: true, revision: 1 });
+			expect(session.setAutomaticParentReportsMuted(true)).toEqual({ muted: true, revision: 1 });
+			expect(session.setAutomaticParentReportsMuted(false)).toEqual({ muted: false, revision: 2 });
+			expect(session.getSessionName()).toBe("child");
+
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			const reopened = SessionManager.open(sessionFile!, sessionDir);
+			expect(reopened.getAutomaticParentReportsMuteState()).toEqual({ muted: false, revision: 2 });
+			expect(reopened.getSessionName()).toBe("child");
+			expect((await SessionManager.list(cwd, sessionDir))[0]).toMatchObject({
+				name: "child",
+				automaticParentReportsMuted: false,
+				automaticParentReportsMuteRevision: 2,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });

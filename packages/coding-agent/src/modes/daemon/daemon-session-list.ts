@@ -46,6 +46,8 @@ export interface SessionSummary {
 	sessionId: string;
 	sessionFile?: string;
 	sessionName?: string;
+	automaticParentReportsMuted?: boolean;
+	automaticParentReportsMuteRevision?: number;
 	cwd: string;
 	model?: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
@@ -200,6 +202,7 @@ export function summaryForActiveSession(
 ): SessionSummary {
 	const session = activeSession.runtime.session;
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
+	const muteState = session.automaticParentReportsMuteState ?? { muted: false, revision: 0 };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
 		try {
@@ -225,6 +228,8 @@ export function summaryForActiveSession(
 		sessionId: session.sessionId,
 		sessionFile: session.sessionFile,
 		sessionName: session.sessionName,
+		automaticParentReportsMuted: muteState.muted || undefined,
+		automaticParentReportsMuteRevision: muteState.revision || undefined,
 		cwd: session.sessionManager.getCwd(),
 		model: session.model as Model<Api> | undefined,
 		thinkingLevel: session.thinkingLevel,
@@ -306,6 +311,8 @@ export function summaryForInactiveSession(
 		sessionId: session.id,
 		sessionFile: session.path,
 		sessionName: session.name,
+		automaticParentReportsMuted: session.automaticParentReportsMuted || undefined,
+		automaticParentReportsMuteRevision: session.automaticParentReportsMuteRevision || undefined,
 		cwd: session.cwd,
 		isStreaming: false,
 		isCompacting: false,

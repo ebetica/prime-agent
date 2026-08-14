@@ -269,6 +269,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"export_html",
 	"export_jsonl",
 	"set_session_name",
+	"set_automatic_parent_reports_muted",
+	"toggle_automatic_parent_reports_muted",
 	"get_rlm_max_depth_status",
 	"set_rlm_max_depth",
 	"rename_saved_session",

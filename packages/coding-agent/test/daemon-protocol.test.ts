@@ -108,6 +108,17 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("planned_restart_handoff_lifecycle");
 	});
 
+	it("capability-gates automatic parent report mute controls", () => {
+		const compatibility = {
+			minProtocol: 7,
+			minSchemaRevision: 23,
+			capability: "automatic_parent_report_mute",
+		};
+		expect(DAEMON_COMMAND_COMPATIBILITY.set_automatic_parent_reports_muted).toEqual(compatibility);
+		expect(DAEMON_COMMAND_COMPATIBILITY.toggle_automatic_parent_reports_muted).toEqual(compatibility);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("automatic_parent_report_mute");
+	});
+
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
 		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
 		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);

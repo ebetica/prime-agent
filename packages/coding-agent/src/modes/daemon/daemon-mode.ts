@@ -339,6 +339,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"export_html",
 	"export_jsonl",
 	"set_session_name",
+	"set_automatic_parent_reports_muted",
+	"toggle_automatic_parent_reports_muted",
 	"get_rlm_max_depth_status",
 	"set_rlm_max_depth",
 	"rename_saved_session",
@@ -3614,7 +3616,18 @@ export class AgentDaemon {
 			}
 
 			case "create": {
+				if (
+					command.automaticParentReportsMuted !== undefined &&
+					!command.runtimeMetadata?.parentActiveSessionId &&
+					!command.runtimeMetadata?.parentSessionId &&
+					!command.runtimeMetadata?.parentSessionFile
+				) {
+					throw new Error("Automatic parent report mute requires a parent session");
+				}
 				const state = await this.createRuntime(command);
+				if (command.automaticParentReportsMuted !== undefined) {
+					state.runtime.session.setAutomaticParentReportsMuted(command.automaticParentReportsMuted);
+				}
 				await this.applyWorkerRecovery(command, state);
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
@@ -4581,6 +4594,20 @@ export class AgentDaemon {
 				}
 				await this.setStateSessionName(state, name);
 				return success(command.id, "set_session_name");
+			}
+
+			case "set_automatic_parent_reports_muted":
+			case "toggle_automatic_parent_reports_muted": {
+				const state = this.getSessionState(command.activeSessionId);
+				const metadata = state.runtime.metadata;
+				if (!metadata.parentActiveSessionId && !metadata.parentSessionId && !metadata.parentSessionFile) {
+					throw new Error("Automatic parent report mute requires a parent session");
+				}
+				const result =
+					command.type === "set_automatic_parent_reports_muted"
+						? state.runtime.session.setAutomaticParentReportsMuted(command.muted)
+						: state.runtime.session.toggleAutomaticParentReportsMuted();
+				return success(command.id, command.type, result);
 			}
 
 			case "get_rlm_max_depth_status": {
