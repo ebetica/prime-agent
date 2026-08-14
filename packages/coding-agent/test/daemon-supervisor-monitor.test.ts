@@ -1,4 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
@@ -3220,6 +3221,98 @@ describe("daemon worker supervisor monitoring", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	function testLaunchEnvironmentDigest(environment: Record<string, string>): string {
+		const canonical = Object.keys(environment)
+			.sort()
+			.map((key) => [key, environment[key]] as const);
+		return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+	}
+
+	function updatePrepareFixture(
+		launchEnvDigest: string | undefined,
+		sessions: Array<{ activeSessionId: string; launchEnv?: unknown }>,
+	) {
+		const descriptor = {
+			workerId: "worker",
+			lifecycle: "ready",
+			rootActiveSessionId: "root",
+			...(launchEnvDigest === undefined ? {} : { launchEnvDigest }),
+		};
+		const manifest = {
+			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+			createdAt: "now",
+			sessions,
+		};
+		const client = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update" ? { success: true, data: manifest } : { success: true },
+			),
+			close: vi.fn(),
+		};
+		const worker = { descriptor, client };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+			validateAndPersistUpdateManifest: vi.fn(),
+			stopWorker: vi.fn(async () => undefined),
+		}) as { prepareUpdateRestartFenced(): Promise<unknown> };
+		return { client, descriptor, supervisor, worker };
+	}
+
+	it("validates prepared launch environments against the pre-request descriptor digest", async () => {
+		const environment = { ALPHA: "one", BETA: "two" };
+		const fixture = updatePrepareFixture(testLaunchEnvironmentDigest(environment), [
+			{ activeSessionId: "root", launchEnv: { BETA: "two", ALPHA: "one" } },
+			{ activeSessionId: "child", launchEnv: { ALPHA: "one", BETA: "two" } },
+		]);
+		fixture.client.requestWorker.mockImplementation(async ({ type }: { type: string }) => {
+			if (type === "worker_prepare_update") {
+				fixture.descriptor.launchEnvDigest = "0".repeat(64);
+				return {
+					success: true,
+					data: {
+						formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+						createdAt: "now",
+						sessions: [
+							{ activeSessionId: "root", launchEnv: { BETA: "two", ALPHA: "one" } },
+							{ activeSessionId: "child", launchEnv: { ALPHA: "one", BETA: "two" } },
+						],
+					},
+				};
+			}
+			return { success: true };
+		});
+
+		expect(fixture.worker).not.toHaveProperty("launchEnv");
+		await expect(fixture.supervisor.prepareUpdateRestartFenced()).resolves.toBeDefined();
+		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_commit_update" }, expect.any(Number));
+	});
+
+	it("rejects and cancels when a child returns a mismatched launch environment", async () => {
+		const environment = { ALPHA: "one" };
+		const fixture = updatePrepareFixture(testLaunchEnvironmentDigest(environment), [
+			{ activeSessionId: "root", launchEnv: environment },
+			{ activeSessionId: "child", launchEnv: { ALPHA: "different" } },
+		]);
+
+		await expect(fixture.supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/untrusted launch environment/);
+		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
+	it.each([
+		{ name: "missing descriptor digest", digest: undefined, launchEnv: { ALPHA: "one" } },
+		{ name: "malformed descriptor digest", digest: "A".repeat(64), launchEnv: { ALPHA: "one" } },
+		{ name: "omitted environment", digest: "0".repeat(64), launchEnv: undefined },
+		{ name: "array environment", digest: "0".repeat(64), launchEnv: ["one"] },
+		{ name: "numeric environment", digest: "0".repeat(64), launchEnv: 1 },
+		{ name: "null environment", digest: "0".repeat(64), launchEnv: null },
+		{ name: "non-string environment value", digest: "0".repeat(64), launchEnv: { ALPHA: 1 } },
+	])("rejects and cancels a prepared manifest with $name", async ({ digest, launchEnv }) => {
+		const fixture = updatePrepareFixture(digest, [{ activeSessionId: "root", launchEnv }]);
+
+		await expect(fixture.supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/untrusted launch environment/);
+		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
 	it.each([
 		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
 		{

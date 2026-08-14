@@ -459,6 +459,34 @@ function launchEnvironmentDigest(environment: Record<string, string>): string {
 	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
+function readLaunchEnvironment(value: unknown): Record<string, string> | undefined {
+	if (
+		!value ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		Object.getPrototypeOf(value) !== Object.prototype
+	) {
+		return undefined;
+	}
+	const entries = Object.entries(value);
+	if (
+		entries.length > 256 ||
+		entries.some(
+			([key, entry]) =>
+				!key ||
+				key.length > 256 ||
+				key === "__proto__" ||
+				key === "prototype" ||
+				key === "constructor" ||
+				typeof entry !== "string",
+		)
+	) {
+		return undefined;
+	}
+	const environment = Object.fromEntries(entries) as Record<string, string>;
+	return Buffer.byteLength(JSON.stringify(environment)) <= 256 * 1024 ? environment : undefined;
+}
+
 function launchEnvironmentsEqual(
 	left: Record<string, string> | undefined,
 	right: Record<string, string> | undefined,
@@ -1019,30 +1047,8 @@ export class DaemonSupervisor {
 			for (const candidate of parsed.sessions) {
 				if (!candidate || typeof candidate !== "object") continue;
 				const session = candidate as { sessionFile?: unknown; launchEnv?: unknown };
-				if (
-					typeof session.sessionFile !== "string" ||
-					!session.launchEnv ||
-					typeof session.launchEnv !== "object"
-				) {
-					continue;
-				}
-				const entries = Object.entries(session.launchEnv);
-				if (
-					entries.length > 256 ||
-					entries.some(
-						([key, value]) =>
-							!key ||
-							key.length > 256 ||
-							key === "__proto__" ||
-							key === "prototype" ||
-							key === "constructor" ||
-							typeof value !== "string",
-					)
-				) {
-					continue;
-				}
-				const environment = Object.fromEntries(entries) as Record<string, string>;
-				if (Buffer.byteLength(JSON.stringify(environment)) > 256 * 1024) continue;
+				const environment = readLaunchEnvironment(session.launchEnv);
+				if (typeof session.sessionFile !== "string" || environment === undefined) continue;
 				environments.set(canonicalSessionPath(session.sessionFile), environment);
 			}
 		} catch {
@@ -2485,6 +2491,7 @@ export class DaemonSupervisor {
 			worker.descriptor = previousDescriptor;
 			throw error;
 		}
+		worker.launchEnv = undefined;
 		worker.promotedOwnerClientId = clientId;
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
@@ -5004,6 +5011,7 @@ export class DaemonSupervisor {
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const client = worker.client;
+				const expectedLaunchEnvDigest = worker.descriptor.launchEnvDigest;
 				const ownsHandoff = handoff ? worker.summaries.has(handoff.target.activeSessionId) : false;
 				const response = await client.requestWorker(
 					{
@@ -5026,7 +5034,13 @@ export class DaemonSupervisor {
 				if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
 					throw new Error(`Worker returned unsupported update manifest version ${manifest.formatVersion}`);
 				}
-				if (manifest.sessions.some((session) => !launchEnvironmentsEqual(session.launchEnv, worker.launchEnv))) {
+				if (
+					manifest.sessions.some((session) => {
+						if (!expectedLaunchEnvDigest || !/^[a-f0-9]{64}$/.test(expectedLaunchEnvDigest)) return true;
+						const environment = readLaunchEnvironment(session.launchEnv);
+						return environment === undefined || launchEnvironmentDigest(environment) !== expectedLaunchEnvDigest;
+					})
+				) {
 					throw new Error(`Worker ${worker.descriptor.workerId} returned an untrusted launch environment`);
 				}
 				if (
