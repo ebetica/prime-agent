@@ -123,6 +123,9 @@ export async function terminateActiveOrphanProcesses(
 ): Promise<number> {
 	const identityStatus = options.identityStatus ?? orphanProcessIdentityStatus;
 	const journaled = readActiveOrphanProcesses(path, ownerPid);
+	if (journaled.length > 256) {
+		throw new Error("Tracked worker background process count exceeds the bounded recovery payload");
+	}
 	const active: ActiveOrphanProcess[] = [];
 	for (const orphan of journaled) {
 		const status = identityStatus(orphan);
@@ -130,9 +133,6 @@ export async function terminateActiveOrphanProcesses(
 			throw new Error("Tracked worker background process identity could not be verified");
 		}
 		if (status === "current") active.push(orphan);
-	}
-	if (active.length > 256) {
-		throw new Error("Tracked worker background process count exceeds the bounded recovery payload");
 	}
 	const signal =
 		options.signal ??
@@ -168,5 +168,5 @@ export async function terminateActiveOrphanProcesses(
 		throw new Error("Tracked worker background processes did not terminate within the cleanup deadline");
 	}
 	clearOrphanProcessJournal(path);
-	return active.length;
+	return journaled.length;
 }

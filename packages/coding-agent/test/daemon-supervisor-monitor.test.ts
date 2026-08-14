@@ -3198,13 +3198,13 @@ describe("daemon worker supervisor monitoring", () => {
 						activeSessionId: "root-active",
 						sessionFile: "/tmp/root.jsonl",
 						operations: ["model_stream"],
-						terminatedBackgroundProcesses: 0,
+						terminatedBackgroundProcesses: 1,
 					},
 					{
 						activeSessionId: "child-active",
 						sessionFile: "/tmp/child.jsonl",
 						operations: ["tool_execution"],
-						terminatedBackgroundProcesses: 0,
+						terminatedBackgroundProcesses: 1,
 					},
 				],
 			});

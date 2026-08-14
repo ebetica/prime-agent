@@ -67,6 +67,23 @@ describe("orphan process journal", () => {
 		expect(existsSync(path)).toBe(false);
 	});
 
+	it("keeps the confirmed-gone count stable across a recovery retry", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-retry-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		recordOrphanProcessState(process.pid, true);
+		await expect(
+			terminateActiveOrphanProcesses(path, process.pid, {
+				identityStatus: () => "gone",
+				signal: () => {
+					throw new Error("must not signal an identity already confirmed gone");
+				},
+			}),
+		).resolves.toBe(1);
+		expect(existsSync(path)).toBe(false);
+	});
+
 	it("retains cleanup facts when a tracked identity remains alive", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-blocked-test-"));
 		tempDirs.push(directory);
