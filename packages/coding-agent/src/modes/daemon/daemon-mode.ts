@@ -507,6 +507,9 @@ export class AgentDaemon {
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
 	private readonly remoteAgentPeers = new Map<string, AgentSessionMessageAgentSummary>();
 	private readonly agentMessagePendingReservations = new Map<string, number>();
+	// Exact update-restart snapshots are trusted only while held by this daemon;
+	// public restore_actions callers cannot mint agent provenance.
+	private readonly trustedActionRecoverySnapshots = new WeakMap<ActiveSessionState, string>();
 	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
 	private readonly agentMessageAcceptingTargets = new Set<string>();
 	// Refcount of prompts in preflight (accepted but not yet streaming); >0 makes
@@ -1670,12 +1673,11 @@ export class AgentDaemon {
 		return this.withAgentMessagePreparingGuard(
 			state,
 			(session, clearPreparing) => {
-				const prompt =
-					options?.agentMessageId !== undefined && options.expandPromptTemplates === false
-						? session.acceptAgentMessagePrompt.bind(session)
-						: waitForCompletion
-							? (session.promptAndWait ?? session.prompt).bind(session)
-							: (session.promptUntilAccepted ?? session.prompt).bind(session);
+				// Ordinary daemon prompt fields are caller-controlled. Only the native
+				// send_message controller below may enter acceptAgentMessagePrompt.
+				const prompt = waitForCompletion
+					? (session.promptAndWait ?? session.prompt).bind(session)
+					: (session.promptUntilAccepted ?? session.prompt).bind(session);
 				return prompt(message, {
 					...options,
 					preflightResult: (didSucceed, queued) => {
@@ -3990,7 +3992,11 @@ export class AgentDaemon {
 
 			case "restore_actions": {
 				const state = this.getSessionState(command.activeSessionId);
-				const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
+				const expectedSnapshot = this.trustedActionRecoverySnapshots.get(state);
+				const trustQueuedOrigins =
+					expectedSnapshot !== undefined && expectedSnapshot === JSON.stringify(command.snapshot);
+				if (trustQueuedOrigins) this.trustedActionRecoverySnapshots.delete(state);
+				const restored = await state.runtime.session.restoreSessionActions(command.snapshot, trustQueuedOrigins);
 				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
 				return success(command.id, "restore_actions", { restored });
 			}
@@ -5767,6 +5773,7 @@ export class AgentDaemon {
 			actions: session.getSessionActionRecoverySnapshot(),
 			nextTurn: [...session.getPendingNextTurnMessageSnapshots()],
 		};
+		this.trustedActionRecoverySnapshots.set(state, JSON.stringify(queue.actions));
 		const hasQueuedMessages = queue.actions.actions.length > 0 || queue.nextTurn.length > 0;
 		const wasStreaming = session.isStreaming;
 		const wasCompacting = session.isCompacting;

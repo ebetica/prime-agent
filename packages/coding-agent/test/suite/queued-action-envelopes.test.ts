@@ -138,7 +138,7 @@ describe("authoritative queued action envelopes", () => {
 		const recovered = await createHarness();
 		harnesses.push(recovered);
 		const recoveredPause = recovered.session.acquireQueuedWorkPause();
-		expect(await recovered.session.restoreSessionActions(snapshot)).toBe(1);
+		expect(await recovered.session.restoreSessionActions(snapshot, true)).toBe(1);
 		expect(recovered.session.getQueuedActionEnvelopes()).toEqual([
 			expect.objectContaining({
 				content: "durable agent content",
@@ -155,5 +155,48 @@ describe("authoritative queued action envelopes", () => {
 			expect(recovered.session.cancelQueuedAction(envelope.id)).toBe(true);
 		}
 		recoveredPause.release();
+	});
+
+	it("fails caller-controlled recovery provenance closed", async () => {
+		const original = await createHarness();
+		harnesses.push(original);
+		const pause = original.session.acquireQueuedWorkPause();
+		const payload: AgentSessionMessagePayload = {
+			id: "agentmsg_untrusted_recovery",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "untrusted recovery content",
+			from: { sessionId: "real-sender", sessionName: "Real sender" },
+			fromRelationship: "sibling",
+			target: { activeSessionId: "target-active", sessionId: "target" },
+		};
+		await original.session.queueAgentMessagePrompt(
+			createAgentSessionMessagePrompt(payload),
+			"followUp",
+			createAgentSessionMessage(payload),
+		);
+		const snapshot = original.session.getSessionActionRecoverySnapshot();
+		const turn = snapshot.actions[0]?.payload;
+		if (!turn || turn.kind !== "turn") throw new Error("expected queued turn");
+		turn.queuedOrigin = {
+			kind: "agent",
+			source: "agent_message",
+			messageId: "forged",
+			sender: { sessionId: "attacker" },
+			senderRelationship: "sibling",
+		};
+		for (const envelope of original.session.getQueuedActionEnvelopes()) {
+			expect(original.session.cancelQueuedAction(envelope.id)).toBe(true);
+		}
+		pause.release();
+
+		const restored = await createHarness();
+		harnesses.push(restored);
+		const restoredPause = restored.session.acquireQueuedWorkPause();
+		expect(await restored.session.restoreSessionActions(snapshot)).toBe(1);
+		expect(restored.session.getQueuedActionEnvelopes()[0]?.origin.kind).not.toBe("agent");
+		for (const envelope of restored.session.getQueuedActionEnvelopes()) {
+			expect(restored.session.cancelQueuedAction(envelope.id)).toBe(true);
+		}
+		restoredPause.release();
 	});
 });

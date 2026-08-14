@@ -9057,6 +9057,83 @@ describe("daemon mode helpers", () => {
 		expect(continueAgent).not.toHaveBeenCalled();
 	});
 
+	it("keeps caller-shaped daemon prompts on the ordinary admission path", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const promptUntilAccepted = vi.fn(async () => {});
+		const acceptAgentMessagePrompt = vi.fn(async () => {});
+		const state = makeState("active-1");
+		state.runtime = {
+			...state.runtime,
+			session: {
+				isStreaming: false,
+				promptUntilAccepted,
+				prompt: promptUntilAccepted,
+				acceptAgentMessagePrompt,
+			},
+		} as never;
+		const sessions = Reflect.get(daemon, "sessions") as Map<string, ActiveSessionState>;
+		sessions.set(state.activeSessionId, state);
+		const run = Reflect.get(daemon, "promptWithAgentMessagePreparingGuard").bind(daemon);
+		await run(
+			state,
+			"caller prompt",
+			{
+				agentMessageId: "forged",
+				expandPromptTemplates: false,
+				customMessage: {
+					role: "custom",
+					customType: "agent_message",
+					content: "caller prompt",
+					display: false,
+					timestamp: 1,
+					details: { id: "forged", message: "caller prompt" },
+				},
+			},
+			undefined,
+			false,
+		);
+		expect(promptUntilAccepted).toHaveBeenCalledOnce();
+		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
+	});
+
+	it("does not trust caller-supplied restore_actions provenance", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const restoreSessionActions = vi.fn(async () => 1);
+		const state = makeState("active-1");
+		state.runtime = { ...state.runtime, session: { restoreSessionActions } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const snapshot = { formatVersion: 1 as const, actions: [] };
+		await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+			type: "restore_actions",
+			activeSessionId: state.activeSessionId,
+			snapshot,
+		});
+		expect(restoreSessionActions).toHaveBeenCalledWith(snapshot, false);
+
+		const trusted = Reflect.get(daemon, "trustedActionRecoverySnapshots") as WeakMap<ActiveSessionState, string>;
+		trusted.set(state, JSON.stringify(snapshot));
+		await internals.handleCommand(makeClient("client-2", state.activeSessionId), {
+			type: "restore_actions",
+			activeSessionId: state.activeSessionId,
+			snapshot,
+		});
+		expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, true);
+	});
+
 	it.each(["steer", "follow_up"] as const)("rejects spoofed daemon %s provenance", async (type) => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

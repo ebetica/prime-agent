@@ -5115,7 +5115,7 @@ export class AgentSession {
 		return "admitted";
 	}
 
-	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<number> {
+	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot, trustQueuedOrigins = false): Promise<number> {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
 		}
@@ -5171,7 +5171,7 @@ export class AgentSession {
 							queueVisible: recovered.payload.queueVisible,
 							acceptedAgentMessage: recovered.payload.acceptedAgentMessage,
 							acceptedBeforeCompletion: recovered.payload.acceptedBeforeCompletion,
-							...(recovered.payload.queuedOrigin
+							...(trustQueuedOrigins && recovered.payload.queuedOrigin
 								? { queuedOrigin: cloneQueuedActionOrigin(recovered.payload.queuedOrigin) }
 								: {}),
 						}
