@@ -124,6 +124,8 @@ export interface AgentConnectionSavedSessionInfo {
 	id: string;
 	cwd: string;
 	name?: string;
+	automaticParentReportsMuted?: boolean;
+	automaticParentReportsMuteRevision?: number;
 	state?: AgentConnectionSavedSessionState;
 	parentSessionPath?: string;
 	rlmDepth?: number;

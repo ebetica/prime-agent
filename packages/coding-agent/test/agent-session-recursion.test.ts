@@ -1006,7 +1006,7 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
 	});
 
-	it("marks a broadcast delivery to the parent as replied without reloading the roster", async () => {
+	it("delivers an explicit parent send from a muted child and marks it replied", async () => {
 		const roster = vi.fn(() => ({
 			current: { name: "child", id: "child-session", depth: 1 },
 			entries: [
@@ -1034,6 +1034,7 @@ describe("AgentSession rlm recursion", () => {
 				sendAgentMessage,
 			},
 		});
+		child.setAutomaticParentReportsMuted(true);
 		const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
@@ -1220,6 +1221,55 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("suppresses cancellation reports after a child is muted", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				void release.then(() => stream.push({ type: "done", reason: "stop", message: assistantMessage("late") }));
+				return stream;
+			},
+		});
+		const spawned = await root.runRlmChild("slow muted child", { name: "muted-cancel-worker" });
+		await waitFor(() => childStarted);
+		const run = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(spawned.rlm_child_id);
+		run?.session?.setAutomaticParentReportsMuted(true);
+		expect(root.cancelRlmChildRun(spawned.rlm_child_id)).toBe(true);
+		releaseChild();
+		await vi.waitFor(() => expect(run?.status).toBe("cancelled"));
+		expect(
+			root.messages.filter(
+				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+			),
+		).toHaveLength(0);
+	});
+
+	it("suppresses failure reports from a muted published child", async () => {
+		const child = createSession({ depth: 1, rlmSessionDir: join(tempDir, "muted-failing-child") });
+		child.setAutomaticParentReportsMuted(true);
+		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child failed"));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const spawned = await root.runRlmChild("failing muted child", { name: "muted-failing-worker" });
+		await vi.waitFor(async () => {
+			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" }),
+			);
+		});
+		expect(
+			root.messages.filter((message) => message.role === "custom" && message.customType === "rlm_child_failure"),
+		).toHaveLength(0);
+	});
+
 	it("injects exactly one notice with a preview when a child completes without replying", async () => {
 		const root = createSession();
 
@@ -1239,6 +1289,29 @@ describe("AgentSession rlm recursion", () => {
 				},
 			});
 		});
+	});
+
+	it("suppresses an automatic completion report from a muted child while retaining completion", async () => {
+		const child = createSession({ depth: 1, rlmSessionDir: join(tempDir, "muted-child") });
+		expect(child.setAutomaticParentReportsMuted(true)).toEqual({ muted: true, revision: 1 });
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+
+		const spawned = await root.runRlmChild("silent muted child", { name: "muted-worker" });
+		await vi.waitFor(async () => {
+			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
+			);
+		});
+		expect(
+			root.messages.filter(
+				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+			),
+		).toHaveLength(0);
 	});
 
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {
