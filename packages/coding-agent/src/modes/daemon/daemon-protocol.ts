@@ -117,8 +117,8 @@ export type DaemonServerCapability =
 	| "planned_restart_handoff"
 	| "planned_restart_handoff_lifecycle"
 	| "automatic_parent_report_mute"
-	| "atomic_stop"
-	| "atomic_queue_withdrawal";
+	| "atomic_stop_v2"
+	| "queued_withdrawal_v2";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -168,8 +168,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"planned_restart_handoff",
 	"planned_restart_handoff_lifecycle",
 	"automatic_parent_report_mute",
-	"atomic_stop",
-	"atomic_queue_withdrawal",
+	"atomic_stop_v2",
+	"queued_withdrawal_v2",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -626,9 +626,9 @@ export type DaemonCommand =
 	| { id?: string; type: "abort"; activeSessionId: string }
 	| {
 			id?: string;
-			type: "stop_active_run";
+			type: "stop_active_operations";
 			activeSessionId: string;
-			expectedRunInstanceId: string;
+			operationSetToken: string;
 	  }
 	| {
 			id?: string;
@@ -894,7 +894,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
-	stop_active_run: { minProtocol: 7, minSchemaRevision: 26, capability: "atomic_stop" },
+	stop_active_operations: { minProtocol: 7, minSchemaRevision: 26, capability: "atomic_stop_v2" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -917,7 +917,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
 	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
 	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
-	withdraw_queued_actions: { minProtocol: 7, minSchemaRevision: 26, capability: "atomic_queue_withdrawal" },
+	withdraw_queued_actions: { minProtocol: 7, minSchemaRevision: 26, capability: "queued_withdrawal_v2" },
 
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,

@@ -200,6 +200,7 @@ import {
 	type WorkerRecoveryDetails,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { OwnedOperationRegistry } from "./owned-operation-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
@@ -1161,9 +1162,8 @@ export class AgentSession {
 		followUps: [],
 		queuedUserActions: [],
 	};
-	private _activeRunInstanceId?: string;
-	private readonly _stoppedRunInstances = new Map<string, Promise<void>>();
-	private _userBashCompletion?: Promise<void>;
+	private readonly _ownedOperations = new OwnedOperationRegistry();
+	private _activeAgentOperation?: { id: string; settle(): void };
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -3417,8 +3417,20 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
-		if (event.type === "agent_start") {
-			this._activeRunInstanceId = randomUUID();
+		if (event.type === "agent_start" && !this._activeAgentOperation) {
+			let settle!: () => void;
+			const settled = new Promise<void>((resolve) => {
+				settle = resolve;
+			});
+			const operation = this._ownedOperations.admitRoot("agent_run", {
+				interrupt: () => this.requestAbort(),
+				settled,
+				cleanup: async () => {
+					await this.agent.waitForIdle();
+					await this._agentEventQueue;
+				},
+			});
+			this._activeAgentOperation = { id: operation.id, settle };
 			this._emitQueueUpdate();
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
@@ -3436,8 +3448,13 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
-			this._activeRunInstanceId = undefined;
-			this._emitQueueUpdate();
+			const operation = this._activeAgentOperation;
+			if (operation) {
+				operation.settle();
+				this._ownedOperations.complete(operation.id);
+				this._activeAgentOperation = undefined;
+				this._emitQueueUpdate();
+			}
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -5724,8 +5741,10 @@ export class AgentSession {
 			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
 		if (options.front) this._actionStore.enqueueFront(action);
 		else this._actionStore.enqueue(action);
-		let disposition: "starts_when_admitted" | "queued" = "queued";
-		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
+		// Selection is performed only by the input pump while it owns the session
+		// action fence. Keeping the item queued here gives withdrawal and selection
+		// one linearization point instead of letting synchronous admission bypass it.
+		const disposition: "starts_when_admitted" | "queued" = canStartImmediately ? "starts_when_admitted" : "queued";
 		const controller = this._actionStore.ticketFor(action);
 		controller.settleAccepted({
 			status: "accepted",
@@ -5857,34 +5876,43 @@ export class AgentSession {
 					this._notifySessionInputCheckpointChange();
 					return;
 				}
-				const first = preselected ?? this._actionStore.selectFirst();
-				if (!first) return;
+				// Selection and queued-only withdrawal are writers on the same fence. Once
+				// this block changes an action to selected/preparing, withdrawal must report
+				// it as not queued; if withdrawal acquired the fence first, selection cannot
+				// observe the removed action.
+				const selectionFence = await this._acquireSessionActionCommitFence();
+				let first: QueuedSessionAction | undefined;
+				const actions: QueuedSessionAction[] = [];
+				try {
+					if (this._isSessionInputHandoffDeferred(epoch)) return;
+					first = preselected?.lifecycle.state === "selected" ? preselected : this._actionStore.selectFirst();
+					if (!first) return;
+					if (first.payload.kind !== "session_command") {
+						const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+						actions.push(first);
+						while (!preselected && mode === "all") {
+							const next = this._actionStore.queuedActions(first.delivery)[0];
+							if (
+								!next ||
+								next.payload.kind !== "turn" ||
+								!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
+							) {
+								break;
+							}
+							this._actionStore.selectFirst();
+							actions.push(next);
+						}
+						for (const action of actions) transitionSessionAction(action, { state: "preparing" });
+					}
+					this._notifySessionInputCheckpointChange();
+					this._emitQueueUpdate();
+				} finally {
+					selectionFence.release();
+				}
 				if (first.payload.kind === "session_command") {
 					await this._executeSelectedSessionCommand(first, epoch);
 					return;
 				}
-
-				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
-				const actions: QueuedSessionAction[] = [first];
-				while (!preselected && mode === "all") {
-					const next = this._actionStore.queuedActions(first.delivery)[0];
-					if (
-						!next ||
-						next.payload.kind !== "turn" ||
-						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
-					) {
-						break;
-					}
-					this._actionStore.selectFirst();
-					actions.push(next);
-				}
-				if (epoch !== this._sessionInputPumpEpoch) {
-					for (const action of actions) this._actionStore.rollback(action);
-					return;
-				}
-				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
-				this._notifySessionInputCheckpointChange();
-				this._emitQueueUpdate();
 				try {
 					await this._startPreparedTurnActions(actions, epoch);
 					for (const action of actions) {
@@ -6612,32 +6640,19 @@ export class AgentSession {
 			if (withdrawn.length > 0) this._emitQueueUpdate();
 			return withdrawn;
 		} finally {
+			// Releasing this writer fence is sufficient. Withdrawal never owns the
+			// caller's queued-work pause and must not globally resume it.
 			fence.release();
-			this.resumeQueuedWork();
 		}
 	}
 
-	async stopActiveRun(expectedRunInstanceId: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
-		const previous = this._stoppedRunInstances.get(expectedRunInstanceId);
-		if (previous) {
-			await previous;
-			return { status: "already_stopped" };
-		}
-		if (this._activeRunInstanceId !== expectedRunInstanceId) return { status: "stale" };
-		// Invalidate the compare token before admitting abort, so a retry cannot hit a replacement.
-		this._activeRunInstanceId = undefined;
+	async stopActiveOperations(operationSetToken: string): Promise<{
+		status: "stopped" | "already_stopped" | "stale";
+		kernelRestarted?: boolean;
+	}> {
+		const result = await this._ownedOperations.stop(operationSetToken);
 		this._emitQueueUpdate();
-		const completion = (async () => {
-			await this.abort();
-			await this._userBashCompletion;
-		})();
-		this._stoppedRunInstances.set(expectedRunInstanceId, completion);
-		while (this._stoppedRunInstances.size > 128) {
-			const oldest = this._stoppedRunInstances.keys().next().value;
-			if (oldest !== undefined) this._stoppedRunInstances.delete(oldest);
-		}
-		await completion;
-		return { status: "stopped" };
+		return result;
 	}
 
 	cancelQueuedAction(id: string): boolean {
@@ -6760,12 +6775,13 @@ export class AgentSession {
 					? activeState
 					: undefined;
 		const queuedUserActions = this.getQueuedUserActions();
+		const activeOperationSet = this._ownedOperations.activeSet();
 		return {
 			queuedCount: steering.length + followUps.length,
 			steering,
 			followUps,
 			queuedUserActions,
-			...(this._activeRunInstanceId ? { activeRunInstanceId: this._activeRunInstanceId } : {}),
+			...(activeOperationSet ? { activeOperationSet } : {}),
 			...(active && phase
 				? {
 						active: {
@@ -11380,17 +11396,23 @@ export class AgentSession {
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}
-		// Claim the bash slot synchronously: isBashRunning is otherwise false until
-		// executeBash installs its abort controller, which would let a second command
-		// slip through during the user_bash extension dispatch below.
+		if (this.isStreaming || this._actionStore.activeActions().length > 0 || this._ownedOperations.activeOwnerId) {
+			throw new Error("Cannot execute standalone bash while agent activity is admitted");
+		}
+		// Claim both the Bash flag and the immutable operation owner synchronously,
+		// before extension dispatch or process spawn. The input pump observes the
+		// Bash flag and cannot select a turn until this operation settles.
 		this._userBashRunning = true;
 		this._userBashAbortRequested = false;
-		if (!this._activeRunInstanceId) this._activeRunInstanceId = randomUUID();
-		this._emitQueueUpdate();
 		let settleUserBash!: () => void;
-		this._userBashCompletion = new Promise<void>((resolve) => {
+		const userBashCompletion = new Promise<void>((resolve) => {
 			settleUserBash = resolve;
 		});
+		const operation = this._ownedOperations.admitRoot("user_bash", {
+			interrupt: () => this.abortBash(),
+			settled: userBashCompletion,
+		});
+		this._emitQueueUpdate();
 		// Echoed on bash_start/bash_end so the requesting client can tell its own
 		// run apart from other clients' runs broadcast on the same session.
 		const identity = {
@@ -11408,8 +11430,7 @@ export class AgentSession {
 		} finally {
 			this._userBashRunning = false;
 			settleUserBash();
-			this._userBashCompletion = undefined;
-			this._activeRunInstanceId = undefined;
+			this._ownedOperations.complete(operation.id);
 			this._emitQueueUpdate();
 		}
 		// Emitted after the slot is released so clients never observe a bash_end

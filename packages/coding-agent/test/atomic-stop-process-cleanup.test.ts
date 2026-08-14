@@ -45,12 +45,15 @@ describe.skipIf(process.platform === "win32")("atomic stop process cleanup", () 
 		await waitFor(() => existsSync(childFile) && existsSync(grandchildFile), "processes did not start");
 		const child = Number(readFileSync(childFile, "utf8"));
 		const grandchild = Number(readFileSync(grandchildFile, "utf8"));
-		const token = harness.session.getSessionActionSnapshot().activeRunInstanceId;
+		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
 		expect(token).toBeDefined();
 
-		expect(await harness.session.stopActiveRun(token!)).toEqual({ status: "stopped" });
+		expect(await harness.session.stopActiveOperations(token!)).toEqual({ status: "stopped", kernelRestarted: false });
 		await running;
 		await waitFor(() => !alive(child) && !alive(grandchild), "owned process group survived stopped response");
-		expect(await harness.session.stopActiveRun(token!)).toEqual({ status: "already_stopped" });
+		expect(await harness.session.stopActiveOperations(token!)).toEqual({
+			status: "already_stopped",
+			kernelRestarted: false,
+		});
 	});
 });

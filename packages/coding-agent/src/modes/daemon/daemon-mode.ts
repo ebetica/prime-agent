@@ -4137,12 +4137,12 @@ export class AgentDaemon {
 				return success(command.id, "abort");
 			}
 
-			case "stop_active_run": {
+			case "stop_active_operations": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(
 					command.id,
-					"stop_active_run",
-					await state.runtime.session.stopActiveRun(command.expectedRunInstanceId),
+					"stop_active_operations",
+					await state.runtime.session.stopActiveOperations(command.operationSetToken),
 				);
 			}
 

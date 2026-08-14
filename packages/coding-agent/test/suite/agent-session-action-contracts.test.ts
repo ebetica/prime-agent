@@ -1,7 +1,8 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { type SessionAction, transitionSessionAction } from "../../src/core/session-action-store.js";
 import { createHarness, getUserTexts, type Harness } from "./harness.js";
-import { withStreaming } from "./scheduling.js";
+import { createWaitingHarness, withStreaming } from "./scheduling.js";
 
 describe("AgentSession action contracts", () => {
 	const harnesses: Harness[] = [];
@@ -128,16 +129,84 @@ describe("AgentSession action contracts", () => {
 		expect(await harness.session.withdrawQueuedUserActions([queued[1].id])).toEqual([]);
 	});
 
-	it("makes matched stop retryable without aborting a replacement run", async () => {
+	it("linearizes selection before withdrawal at the selected and preparing boundaries", async () => {
+		for (const prepare of [false, true]) {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			withStreaming(harness, true);
+			await harness.session.prompt(`target-${prepare}`, { streamingBehavior: "followUp" });
+			const target = harness.session.getSessionActionSnapshot().queuedUserActions![0];
+			const internals = harness.session as unknown as {
+				_acquireSessionActionCommitFence(): Promise<{ release(): void }>;
+				_actionStore: { selectFirst(): SessionAction | undefined };
+			};
+			const fence = await internals._acquireSessionActionCommitFence();
+			try {
+				const action = internals._actionStore.selectFirst();
+				expect(action?.id).toBe(target.id);
+				if (prepare && action) transitionSessionAction(action, { state: "preparing" });
+			} finally {
+				fence.release();
+			}
+			expect(await harness.session.withdrawQueuedUserActions([target.id])).toEqual([]);
+			harness.session.clearQueue();
+			withStreaming(harness, false);
+		}
+	});
+
+	it("lets queued-only withdrawal win without stranding remaining FIFO work", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("initial done"),
+			fauxAssistantMessage("remaining delivered"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("same", { streamingBehavior: "followUp" });
+		await harness.session.prompt("same", { streamingBehavior: "followUp" });
+		const queued = harness.session.getSessionActionSnapshot().queuedUserActions!;
+		expect(await harness.session.withdrawQueuedUserActions([queued[0].id])).toEqual([queued[0]]);
+		expect(harness.session.getSessionActionSnapshot().queuedUserActions).toEqual([queued[1]]);
+		releaseToolExecution();
+		await promptPromise;
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["start", "same"]);
+	});
+
+	it("makes matched stop retryable without aborting a replacement owner", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const internals = harness.session as unknown as { _activeRunInstanceId?: string; abort(): Promise<void> };
-		internals._activeRunInstanceId = "run-a";
-		internals.abort = async () => {};
-		const run = harness.session.getSessionActionSnapshot().activeRunInstanceId;
-		expect(run).toBe("run-a");
-		expect(await harness.session.stopActiveRun(run!)).toEqual({ status: "stopped" });
-		expect(await harness.session.stopActiveRun(run!)).toEqual({ status: "already_stopped" });
-		expect(await harness.session.stopActiveRun("not-the-run")).toEqual({ status: "stale" });
+		let interrupted = 0;
+		const registry = (
+			harness.session as unknown as {
+				_ownedOperations: {
+					admitRoot(kind: "agent_run", hooks: { interrupt(): void; settled: Promise<void> }): unknown;
+				};
+			}
+		)._ownedOperations;
+		registry.admitRoot("agent_run", {
+			interrupt() {
+				interrupted++;
+			},
+			settled: Promise.resolve(),
+		});
+		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(token).toBeDefined();
+		expect(await harness.session.stopActiveOperations(token!)).toEqual({ status: "stopped", kernelRestarted: false });
+
+		registry.admitRoot("agent_run", {
+			interrupt() {
+				interrupted++;
+			},
+			settled: Promise.resolve(),
+		});
+		expect(await harness.session.stopActiveOperations(token!)).toEqual({
+			status: "already_stopped",
+			kernelRestarted: false,
+		});
+		expect(interrupted).toBe(1);
+		expect(await harness.session.stopActiveOperations("not-the-run")).toEqual({ status: "stale" });
 	});
 });

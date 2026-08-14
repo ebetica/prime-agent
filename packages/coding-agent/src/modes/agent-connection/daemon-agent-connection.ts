@@ -574,8 +574,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async withdrawQueuedActions(ids: readonly string[]): Promise<readonly AgentConnectionQueuedUserAction[]> {
-		if (!this.client.supportsServerCapability("atomic_queue_withdrawal")) {
-			throw new DaemonCapabilityUnavailableError("withdraw_queued_actions", "atomic_queue_withdrawal");
+		if (!this.client.supportsServerCapability("queued_withdrawal_v2")) {
+			throw new DaemonCapabilityUnavailableError("withdraw_queued_actions", "queued_withdrawal_v2");
 		}
 		const data = await this.requestData<{ withdrawn: AgentConnectionQueuedUserAction[] }>({
 			type: "withdraw_queued_actions",
@@ -585,14 +585,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.withdrawn;
 	}
 
-	async stopActiveRun(expectedRunInstanceId: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
-		if (!this.client.supportsServerCapability("atomic_stop")) {
-			throw new DaemonCapabilityUnavailableError("stop_active_run", "atomic_stop");
+	async stopActiveOperations(
+		operationSetToken: string,
+	): Promise<{ status: "stopped" | "already_stopped" | "stale"; kernelRestarted?: boolean }> {
+		if (!this.client.supportsServerCapability("atomic_stop_v2")) {
+			throw new DaemonCapabilityUnavailableError("stop_active_operations", "atomic_stop_v2");
 		}
 		return this.requestData({
-			type: "stop_active_run",
+			type: "stop_active_operations",
 			activeSessionId: this.activeSessionId,
-			expectedRunInstanceId,
+			operationSetToken,
 		});
 	}
 	async clearQueue(): Promise<AgentConnectionQueueState> {
