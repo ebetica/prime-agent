@@ -142,7 +142,10 @@ export async function terminateActiveOrphanProcesses(
 			} catch {
 				try {
 					process.kill(pid, "SIGKILL");
-				} catch {}
+				} catch {
+					// The identity-aware polling below decides whether cleanup succeeded;
+					// signaling is best-effort so an already-exited PID is not an error.
+				}
 			}
 		});
 	for (const orphan of active) signal(orphan.pid);
