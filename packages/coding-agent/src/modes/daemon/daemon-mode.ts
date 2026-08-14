@@ -4275,6 +4275,11 @@ export class AgentDaemon {
 				return success(command.id, "get_queued_user_actions", state.runtime.session.getQueuedUserActions());
 			}
 
+			case "get_queued_action_envelopes": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_queued_action_envelopes", state.runtime.session.getQueuedActionEnvelopes());
+			}
+
 			case "cancel_queued_action": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(

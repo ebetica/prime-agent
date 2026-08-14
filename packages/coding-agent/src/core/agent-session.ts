@@ -55,6 +55,7 @@ import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
+	AGENT_MESSAGE_SOURCE,
 	type AgentFamilyCatalogEntry,
 	type AgentFamilyRosterResult,
 	type AgentSessionMessage,
@@ -246,6 +247,7 @@ import {
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
+	type QueuedActionEnvelope,
 	type QueuedMessageLane,
 	type QueuedMessageMutation,
 	type QueuedMessageMutationStatus,
@@ -6411,6 +6413,39 @@ export class AgentSession {
 				text: queuedAgentMessagePreview(action),
 				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
 			}));
+	}
+
+	getQueuedActionEnvelopes(): readonly QueuedActionEnvelope[] {
+		return visibleSessionActionProjection(this._actionStore.queuedActions())
+			.filter((action): action is SessionAction<PreparedTurnPayload> => action.payload.kind === "turn")
+			.map((action) => {
+				const customMessage = action.payload.customMessage;
+				const agentMessage = customMessage && isAgentSessionMessage(customMessage) ? customMessage : undefined;
+				const primary = primaryDeliveryRecord(action).message;
+				return {
+					id: action.id,
+					state: "queued",
+					lane: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+					content: agentMessage?.details.message ?? action.payload.text,
+					origin: agentMessage
+						? {
+								kind: "agent",
+								source: AGENT_MESSAGE_SOURCE,
+								messageId: agentMessage.details.id,
+								...(agentMessage.details.from ? { sender: { ...agentMessage.details.from } } : {}),
+								...(agentMessage.details.fromRelationship
+									? { senderRelationship: agentMessage.details.fromRelationship }
+									: {}),
+							}
+						: primary.role === "user"
+							? { kind: "operator", source: action.source }
+							: {
+									kind: "system",
+									source: action.source,
+									...(customMessage ? { customType: customMessage.customType } : {}),
+								},
+				};
+			});
 	}
 
 	cancelQueuedAction(id: string): boolean {

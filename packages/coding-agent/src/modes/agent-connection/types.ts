@@ -20,6 +20,7 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { RlmMaxDepthStatus, SetRlmMaxDepthResult } from "../../core/rlm-max-depth.js";
 import type {
+	QueuedActionEnvelope,
 	QueuedMessageLane,
 	QueuedMessageMutation,
 	QueuedMessageMutationStatus,
@@ -543,6 +544,8 @@ export interface AgentConnectionQueuedUserAction {
 	delivery: "steering" | "followUp";
 }
 
+export type AgentConnectionQueuedActionEnvelope = QueuedActionEnvelope;
+
 export interface AgentConnectionHeartbeat {
 	job: AgentCronJob;
 	sessionName?: string;
@@ -680,6 +683,7 @@ export interface AgentConnection {
 		mutation: AgentConnectionQueuedMessageMutation,
 	): Promise<AgentConnectionQueuedMessageMutationStatus>;
 	getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]>;
+	getQueuedActionEnvelopes(): Promise<readonly AgentConnectionQueuedActionEnvelope[]>;
 	cancelQueuedAction(id: string): Promise<boolean>;
 
 	clearQueue(): Promise<AgentConnectionQueueState>;

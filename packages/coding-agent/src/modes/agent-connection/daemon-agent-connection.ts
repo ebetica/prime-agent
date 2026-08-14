@@ -59,6 +59,7 @@ import type {
 	AgentConnectionNavigateTreeResult,
 	AgentConnectionNewSessionOptions,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueuedActionEnvelope,
 	AgentConnectionQueuedMessageLane,
 	AgentConnectionQueuedMessageMutation,
 	AgentConnectionQueuedMessageMutationStatus,
@@ -558,6 +559,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		return this.requestData<AgentConnectionQueuedUserAction[]>({
 			type: "get_queued_user_actions",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async getQueuedActionEnvelopes(): Promise<readonly AgentConnectionQueuedActionEnvelope[]> {
+		if (!this.client.supportsServerCapability("queued_action_envelopes")) {
+			throw new DaemonCapabilityUnavailableError("get_queued_action_envelopes", "queued_action_envelopes");
+		}
+		return this.requestData<AgentConnectionQueuedActionEnvelope[]>({
+			type: "get_queued_action_envelopes",
 			activeSessionId: this.activeSessionId,
 		});
 	}

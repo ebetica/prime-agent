@@ -66,8 +66,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 adds authenticated, durable planned-restart handoffs.
 // Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 22 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-eb48ac5a9731";
+// Revision 23 adds authoritative queued action envelopes with structured origin.
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-451a0b4c036c";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -110,6 +111,7 @@ export type DaemonServerCapability =
 	| "atomic_reload"
 	| "atomic_resource_reload"
 	| "queued_action_cancellation"
+	| "queued_action_envelopes"
 	| "planned_restart_handoff"
 	| "planned_restart_handoff_lifecycle";
 
@@ -158,6 +160,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"atomic_reload",
 	"atomic_resource_reload",
 	"queued_action_cancellation",
+	"queued_action_envelopes",
 	"planned_restart_handoff",
 	"planned_restart_handoff_lifecycle",
 ];
@@ -640,6 +643,7 @@ export type DaemonCommand =
 			mutation: QueuedMessageMutation;
 	  }
 	| { id?: string; type: "get_queued_user_actions"; activeSessionId: string }
+	| { id?: string; type: "get_queued_action_envelopes"; activeSessionId: string }
 	| { id?: string; type: "cancel_queued_action"; activeSessionId: string; actionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
@@ -808,6 +812,11 @@ const QUEUED_ACTION_CANCELLATION_COMMAND = {
 	minSchemaRevision: 15,
 	capability: "queued_action_cancellation",
 } as const;
+const QUEUED_ACTION_ENVELOPES_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 23,
+	capability: "queued_action_envelopes",
+} as const;
 const PLANNED_RESTART_HANDOFF_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 17,
@@ -870,6 +879,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_queue: LEGACY_DAEMON_COMMAND,
 	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
 	get_queued_user_actions: QUEUED_ACTION_CANCELLATION_COMMAND,
+	get_queued_action_envelopes: QUEUED_ACTION_ENVELOPES_COMMAND,
 	cancel_queued_action: QUEUED_ACTION_CANCELLATION_COMMAND,
 
 	clear_queue: LEGACY_DAEMON_COMMAND,
@@ -1237,6 +1247,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_available_models",
 	"get_queue",
 	"get_queued_user_actions",
+	"get_queued_action_envelopes",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",

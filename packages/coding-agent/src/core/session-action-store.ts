@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, UserMessage } from "@earendil-works/pi-ai";
+import type { AgentFamilyRelationship, AgentSessionMessageSender } from "./agent-messages.js";
 import type { InputSource } from "./extensions/index.js";
 import type { CustomMessage } from "./messages.js";
 import type { SessionSlashCommand } from "./slash-commands.js";
@@ -8,6 +9,26 @@ export type DeliveryPolicy = "next_turn_boundary" | "when_run_idle";
 export type WakePolicy = "immediate" | "on_lower_boundary" | "external_resume";
 
 export type QueuedMessageLane = "steering" | "followUp";
+
+export type QueuedActionOrigin =
+	| { kind: "operator"; source: InputSource | "internal" }
+	| { kind: "system"; source: InputSource | "internal"; customType?: string }
+	| {
+			kind: "agent";
+			source: "agent_message";
+			messageId: string;
+			sender?: AgentSessionMessageSender;
+			senderRelationship?: AgentFamilyRelationship;
+	  };
+
+/** Authoritative queued turn projection in delivery order. */
+export interface QueuedActionEnvelope {
+	id: string;
+	state: "queued";
+	lane: QueuedMessageLane;
+	content: string;
+	origin: QueuedActionOrigin;
+}
 
 export function queuedMessageLaneDeliveryPolicy(lane: QueuedMessageLane): DeliveryPolicy {
 	return lane === "steering" ? "next_turn_boundary" : "when_run_idle";

@@ -138,6 +138,21 @@ class FakeDaemonClient {
 					success: true,
 					data: [{ id: "action-1", text: "follow", delivery: "followUp" }],
 				};
+			case "get_queued_action_envelopes":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: [
+						{
+							id: "action-1",
+							state: "queued",
+							lane: "followUp",
+							content: "follow",
+							origin: { kind: "operator", source: "rpc" },
+						},
+					],
+				};
 			case "cancel_queued_action":
 				return { type: "response", command: command.type, success: true, data: command.actionId === "action-1" };
 			case "get_connection_state":
@@ -2277,6 +2292,7 @@ describe("DaemonAgentConnection", () => {
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 
 		await expect(connection.getQueuedUserActions()).rejects.toThrow("queued_action_cancellation");
+		await expect(connection.getQueuedActionEnvelopes()).rejects.toThrow("queued_action_envelopes");
 		await expect(connection.cancelQueuedAction("action-1")).rejects.toThrow("queued_action_cancellation");
 		expect(fakeClient.requests).toEqual([]);
 	});
@@ -2284,12 +2300,22 @@ describe("DaemonAgentConnection", () => {
 	it("sends queue commands through the daemon protocol", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("queued_action_cancellation");
+		fakeClient.serverCapabilities.add("queued_action_envelopes");
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		await connection.attach();
 
 		await expect(connection.getQueue()).resolves.toEqual({ steering: ["steer"], followUp: ["follow"] });
 		await expect(connection.getQueuedUserActions()).resolves.toEqual([
 			{ id: "action-1", text: "follow", delivery: "followUp" },
+		]);
+		await expect(connection.getQueuedActionEnvelopes()).resolves.toEqual([
+			{
+				id: "action-1",
+				state: "queued",
+				lane: "followUp",
+				content: "follow",
+				origin: { kind: "operator", source: "rpc" },
+			},
 		]);
 		await expect(connection.cancelQueuedAction("action-1")).resolves.toBe(true);
 		await expect(connection.clearQueue()).resolves.toEqual({ steering: ["cleared"], followUp: [] });
@@ -2305,6 +2331,7 @@ describe("DaemonAgentConnection", () => {
 			"attach",
 			"get_queue",
 			"get_queued_user_actions",
+			"get_queued_action_envelopes",
 			"cancel_queued_action",
 			"clear_queue",
 			"abort_and_clear_queue",
@@ -2314,14 +2341,18 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests[1]).toMatchObject({ type: "get_queue", activeSessionId: "active-1" });
 		expect(fakeClient.requests[2]).toMatchObject({ type: "get_queued_user_actions", activeSessionId: "active-1" });
 		expect(fakeClient.requests[3]).toMatchObject({
+			type: "get_queued_action_envelopes",
+			activeSessionId: "active-1",
+		});
+		expect(fakeClient.requests[4]).toMatchObject({
 			type: "cancel_queued_action",
 			activeSessionId: "active-1",
 			actionId: "action-1",
 		});
-		expect(fakeClient.requests[4]).toMatchObject({ type: "clear_queue", activeSessionId: "active-1" });
-		expect(fakeClient.requests[5]).toMatchObject({ type: "abort_and_clear_queue", activeSessionId: "active-1" });
-		expect(fakeClient.requests[6]).toMatchObject({ type: "wait_for_idle", activeSessionId: "active-1" });
-		expect(fakeClient.requests[7]).toMatchObject({
+		expect(fakeClient.requests[5]).toMatchObject({ type: "clear_queue", activeSessionId: "active-1" });
+		expect(fakeClient.requests[6]).toMatchObject({ type: "abort_and_clear_queue", activeSessionId: "active-1" });
+		expect(fakeClient.requests[7]).toMatchObject({ type: "wait_for_idle", activeSessionId: "active-1" });
+		expect(fakeClient.requests[8]).toMatchObject({
 			type: "set_scoped_models",
 			activeSessionId: "active-1",
 			scopedModels: [{ model, thinkingLevel: "high" }],

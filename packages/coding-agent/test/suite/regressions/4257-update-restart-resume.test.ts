@@ -1114,6 +1114,12 @@ describe("issue #4257 update restart resume", () => {
 		expect(target.session.getSessionActionRecoverySnapshot()).toEqual(snapshot);
 		expect(target.session.getSteeringMessages()).toEqual(["steering one", "steering two"]);
 		expect(target.session.getFollowUpMessages()).toEqual(["follow-up one"]);
+		expect(target.session.getQueuedActionEnvelopes()).toEqual(source.session.getQueuedActionEnvelopes());
+		expect(target.session.getQueuedActionEnvelopes().map((item) => [item.lane, item.content])).toEqual([
+			["steering", "steering one"],
+			["steering", "steering two"],
+			["followUp", "follow-up one"],
+		]);
 		await expect(
 			target.session.restoreSessionActions({
 				formatVersion: 2,

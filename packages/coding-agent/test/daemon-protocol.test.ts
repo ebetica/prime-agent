@@ -217,6 +217,15 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_queue).toEqual({ minProtocol: 7 });
 	});
 
+	it("capability-gates authoritative queued action envelopes", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_queued_action_envelopes).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 23,
+			capability: "queued_action_envelopes",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queued_action_envelopes");
+	});
+
 	it("keeps refine failure events backward-compatible on the existing session event channel", () => {
 		const event: DaemonOutbound = {
 			type: "session_event",
