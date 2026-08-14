@@ -402,8 +402,15 @@ function rlmChildSnapshotForActiveSession(
 		: undefined;
 	const durableTerminal = session._persistedRlmTerminalStatus;
 	const status =
-		runStatus ?? (durableTerminal === "completed" ? "done" : durableTerminal === "interrupted" ? "error" : "running");
-	const isActive = status === "running";
+		runStatus ??
+		(durableTerminal === "completed"
+			? "done"
+			: durableTerminal === "interrupted"
+				? "error"
+				: session.isSessionActive
+					? "running"
+					: "done");
+	const hasLiveActivity = status === "running" || session.isSessionActive;
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -417,7 +424,7 @@ function rlmChildSnapshotForActiveSession(
 		tokenCount: session._contextTokensForCurrentMessages(),
 		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
-		activity: isActive ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
+		activity: hasLiveActivity ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
 	};
 }
 
