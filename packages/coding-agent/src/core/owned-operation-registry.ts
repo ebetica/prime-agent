@@ -52,6 +52,7 @@ interface RootRecord {
 	ownerId: string;
 	operations: Map<string, OperationRecord>;
 	version: number;
+	admissionClosed: boolean;
 	snapshot?: { version: number; value: OwnedOperationSet };
 	stopping?: Promise<StopOwnedOperationResult>;
 }
@@ -99,13 +100,14 @@ export class OwnedOperationRegistry {
 			ownerId,
 			operations: new Map([[ownerId, { ...operation, ownerId, hooks }]]),
 			version: 1,
+			admissionClosed: false,
 		};
 		return operation;
 	}
 
 	admitChild(ownerId: string, kind: OwnedOperationKind, hooks: OwnedOperationHooks): OwnedOperationDescriptor {
 		const root = this.root;
-		if (!root || root.ownerId !== ownerId || root.stopping) {
+		if (!root || root.ownerId !== ownerId || root.admissionClosed || root.stopping) {
 			throw new Error("Owned operation admission is closed");
 		}
 		const operation = Object.freeze({ id: randomUUID(), kind });
@@ -119,7 +121,8 @@ export class OwnedOperationRegistry {
 		const root = this.root;
 		if (!root || root.stopping) return;
 		if (!root.operations.delete(operationId)) return;
-		if (operationId === root.ownerId || root.operations.size === 0) {
+		if (operationId === root.ownerId) root.admissionClosed = true;
+		if (root.operations.size === 0) {
 			this.root = undefined;
 			return;
 		}
@@ -153,6 +156,7 @@ export class OwnedOperationRegistry {
 		if (!root || !active || active.token !== token) return { status: "stale" };
 		if (root.stopping) return root.stopping;
 
+		root.admissionClosed = true;
 		const records = [...root.operations.values()];
 		const operationIds = Object.freeze(records.map((record) => record.id));
 		const kernelRestarted = records.some((record) => record.kind === "kernel_cell");

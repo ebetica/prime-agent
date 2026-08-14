@@ -31,6 +31,19 @@ describe("OwnedOperationRegistry", () => {
 		);
 	});
 
+	it("keeps explicit children owned after the root settles and closes late admission", () => {
+		const registry = new OwnedOperationRegistry();
+		const root = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });
+		const child = registry.admitChild(root.id, "kernel_cell", { interrupt() {}, settled: Promise.resolve() });
+		registry.complete(root.id);
+		expect(registry.activeSet()?.operations).toEqual([{ id: child.id, kind: "kernel_cell" }]);
+		expect(() => registry.admitChild(root.id, "subprocess", { interrupt() {}, settled: Promise.resolve() })).toThrow(
+			"admission is closed",
+		);
+		registry.complete(child.id);
+		expect(registry.activeSet()).toBeUndefined();
+	});
+
 	it("closes admission and returns stopped only after durable intent, settlement, cleanup, and terminal receipt", async () => {
 		const task = deferred();
 		const cleanup = deferred();
