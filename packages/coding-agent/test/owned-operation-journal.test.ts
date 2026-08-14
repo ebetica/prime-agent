@@ -26,12 +26,23 @@ describe("OwnedOperationJournal", () => {
 
 		const reopened = await OwnedOperationJournal.open(path);
 		expect(reopened.pending?.token).toBe("token-a");
-		let cleanupFinished = false;
-		await reopened.recoverPending(async (record) => {
-			expect(record.operationIds).toEqual(["root", "child"]);
-			cleanupFinished = true;
+		let releaseCleanup!: () => void;
+		const cleanupGate = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
 		});
-		expect(cleanupFinished).toBe(true);
+		let cleanupRuns = 0;
+		const cleanup = async (record: { operationIds: readonly string[] }) => {
+			cleanupRuns++;
+			expect(record.operationIds).toEqual(["root", "child"]);
+			await cleanupGate;
+		};
+		const recovery = reopened.recoverPending(cleanup);
+		const concurrentRecovery = reopened.recoverPending(cleanup);
+		expect(concurrentRecovery).toBe(recovery);
+		releaseCleanup();
+		expect(await recovery).toBe(true);
+		expect(await concurrentRecovery).toBe(true);
+		expect(cleanupRuns).toBe(1);
 		expect(reopened.pending).toBeUndefined();
 		expect(reopened.terminalReceipts).toMatchObject([{ token: "token-a", status: "stopped", kernelRestarted: true }]);
 
@@ -64,6 +75,15 @@ describe("OwnedOperationJournal", () => {
 			operationIds: ["a"],
 			kernelRestarted: false,
 		});
+		await expect(
+			journal.writeStopped({
+				token: "pending-a",
+				ownerId: "different-owner",
+				operationIds: ["a"],
+				kernelRestarted: false,
+			}),
+		).rejects.toThrow("immutable durable intent");
+		expect(journal.pending?.ownerId).toBe("owner-a");
 		await expect(
 			journal.writeStopIntent({
 				token: "pending-b",

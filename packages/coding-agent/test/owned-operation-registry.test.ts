@@ -87,6 +87,35 @@ describe("OwnedOperationRegistry", () => {
 		expect(registry.activeSet()).toBeUndefined();
 	});
 
+	it("attempts every interrupt and cleanup before fencing a failed stop", async () => {
+		const calls: string[] = [];
+		const registry = new OwnedOperationRegistry();
+		const root = registry.admitRoot("agent_run", {
+			interrupt() {
+				calls.push("root interrupt");
+				throw new Error("root interrupt failed");
+			},
+			settled: Promise.resolve(),
+			cleanup() {
+				calls.push("root cleanup");
+			},
+		});
+		registry.admitChild(root.id, "subprocess", {
+			interrupt() {
+				calls.push("child interrupt");
+			},
+			settled: Promise.reject(new Error("child settlement failed")),
+			cleanup() {
+				calls.push("child cleanup");
+			},
+		});
+		const token = registry.activeSet()!.token;
+		await expect(registry.stop(token)).rejects.toThrow("did not settle safely");
+		expect(calls).toEqual(["root interrupt", "child interrupt", "root cleanup", "child cleanup"]);
+		expect(registry.isStopping).toBe(true);
+		expect(registry.activeSet()?.token).toBe(token);
+	});
+
 	it("never lets a frozen stale token stop a changed or replacement owner", async () => {
 		const registry = new OwnedOperationRegistry();
 		const root = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });

@@ -162,9 +162,14 @@ export class OwnedOperationRegistry {
 		const kernelRestarted = records.some((record) => record.kind === "kernel_cell");
 		const completion = (async (): Promise<StopOwnedOperationResult> => {
 			await this.persistence?.writeStopIntent({ token, ownerId: root.ownerId, operationIds, kernelRestarted });
-			await Promise.all(records.map((record) => record.hooks.interrupt()));
-			await Promise.all(records.map((record) => record.hooks.settled));
-			await Promise.all(records.map((record) => record.hooks.cleanup?.()));
+			const failures: unknown[] = [];
+			const collect = (results: PromiseSettledResult<void>[]) => {
+				for (const result of results) if (result.status === "rejected") failures.push(result.reason);
+			};
+			collect(await Promise.allSettled(records.map(async (record) => await record.hooks.interrupt())));
+			collect(await Promise.allSettled(records.map(async (record) => await record.hooks.settled)));
+			collect(await Promise.allSettled(records.map(async (record) => await record.hooks.cleanup?.())));
+			if (failures.length > 0) throw new AggregateError(failures, "Owned operation cleanup did not settle safely");
 			await this.persistence?.writeStopped({ token, ownerId: root.ownerId, operationIds, kernelRestarted });
 			if (this.root === root) this.root = undefined;
 			return { status: "stopped", kernelRestarted };

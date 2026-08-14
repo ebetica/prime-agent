@@ -44,6 +44,16 @@ function validRecord(value: unknown): value is DurableStopRecord {
 	);
 }
 
+function sameIntent(left: DurableStopRecord, right: Omit<DurableStopRecord, "recordedAt">): boolean {
+	return (
+		left.token === right.token &&
+		left.ownerId === right.ownerId &&
+		left.kernelRestarted === right.kernelRestarted &&
+		left.operationIds.length === right.operationIds.length &&
+		left.operationIds.every((id, index) => id === right.operationIds[index])
+	);
+}
+
 async function loadState(path: string): Promise<JournalState> {
 	try {
 		const value = JSON.parse(await readFile(path, "utf8")) as Partial<JournalState>;
@@ -63,20 +73,30 @@ async function loadState(path: string): Promise<JournalState> {
 	}
 }
 
+/** A rename completed but parent-directory durability could not be proved. */
+class AmbiguousDurableCommitError extends Error {
+	constructor(cause: unknown) {
+		super("Operation journal rename completed but directory fsync failed", { cause });
+		this.name = "AmbiguousDurableCommitError";
+	}
+}
+
 /** Atomic replacement with file and parent-directory fsync. */
 async function writeDurable(path: string, state: JournalState): Promise<void> {
 	const directory = dirname(path);
 	await mkdir(directory, { recursive: true, mode: 0o700 });
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	const file = await open(temporary, "wx", 0o600);
+	let renamed = false;
 	try {
-		await file.writeFile(`${JSON.stringify(state)}\n`, "utf8");
-		await file.sync();
-	} finally {
-		await file.close();
-	}
-	try {
+		const file = await open(temporary, "wx", 0o600);
+		try {
+			await file.writeFile(`${JSON.stringify(state)}\n`, "utf8");
+			await file.sync();
+		} finally {
+			await file.close();
+		}
 		await rename(temporary, path);
+		renamed = true;
 		const parent = await open(directory, "r");
 		try {
 			await parent.sync();
@@ -84,7 +104,8 @@ async function writeDurable(path: string, state: JournalState): Promise<void> {
 			await parent.close();
 		}
 	} catch (error) {
-		await rm(temporary, { force: true });
+		if (!renamed) await rm(temporary, { force: true });
+		if (renamed) throw new AmbiguousDurableCommitError(error);
 		throw error;
 	}
 }
@@ -100,6 +121,8 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 	private readonly now: () => number;
 	private state: JournalState;
 	private tail: Promise<void> = Promise.resolve();
+	private writeFenced = false;
+	private recovery?: Promise<boolean>;
 
 	private constructor(path: string, state: JournalState, options: OwnedOperationJournalOptions) {
 		this.path = path;
@@ -139,7 +162,9 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 
 	writeStopped(record: Omit<DurableStopRecord, "recordedAt">): Promise<void> {
 		return this.update((state) => {
-			if (state.pending?.token !== record.token) throw new Error("Stopped receipt has no matching durable intent");
+			if (!state.pending || !sameIntent(state.pending, record)) {
+				throw new Error("Stopped receipt has no matching immutable durable intent");
+			}
 			state.pending = undefined;
 			state.terminal = state.terminal.filter((receipt) => receipt.token !== record.token);
 			state.terminal.push({
@@ -151,17 +176,30 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 		});
 	}
 
-	/** Reconcile a crash-pending intent; cleanup proof must finish before the durable terminal receipt. */
-	async recoverPending(cleanup: (record: DurableStopRecord) => Promise<void>): Promise<boolean> {
-		const record = this.pending;
-		if (!record) return false;
-		await cleanup(record);
-		await this.writeStopped(record);
-		return true;
+	/** Reconcile a crash-pending intent once; concurrent callers share the same cleanup receipt. */
+	recoverPending(cleanup: (record: DurableStopRecord) => Promise<void>): Promise<boolean> {
+		if (this.recovery) return this.recovery;
+		const run = async () => {
+			const record = this.pending;
+			if (!record) return false;
+			await cleanup(record);
+			await this.writeStopped(record);
+			return true;
+		};
+		const recovery = run().finally(() => {
+			if (this.recovery === recovery) this.recovery = undefined;
+		});
+		this.recovery = recovery;
+		return recovery;
 	}
 
 	private update(change: (state: JournalState) => void): Promise<void> {
 		const run = async () => {
+			if (this.writeFenced) {
+				throw new Error(
+					"Operation journal writes are fenced after an ambiguous durable commit; reopen to reconcile",
+				);
+			}
 			const next: JournalState = {
 				version: 1,
 				...(this.state.pending
@@ -176,7 +214,11 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 			try {
 				await writeDurable(this.path, this.state);
 			} catch (error) {
-				this.state = previous;
+				if (error instanceof AmbiguousDurableCommitError) {
+					this.writeFenced = true;
+				} else {
+					this.state = previous;
+				}
 				throw error;
 			}
 		};
