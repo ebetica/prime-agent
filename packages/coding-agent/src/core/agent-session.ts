@@ -248,6 +248,7 @@ import {
 	type DeliveryPolicy,
 	type DeliveryRecord,
 	type QueuedActionEnvelope,
+	type QueuedActionOrigin,
 	type QueuedMessageLane,
 	type QueuedMessageMutation,
 	type QueuedMessageMutationStatus,
@@ -672,6 +673,7 @@ interface PreparedTurnPayload extends SessionTurnPayload {
 	queueVisible: boolean;
 	acceptedAgentMessage: boolean;
 	acceptedBeforeCompletion: boolean;
+	queuedOrigin?: QueuedActionOrigin;
 	captureRunMessages?: Set<AgentMessage>;
 	cancelledDispatchEnded?: boolean;
 }
@@ -735,6 +737,7 @@ export type SessionActionRecoveryPayload =
 			queueVisible: boolean;
 			acceptedAgentMessage: boolean;
 			acceptedBeforeCompletion: boolean;
+			queuedOrigin?: QueuedActionOrigin;
 	  }
 	| {
 			kind: "session_command";
@@ -764,6 +767,22 @@ function cloneCustomMessage(message: CustomMessage): CustomMessage {
 		...message,
 		content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
 	};
+}
+
+function trustedAgentQueuedOrigin(message: AgentSessionMessage): QueuedActionOrigin {
+	return {
+		kind: "agent",
+		source: AGENT_MESSAGE_SOURCE,
+		messageId: message.details.id,
+		...(message.details.from ? { sender: { ...message.details.from } } : {}),
+		...(message.details.fromRelationship ? { senderRelationship: message.details.fromRelationship } : {}),
+	};
+}
+
+function cloneQueuedActionOrigin(origin: QueuedActionOrigin): QueuedActionOrigin {
+	return origin.kind === "agent"
+		? { ...origin, ...(origin.sender ? { sender: { ...origin.sender } } : {}) }
+		: { ...origin };
 }
 
 function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessage {
@@ -4529,15 +4548,20 @@ export class AgentSession {
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
-		await this._prompt(text, {
-			...options,
-			expandPromptTemplates: false,
-			skipInputHandlers: true,
-			skipPrePromptWork: true,
-			returnAfterAccepted: true,
-			agentMessageId: options?.agentMessageId ?? customMessage?.details.id ?? parseAgentSessionMessagePromptId(text),
-			customMessage,
-		});
+		await this._prompt(
+			text,
+			{
+				...options,
+				expandPromptTemplates: false,
+				skipInputHandlers: true,
+				skipPrePromptWork: true,
+				returnAfterAccepted: true,
+				agentMessageId:
+					options?.agentMessageId ?? customMessage?.details.id ?? parseAgentSessionMessagePromptId(text),
+				customMessage,
+			},
+			customMessage ? trustedAgentQueuedOrigin(customMessage) : undefined,
+		);
 		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 	}
 
@@ -4551,6 +4575,7 @@ export class AgentSession {
 			await this._queuePreparedPrompt("steer", text, undefined, {
 				agentMessageId,
 				message: customMessage,
+				...(customMessage ? { queuedOrigin: trustedAgentQueuedOrigin(customMessage) } : {}),
 			});
 			if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 			return true;
@@ -4558,6 +4583,7 @@ export class AgentSession {
 		const queued = await this._queuePreparedPrompt("followUp", text, undefined, {
 			agentMessageId,
 			message: customMessage,
+			...(customMessage ? { queuedOrigin: trustedAgentQueuedOrigin(customMessage) } : {}),
 		});
 		if (queued && customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 		return queued;
@@ -4644,7 +4670,11 @@ export class AgentSession {
 		}
 	}
 
-	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+	private async _prompt(
+		text: string,
+		options?: InternalPromptOptions,
+		trustedQueuedOrigin?: QueuedActionOrigin,
+	): Promise<void> {
 		if (!this.isStreaming) {
 			this._sessionInputPumpSuspended = false;
 			this._assertSessionActionAdmissionAvailable();
@@ -4765,6 +4795,7 @@ export class AgentSession {
 					queueVisible: visibleQueued,
 					acceptedAgentMessage,
 					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
+					queuedOrigin: trustedQueuedOrigin,
 				});
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
@@ -5140,6 +5171,9 @@ export class AgentSession {
 							queueVisible: recovered.payload.queueVisible,
 							acceptedAgentMessage: recovered.payload.acceptedAgentMessage,
 							acceptedBeforeCompletion: recovered.payload.acceptedBeforeCompletion,
+							...(recovered.payload.queuedOrigin
+								? { queuedOrigin: cloneQueuedActionOrigin(recovered.payload.queuedOrigin) }
+								: {}),
 						}
 					: {
 							kind: "session_command",
@@ -5379,6 +5413,7 @@ export class AgentSession {
 			queueVisible?: boolean;
 			acceptedAgentMessage?: boolean;
 			acceptedBeforeCompletion?: boolean;
+			queuedOrigin?: QueuedActionOrigin;
 		},
 	): QueuedSessionAction {
 		const id = options.actionId ?? randomUUID();
@@ -5407,6 +5442,7 @@ export class AgentSession {
 			queueVisible: options.queueVisible ?? true,
 			acceptedAgentMessage: options.acceptedAgentMessage ?? false,
 			acceptedBeforeCompletion: options.acceptedBeforeCompletion ?? false,
+			...(options.queuedOrigin ? { queuedOrigin: cloneQueuedActionOrigin(options.queuedOrigin) } : {}),
 		};
 		return {
 			id,
@@ -5583,6 +5619,7 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			queuedOrigin?: QueuedActionOrigin;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
@@ -6420,23 +6457,19 @@ export class AgentSession {
 			.filter((action): action is SessionAction<PreparedTurnPayload> => action.payload.kind === "turn")
 			.map((action) => {
 				const customMessage = action.payload.customMessage;
-				const agentMessage = customMessage && isAgentSessionMessage(customMessage) ? customMessage : undefined;
+				const trustedOrigin = action.payload.queuedOrigin;
+				const trustedAgentMessage =
+					trustedOrigin?.kind === "agent" && customMessage && isAgentSessionMessage(customMessage)
+						? customMessage
+						: undefined;
 				const primary = primaryDeliveryRecord(action).message;
 				return {
 					id: action.id,
 					state: "queued",
 					lane: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
-					content: agentMessage?.details.message ?? action.payload.text,
-					origin: agentMessage
-						? {
-								kind: "agent",
-								source: AGENT_MESSAGE_SOURCE,
-								messageId: agentMessage.details.id,
-								...(agentMessage.details.from ? { sender: { ...agentMessage.details.from } } : {}),
-								...(agentMessage.details.fromRelationship
-									? { senderRelationship: agentMessage.details.fromRelationship }
-									: {}),
-							}
+					content: trustedAgentMessage?.details.message ?? action.payload.text,
+					origin: trustedOrigin
+						? cloneQueuedActionOrigin(trustedOrigin)
 						: primary.role === "user"
 							? { kind: "operator", source: action.source }
 							: {
@@ -6591,6 +6624,9 @@ export class AgentSession {
 								queueVisible: action.payload.queueVisible,
 								acceptedAgentMessage: action.payload.acceptedAgentMessage,
 								acceptedBeforeCompletion: action.payload.acceptedBeforeCompletion,
+								...(action.payload.queuedOrigin
+									? { queuedOrigin: cloneQueuedActionOrigin(action.payload.queuedOrigin) }
+									: {}),
 							}
 						: {
 								kind: "session_command",

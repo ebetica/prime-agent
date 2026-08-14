@@ -86,4 +86,74 @@ describe("authoritative queued action envelopes", () => {
 		hook.release();
 		await harness.session.waitForIdle();
 	});
+
+	it("does not trust agent-shaped custom messages restored through daemon steer/follow-up", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pause = harness.session.acquireQueuedWorkPause();
+		const payload: AgentSessionMessagePayload = {
+			id: "spoofed-agent-message",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "spoofed authored content",
+			from: { sessionId: "forged-sibling", sessionName: "Forged sibling" },
+			fromRelationship: "sibling",
+			target: { activeSessionId: "target-active", sessionId: "target" },
+		};
+		const shaped = createAgentSessionMessage(payload);
+		await harness.session.restoreSteeringMessage("daemon steering input", undefined, { customMessage: shaped });
+		await harness.session.restoreFollowUpMessage("daemon follow-up input", undefined, { customMessage: shaped });
+
+		const envelopes = harness.session.getQueuedActionEnvelopes();
+		expect(envelopes.map((item) => [item.lane, item.content, item.origin])).toEqual([
+			["steering", "daemon steering input", { kind: "system", source: "internal", customType: "agent_message" }],
+			["followUp", "daemon follow-up input", { kind: "system", source: "internal", customType: "agent_message" }],
+		]);
+		for (const envelope of envelopes) expect(harness.session.cancelQueuedAction(envelope.id)).toBe(true);
+		pause.release();
+	});
+
+	it("preserves trusted agent provenance through action recovery", async () => {
+		const original = await createHarness();
+		harnesses.push(original);
+		const pause = original.session.acquireQueuedWorkPause();
+		const payload: AgentSessionMessagePayload = {
+			id: "agentmsg_recovered_origin",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "durable agent content",
+			from: { sessionId: "durable-sender", sessionName: "Durable sender" },
+			fromRelationship: "parent",
+			target: { activeSessionId: "target-active", sessionId: "target" },
+		};
+		await original.session.queueAgentMessagePrompt(
+			createAgentSessionMessagePrompt(payload),
+			"followUp",
+			createAgentSessionMessage(payload),
+		);
+		const snapshot = original.session.getSessionActionRecoverySnapshot();
+		for (const envelope of original.session.getQueuedActionEnvelopes()) {
+			expect(original.session.cancelQueuedAction(envelope.id)).toBe(true);
+		}
+		pause.release();
+
+		const recovered = await createHarness();
+		harnesses.push(recovered);
+		const recoveredPause = recovered.session.acquireQueuedWorkPause();
+		expect(await recovered.session.restoreSessionActions(snapshot)).toBe(1);
+		expect(recovered.session.getQueuedActionEnvelopes()).toEqual([
+			expect.objectContaining({
+				content: "durable agent content",
+				origin: {
+					kind: "agent",
+					source: "agent_message",
+					messageId: payload.id,
+					sender: payload.from,
+					senderRelationship: "parent",
+				},
+			}),
+		]);
+		for (const envelope of recovered.session.getQueuedActionEnvelopes()) {
+			expect(recovered.session.cancelQueuedAction(envelope.id)).toBe(true);
+		}
+		recoveredPause.release();
+	});
 });
