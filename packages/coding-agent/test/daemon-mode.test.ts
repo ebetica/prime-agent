@@ -5703,6 +5703,73 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("appends root recovery tool results through the live runtime manager", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-live-root-recovery-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const persistedRoot = SessionManager.open(fixture.parentSessionFile);
+			persistedRoot.appendMessage({
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "interrupted-tool", name: "bash", arguments: { command: "touch side-effect" } },
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "fixture-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			});
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				applyWorkerRecovery(
+					command: Extract<DaemonCommand, { type: "create" }>,
+					root: ActiveSessionState,
+				): Promise<void>;
+			};
+			const root = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			root.runtime.session.admitWorkerRecoveryContinuation = vi.fn();
+			root.runtime.session.resumeQueuedWork = vi.fn();
+
+			await internals.applyWorkerRecovery(
+				{
+					type: "create",
+					workerRecovery: {
+						version: 1,
+						generation: "a".repeat(64),
+						interrupted: [
+							{
+								activeSessionId: root.activeSessionId,
+								sessionFile: fixture.parentSessionFile,
+								operations: ["tool_execution"],
+								terminatedBackgroundProcesses: 0,
+							},
+						],
+					},
+				},
+				root,
+			);
+
+			const liveMessages = root.runtime.session.sessionManager.buildSessionContext().messages;
+			const interruptedResults = liveMessages.filter(
+				(message) => message.role === "toolResult" && message.toolCallId === "interrupted-tool",
+			);
+			expect(interruptedResults).toHaveLength(1);
+			expect(interruptedResults[0]).toMatchObject({ isError: true });
+			expect(root.runtime.session.admitWorkerRecoveryContinuation).toHaveBeenCalledOnce();
+			expect(root.runtime.session.resumeQueuedWork).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects malformed worker recovery facts before mutating transcripts", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-malformed-worker-recovery-"));
 		try {

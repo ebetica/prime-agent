@@ -67,12 +67,17 @@ const RLM_CHILD_INTERRUPTED_CUSTOM_TYPE = "prime-agent.rlm_child_interrupted";
  * The registry transition is the durable truth; the parent notice is deduplicated
  * from its own transcript so retries after either append remain idempotent.
  */
-export async function reconcileInterruptedRlmChild(sessionPath: string): Promise<boolean> {
+export async function reconcileInterruptedRlmChild(sessionPath: string, liveParent?: SessionManager): Promise<boolean> {
 	const child = SessionManager.open(sessionPath);
 	const header = child.getHeader();
 	if (!header?.parentSession) return false;
 	const parentPath = resolve(dirname(sessionPath), header.parentSession);
-	const parentSessionId = SessionManager.open(parentPath).getSessionId();
+	const liveParentPath = liveParent?.getSessionFile();
+	const parent =
+		liveParent && liveParentPath && resolve(liveParentPath) === parentPath
+			? liveParent
+			: SessionManager.open(parentPath);
+	const parentSessionId = parent.getSessionId();
 	const registryPath = join(dirname(dirname(parentPath)), "session-artifacts", parentSessionId, "rlm-subagents.jsonl");
 	return await mutateRlmSubagentRegistry(registryPath, (latest) => {
 		const entry = [...latest.values()].find(
@@ -89,7 +94,6 @@ export async function reconcileInterruptedRlmChild(sessionPath: string): Promise
 			result: transitioned,
 			...(transitioned ? { entry: reconciledEntry } : {}),
 			afterWrite: () => {
-				const parent = SessionManager.open(parentPath);
 				const alreadyNotified = parent
 					.getEntries()
 					.some(

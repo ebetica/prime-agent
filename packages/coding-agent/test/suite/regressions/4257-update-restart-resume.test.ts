@@ -6,13 +6,19 @@ import { getDaemonUpdateRestartManifestPath } from "../../../src/config.js";
 import type { SessionActionRecoverySnapshot } from "../../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
-import { type CustomMessage, createSessionSlashCommandMessage } from "../../../src/core/messages.js";
+import {
+	type CustomMessage,
+	createSessionSlashCommandMessage,
+	type WorkerRecoveryDetails,
+} from "../../../src/core/messages.js";
+import { SessionManager } from "../../../src/core/session-manager.js";
 import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
 import {
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+	type DaemonCommand,
 	type DaemonUpdateRestartManifest,
 } from "../../../src/modes/daemon/daemon-protocol.js";
 import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
@@ -25,6 +31,7 @@ type AgentDaemonUpdateInternals = {
 	cronStore: AgentCronJobStore;
 	cronScheduler: AgentCronScheduler;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
+	applyWorkerRecovery(command: Extract<DaemonCommand, { type: "create" }>, root: ActiveSessionState): Promise<void>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
 	beginUpdateRestartTransaction(
 		owner?: DaemonSocketClient,
@@ -225,6 +232,104 @@ describe("issue #4257 update restart resume", () => {
 		expect(() => harness.session.admitPlannedRestartContinuation("restart-action-1", "different nonce")).toThrow(
 			/conflicts with its completed message/,
 		);
+	});
+
+	it("admits one trusted worker recovery continuation without replaying the interrupted input", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("continued safely")]);
+		const details: WorkerRecoveryDetails = {
+			generation: "a".repeat(64),
+			actionId: `worker-recovery:${"a".repeat(64)}`,
+			source: "internal",
+			activities: ["tool execution"],
+			terminatedBackgroundProcesses: 1,
+		};
+		expect(harness.session.admitWorkerRecoveryContinuation(details)).toBe("admitted");
+		expect(harness.session.admitWorkerRecoveryContinuation(details)).toBe("already_admitted");
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+		const recovery = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === "prime-agent.worker_recovery",
+		);
+		expect(recovery).toHaveLength(1);
+		expect(recovery[0]).toMatchObject({
+			display: true,
+			details,
+		});
+		expect(JSON.stringify(recovery[0])).not.toMatch(/pid|path|command text/i);
+	});
+
+	it("wakes the root once when only an owned child was interrupted", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("handled interrupted child")]);
+		const rootFile = harness.session.sessionFile;
+		if (!rootFile) throw new Error("expected persisted root session");
+		const child = SessionManager.create(harness.tempDir, `${harness.tempDir}/child-sessions`);
+		child.newSession({ parentSession: rootFile });
+		child.appendMessage({ role: "user", content: "child work", timestamp: Date.now() });
+		child.appendSessionState({ status: "active" });
+		const childFile = child.getSessionFile();
+		if (!childFile) throw new Error("expected persisted child session");
+		expect(SessionManager.open(childFile).getHeader()?.parentSession).toBe(rootFile);
+		const state = createState(harness, "root-active", { kind: "top-level", createdAt: Date.now() });
+		const internals = createDaemonInternals(harness);
+		await internals.applyWorkerRecovery(
+			{
+				type: "create",
+				workerRecovery: {
+					version: 1,
+					generation: "c".repeat(64),
+					interrupted: [
+						{
+							activeSessionId: "child-active",
+							sessionFile: childFile,
+							operations: ["tool_execution"],
+							terminatedBackgroundProcesses: 0,
+						},
+					],
+				},
+			},
+			state,
+		);
+		await harness.session.waitForIdle();
+		const recovery = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === "prime-agent.worker_recovery",
+		);
+		expect(recovery).toHaveLength(1);
+		expect(getMessageText(recovery[0]!)).toContain("child agent");
+	});
+
+	it("recovers a durable worker recovery intent after a successor crash", async () => {
+		const details: WorkerRecoveryDetails = {
+			generation: "b".repeat(64),
+			actionId: `worker-recovery:${"b".repeat(64)}`,
+			source: "internal",
+			activities: ["model response"],
+			terminatedBackgroundProcesses: 0,
+		};
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered worker continuation")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.worker_recovery_intent",
+					"Worker recovery continuation pending",
+					false,
+					details,
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "prime-agent.worker_recovery",
+			),
+		).toHaveLength(1);
 	});
 
 	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {

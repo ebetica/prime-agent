@@ -3132,6 +3132,17 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: string;
 				recoveryJournalPath: string;
 				orphanProcessJournalPath: string;
+				createCommand: { workerRecovery?: RecoveryWorker["pendingRecovery"] };
+			};
+			pendingRecovery?: {
+				version: 1;
+				generation: string;
+				interrupted: Array<{
+					activeSessionId: string;
+					sessionFile: string;
+					operations: string[];
+					terminatedBackgroundProcesses: number;
+				}>;
 			};
 		};
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-test-"));
@@ -3170,12 +3181,10 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: "root-active",
 				recoveryJournalPath: journalPath,
 				orphanProcessJournalPath: orphanJournalPath,
+				createCommand: {},
 			},
 		};
-		const markInterrupted = vi.fn(async () => undefined);
-		const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			catalog: { markInterrupted },
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as {
@@ -3184,12 +3193,30 @@ describe("daemon worker supervisor monitoring", () => {
 
 		try {
 			await supervisor.recoverUncertainWorkerOperations(worker, false);
-			expect(kill).not.toHaveBeenCalled();
-			expect(markInterrupted).toHaveBeenCalledTimes(2);
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"]);
-			expect(markInterrupted).toHaveBeenCalledWith("/tmp/child.jsonl", "child-active", ["tool_execution"]);
+			expect(worker.pendingRecovery).toMatchObject({
+				version: 1,
+				interrupted: [
+					{
+						activeSessionId: "root-active",
+						sessionFile: "/tmp/root.jsonl",
+						operations: ["model_stream"],
+						terminatedBackgroundProcesses: 1,
+					},
+					{
+						activeSessionId: "child-active",
+						sessionFile: "/tmp/child.jsonl",
+						operations: ["tool_execution"],
+						terminatedBackgroundProcesses: 1,
+					},
+				],
+			});
+			const durableRecovery = worker.pendingRecovery;
+			expect(durableRecovery).toBeDefined();
+			worker.descriptor.createCommand.workerRecovery = durableRecovery;
+			worker.pendingRecovery = undefined;
+			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			expect(worker.pendingRecovery).toBe(durableRecovery);
 		} finally {
-			kill.mockRestore();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});

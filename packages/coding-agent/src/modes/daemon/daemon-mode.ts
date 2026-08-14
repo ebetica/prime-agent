@@ -109,6 +109,11 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import {
+	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+	type WorkerRecoveryActivity,
+	type WorkerRecoveryDetails,
+} from "../../core/messages.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
@@ -430,6 +435,29 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 			error.message.startsWith("Ambiguous") ||
 			error.message === AGENT_FAMILY_REACH_ERROR)
 	);
+}
+
+function workerRecoveryActivities(operations: string[]): WorkerRecoveryActivity[] {
+	const activities = new Set<WorkerRecoveryActivity>();
+	for (const operation of operations) {
+		const value = operation.toLowerCase();
+		if (value.includes("rlm") || value.includes("child")) activities.add("child agent");
+		else if (value.includes("bash") || value.includes("background_process"))
+			activities.add("shell or background command");
+		else if (value.includes("tool")) activities.add("tool execution");
+		else if (
+			value.includes("queue") ||
+			value.includes("prompt") ||
+			value.includes("steer") ||
+			value.includes("follow")
+		)
+			activities.add("queued input");
+		else if (value.includes("compact")) activities.add("context maintenance");
+		else if (value.includes("model") || value.includes("turn") || value.includes("retry"))
+			activities.add("model response");
+		else activities.add("session work");
+	}
+	return [...activities];
 }
 
 export class AgentDaemon {
@@ -1280,12 +1308,15 @@ export class AgentDaemon {
 			recovery.version !== 1 ||
 			!/^[0-9a-f]{64}$/.test(recovery.generation) ||
 			!Array.isArray(recovery.interrupted) ||
+			recovery.interrupted.length === 0 ||
 			recovery.interrupted.length > 256
 		)
 			throw new Error("Unsupported or malformed worker recovery payload");
 		const rootFile = root.runtime.session.sessionFile;
 		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
 		const rootPath = resolve(rootFile);
+		const activities = new Set<WorkerRecoveryActivity>();
+		let terminatedBackgroundProcesses: number | undefined;
 		for (const item of recovery.interrupted) {
 			if (
 				typeof item.activeSessionId !== "string" ||
@@ -1298,10 +1329,16 @@ export class AgentDaemon {
 				item.operations.length > 32 ||
 				item.operations.some(
 					(operation) => typeof operation !== "string" || operation.length === 0 || operation.length > 256,
-				)
+				) ||
+				!Number.isSafeInteger(item.terminatedBackgroundProcesses) ||
+				item.terminatedBackgroundProcesses < 0 ||
+				item.terminatedBackgroundProcesses > 256 ||
+				(terminatedBackgroundProcesses !== undefined &&
+					terminatedBackgroundProcesses !== item.terminatedBackgroundProcesses)
 			) {
 				throw new Error("Malformed worker recovery target");
 			}
+			terminatedBackgroundProcesses = item.terminatedBackgroundProcesses;
 			const sessionFile = resolve(item.sessionFile);
 			let cursor = sessionFile;
 			let owned = cursor === rootPath;
@@ -1312,25 +1349,39 @@ export class AgentDaemon {
 				owned = cursor === rootPath;
 			}
 			if (!owned) throw new Error("Worker recovery target is outside its owned root");
-			const target = SessionManager.open(sessionFile);
+			const target =
+				sessionFile === rootPath ? root.runtime.session.sessionManager : SessionManager.open(sessionFile);
 			appendInterruptedToolResults(target);
-			await reconcileInterruptedRlmChild(sessionFile);
-			const exists = target
-				.getEntries()
-				.some(
-					(entry) =>
-						entry.type === "custom_message" &&
-						entry.customType === "prime-agent.worker_recovery" &&
-						(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
-				);
-			if (!exists)
-				target.appendCustomMessageEntryWithRollback(
-					"prime-agent.worker_recovery",
-					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
-					false,
-					{ generation: recovery.generation, activeSessionId: item.activeSessionId, operations: item.operations },
-				);
+			await reconcileInterruptedRlmChild(sessionFile, root.runtime.session.sessionManager);
+			for (const activity of workerRecoveryActivities(item.operations)) activities.add(activity);
+			if (sessionFile !== rootPath) activities.add("child agent");
 		}
+		const details: WorkerRecoveryDetails = {
+			generation: recovery.generation,
+			actionId: `worker-recovery:${recovery.generation}`,
+			source: "internal",
+			activities: [...activities],
+			terminatedBackgroundProcesses: terminatedBackgroundProcesses ?? 0,
+		};
+		const exists = root.runtime.session.sessionManager
+			.getEntries()
+			.some(
+				(entry) =>
+					entry.type === "custom_message" &&
+					(entry.customType === WORKER_RECOVERY_INTENT_CUSTOM_TYPE ||
+						entry.customType === "prime-agent.worker_recovery") &&
+					(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
+			);
+		if (!exists) {
+			root.runtime.session.sessionManager.appendCustomMessageEntryWithRollback(
+				WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+				"Worker recovery continuation pending",
+				false,
+				details,
+			);
+		}
+		root.runtime.session.admitWorkerRecoveryContinuation(details);
+		root.runtime.session.resumeQueuedWork();
 	}
 
 	private async createRuntime(

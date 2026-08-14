@@ -13,6 +13,7 @@ import {
 	isSessionSlashCommandResultMessage,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
 } from "../src/core/messages.js";
 import { parseSessionSlashCommand } from "../src/core/slash-commands.js";
 import { CompactionOutcomeMessageComponent } from "../src/modes/interactive/components/compaction-outcome-message.js";
@@ -166,6 +167,7 @@ describe("session command messages", () => {
 				customMessage(SESSION_SLASH_COMMAND_CUSTOM_TYPE),
 				customMessage(SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE),
 				customMessage(COMPACTION_OUTCOME_CUSTOM_TYPE),
+				customMessage(WORKER_RECOVERY_INTENT_CUSTOM_TYPE),
 			]),
 		).toEqual([]);
 	});

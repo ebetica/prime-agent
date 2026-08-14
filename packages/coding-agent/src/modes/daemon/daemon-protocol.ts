@@ -67,8 +67,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 22 preserves immutable worker launch environment across planned restarts.
 // Revision 23 adds durable, atomic child-to-parent automatic report mute controls.
-export const DAEMON_SCHEMA_REVISION = 23;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-07eafa275d21";
+// Revision 24 carries confirmed background-process cleanup counts in worker recovery handoffs.
+export const DAEMON_SCHEMA_REVISION = 24;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-63fab59b1d27";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -471,7 +472,12 @@ export type DaemonCommand =
 			workerRecovery?: {
 				version: 1;
 				generation: string;
-				interrupted: Array<{ activeSessionId: string; sessionFile: string; operations: string[] }>;
+				interrupted: Array<{
+					activeSessionId: string;
+					sessionFile: string;
+					operations: string[];
+					terminatedBackgroundProcesses: number;
+				}>;
 			};
 			sessionPath?: string;
 			continueRecent?: boolean;

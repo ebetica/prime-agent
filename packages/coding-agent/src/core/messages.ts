@@ -30,6 +30,59 @@ export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
 export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 export const PLANNED_RESTART_INTENT_CUSTOM_TYPE = "prime-agent.planned_restart_intent";
 export const PLANNED_RESTART_HANDOFF_CUSTOM_TYPE = "prime-agent.planned_restart_handoff";
+export const WORKER_RECOVERY_INTENT_CUSTOM_TYPE = "prime-agent.worker_recovery_intent";
+export const WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE = "prime-agent.worker_recovery";
+
+export const WORKER_RECOVERY_ACTIVITY_LABELS = [
+	"model response",
+	"tool execution",
+	"shell or background command",
+	"child agent",
+	"queued input",
+	"context maintenance",
+	"session work",
+] as const;
+export type WorkerRecoveryActivity = (typeof WORKER_RECOVERY_ACTIVITY_LABELS)[number];
+export interface WorkerRecoveryDetails {
+	generation: string;
+	actionId: string;
+	source: "internal";
+	activities: WorkerRecoveryActivity[];
+	terminatedBackgroundProcesses: number;
+}
+
+export function isWorkerRecoveryDetails(value: unknown): value is WorkerRecoveryDetails {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Partial<WorkerRecoveryDetails>;
+	return (
+		typeof candidate.generation === "string" &&
+		/^[0-9a-f]{64}$/.test(candidate.generation) &&
+		candidate.actionId === `worker-recovery:${candidate.generation}` &&
+		candidate.source === "internal" &&
+		Array.isArray(candidate.activities) &&
+		candidate.activities.length <= WORKER_RECOVERY_ACTIVITY_LABELS.length &&
+		candidate.activities.every((activity) => WORKER_RECOVERY_ACTIVITY_LABELS.includes(activity)) &&
+		Number.isSafeInteger(candidate.terminatedBackgroundProcesses) &&
+		(candidate.terminatedBackgroundProcesses ?? -1) >= 0 &&
+		(candidate.terminatedBackgroundProcesses ?? 257) <= 256
+	);
+}
+
+export function createWorkerRecoveryMessage(details: WorkerRecoveryDetails): string {
+	const activity = details.activities.length > 0 ? details.activities.join(", ") : "session work";
+	const background =
+		details.terminatedBackgroundProcesses === 0
+			? "No tracked background process required termination."
+			: `${details.terminatedBackgroundProcesses} tracked background ${details.terminatedBackgroundProcesses === 1 ? "process was" : "processes were"} confirmed terminated.`;
+	return [
+		"<prime_agent_worker_interrupted>",
+		"The isolated session worker restarted after in-flight work was interrupted. The old turn was not replayed.",
+		background,
+		`Recorded activity: ${activity}. Inspect external side effects before continuing.`,
+		"IPython state restoration has not been verified yet; if the kernel starts, its separate restoration notice is authoritative.",
+		"</prime_agent_worker_interrupted>",
+	].join("\n");
+}
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
@@ -453,7 +506,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
 						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
 						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE ||
-						m.customType === PLANNED_RESTART_INTENT_CUSTOM_TYPE
+						m.customType === PLANNED_RESTART_INTENT_CUSTOM_TYPE ||
+						m.customType === WORKER_RECOVERY_INTENT_CUSTOM_TYPE
 					) {
 						return undefined;
 					}

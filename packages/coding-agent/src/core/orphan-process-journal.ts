@@ -83,10 +83,89 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 		.map((record) => ({ pid: record.pid, processStartId: record.processStartId }));
 }
 
+export type OrphanProcessIdentityStatus = "current" | "gone" | "unknown";
+
+export function orphanProcessIdentityStatus(orphan: ActiveOrphanProcess): OrphanProcessIdentityStatus {
+	const observedStartId = getProcessStartId(orphan.pid);
+	if (observedStartId === orphan.processStartId) return "current";
+	if (observedStartId !== undefined) return "gone";
+	try {
+		process.kill(orphan.pid, 0);
+		return "unknown";
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "unknown";
+	}
+}
+
 export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boolean {
-	return getProcessStartId(orphan.pid) === orphan.processStartId;
+	return orphanProcessIdentityStatus(orphan) === "current";
 }
 
 export function clearOrphanProcessJournal(path: string): void {
 	rmSync(path, { force: true });
+}
+
+export interface TerminateActiveOrphanProcessOptions {
+	timeoutMs?: number;
+	pollMs?: number;
+	identityStatus?: (orphan: ActiveOrphanProcess) => OrphanProcessIdentityStatus;
+	signal?: (pid: number) => void;
+	delay?: (milliseconds: number) => Promise<void>;
+}
+
+/** Kill only journaled PID/start-id identities and clear the journal only after
+ * every identity is authoritatively gone. The returned count contains no
+ * process metadata and is safe to include in a recovery notice. */
+export async function terminateActiveOrphanProcesses(
+	path: string,
+	ownerPid: number,
+	options: TerminateActiveOrphanProcessOptions = {},
+): Promise<number> {
+	const identityStatus = options.identityStatus ?? orphanProcessIdentityStatus;
+	const journaled = readActiveOrphanProcesses(path, ownerPid);
+	if (journaled.length > 256) {
+		throw new Error("Tracked worker background process count exceeds the bounded recovery payload");
+	}
+	const active: ActiveOrphanProcess[] = [];
+	for (const orphan of journaled) {
+		const status = identityStatus(orphan);
+		if (status === "unknown") {
+			throw new Error("Tracked worker background process identity could not be verified");
+		}
+		if (status === "current") active.push(orphan);
+	}
+	const signal =
+		options.signal ??
+		((pid: number) => {
+			try {
+				process.kill(-pid, "SIGKILL");
+			} catch {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+		});
+	for (const orphan of active) signal(orphan.pid);
+	const timeoutMs = options.timeoutMs ?? 5_000;
+	const pollMs = options.pollMs ?? 25;
+	const delay =
+		options.delay ??
+		((milliseconds: number) => new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds)));
+	const hasLiveIdentity = (): boolean => {
+		let current = false;
+		for (const orphan of active) {
+			const status = identityStatus(orphan);
+			if (status === "unknown") {
+				throw new Error("Tracked worker background process identity could not be verified after termination");
+			}
+			if (status === "current") current = true;
+		}
+		return current;
+	};
+	const deadline = Date.now() + timeoutMs;
+	while (hasLiveIdentity() && Date.now() < deadline) await delay(pollMs);
+	if (hasLiveIdentity()) {
+		throw new Error("Tracked worker background processes did not terminate within the cleanup deadline");
+	}
+	return journaled.length;
 }

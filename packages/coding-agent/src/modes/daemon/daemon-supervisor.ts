@@ -47,9 +47,8 @@ import {
 } from "../../core/cron-jobs.js";
 import {
 	clearOrphanProcessJournal,
-	isOrphanProcessIdentityCurrent,
 	ORPHAN_PROCESS_JOURNAL_ENV,
-	readActiveOrphanProcesses,
+	terminateActiveOrphanProcesses,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import {
@@ -438,7 +437,7 @@ function withoutCommandId(command: DaemonCommand): DaemonCommandBody {
 }
 
 function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCreateCommand {
-	const { launchEnv: _launchEnv, lifecycle: _lifecycle, ...workerCommand } = command;
+	const { launchEnv: _launchEnv, lifecycle: _lifecycle, workerRecovery: _workerRecovery, ...workerCommand } = command;
 	return workerCommand;
 }
 
@@ -2688,10 +2687,15 @@ export class DaemonSupervisor {
 			await this.assertRecoveryAllowed();
 			if (worker.pendingRecovery) {
 				if (worker.descriptor.createCommand.workerRecovery) {
+					// Keep cleanup facts until the replacement worker has durably accepted its
+					// idempotent recovery action. If the supervisor crashes before this point,
+					// the same generation and confirmed-gone count are reconstructed.
+					if (worker.descriptor.orphanProcessJournalPath) {
+						clearOrphanProcessJournal(worker.descriptor.orphanProcessJournalPath);
+					}
 					const { workerRecovery: _recovery, ...acknowledgedCreateCommand } = worker.descriptor.createCommand;
 					worker.descriptor.createCommand = acknowledgedCreateCommand;
-					// Persist the no-replay boundary before acknowledging journal facts. A crash
-					// before this point safely retries idempotently; after it cannot replay them.
+					// Persist the no-replay boundary before acknowledging recovery-journal facts.
 					this.persistWorker(worker);
 				}
 				const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
@@ -3332,28 +3336,19 @@ export class DaemonSupervisor {
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
-		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
-		if (orphanProcessJournalPath) {
-			try {
-				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) continue;
-					try {
-						process.kill(-orphan.pid, "SIGKILL");
-					} catch {
-						try {
-							process.kill(orphan.pid, "SIGKILL");
-						} catch {}
-					}
-				}
-				clearOrphanProcessJournal(orphanProcessJournalPath);
-			} catch (error) {
-				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
-			}
+		const durableRecovery = worker.descriptor.createCommand.workerRecovery;
+		if (durableRecovery) {
+			worker.pendingRecovery = durableRecovery;
+			return;
 		}
+		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
+		const terminatedBackgroundProcesses = orphanProcessJournalPath
+			? await terminateActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)
+			: 0;
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);
-		if (uncertain.length === 0) return;
+		if (uncertain.length === 0 && terminatedBackgroundProcesses === 0) return;
 		const interrupted = new Map<string, { activeSessionId: string; sessionFile: string; operations: Set<string> }>();
 		for (const record of uncertain) {
 			const sessionFile =
@@ -3371,8 +3366,17 @@ export class DaemonSupervisor {
 			current.operations.add(record.operation);
 			interrupted.set(key, current);
 		}
+		if (interrupted.size === 0 && terminatedBackgroundProcesses > 0 && worker.descriptor.sessionFile) {
+			interrupted.set(`${worker.descriptor.rootActiveSessionId}\0${worker.descriptor.sessionFile}`, {
+				activeSessionId: worker.descriptor.rootActiveSessionId,
+				sessionFile: worker.descriptor.sessionFile,
+				operations: new Set(["background_process"]),
+			});
+		}
 		const generation = createHash("sha256")
 			.update(worker.descriptor.workerId)
+			.update("\0")
+			.update(String(terminatedBackgroundProcesses))
 			.update("\0")
 			.update(
 				JSON.stringify(
@@ -3392,6 +3396,7 @@ export class DaemonSupervisor {
 				activeSessionId: value.activeSessionId,
 				sessionFile: value.sessionFile,
 				operations: [...value.operations],
+				terminatedBackgroundProcesses,
 			})),
 		};
 	}
