@@ -53,6 +53,38 @@ describe("OwnedOperationJournal", () => {
 		expect(await registry.stop("token-a")).toEqual({ status: "already_stopped", kernelRestarted: true });
 	});
 
+	it("does not publish an optimistic intent before the durable writer succeeds", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "owned-operation-journal-"));
+		dirs.push(dir);
+		let writerReached!: () => void;
+		const reached = new Promise<void>((resolve) => {
+			writerReached = resolve;
+		});
+		let releaseWriter!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			releaseWriter = resolve;
+		});
+		const journal = await OwnedOperationJournal.open(join(dir, "stop.json"), {
+			durableWriter: async () => {
+				writerReached();
+				await gate;
+				throw new Error("pre-rename write failed");
+			},
+		});
+		const writing = journal.writeStopIntent({
+			token: "not-durable-yet",
+			ownerId: "owner",
+			operationIds: ["operation"],
+			kernelRestarted: false,
+		});
+		await reached;
+		expect(journal.pending).toBeUndefined();
+		expect(await journal.recoverPending(async () => {})).toBe(false);
+		releaseWriter();
+		await expect(writing).rejects.toThrow("pre-rename write failed");
+		expect(journal.pending).toBeUndefined();
+	});
+
 	it("keeps only a bounded retry window and rejects a mixed pending owner", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "owned-operation-journal-"));
 		dirs.push(dir);
@@ -75,6 +107,14 @@ describe("OwnedOperationJournal", () => {
 			operationIds: ["a"],
 			kernelRestarted: false,
 		});
+		await expect(
+			journal.writeStopIntent({
+				token: "pending-a",
+				ownerId: "different-owner",
+				operationIds: ["a"],
+				kernelRestarted: false,
+			}),
+		).rejects.toThrow("immutable durable stop intent");
 		await expect(
 			journal.writeStopped({
 				token: "pending-a",

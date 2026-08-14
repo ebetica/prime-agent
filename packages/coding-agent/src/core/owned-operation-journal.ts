@@ -25,6 +25,8 @@ export interface OwnedOperationJournalOptions {
 	maxTerminalReceipts?: number;
 	terminalReceiptTtlMs?: number;
 	now?: () => number;
+	/** Alternate durable writer for storage adapters and deterministic failure tests. */
+	durableWriter?: (path: string, state: JournalState) => Promise<void>;
 }
 
 function emptyState(): JournalState {
@@ -119,6 +121,7 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 	private readonly maxTerminalReceipts: number;
 	private readonly terminalReceiptTtlMs: number;
 	private readonly now: () => number;
+	private readonly durableWriter: (path: string, state: JournalState) => Promise<void>;
 	private state: JournalState;
 	private tail: Promise<void> = Promise.resolve();
 	private writeFenced = false;
@@ -130,7 +133,8 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 		this.maxTerminalReceipts = options.maxTerminalReceipts ?? 128;
 		this.terminalReceiptTtlMs = options.terminalReceiptTtlMs ?? 24 * 60 * 60 * 1000;
 		this.now = options.now ?? Date.now;
-		this.prune();
+		this.durableWriter = options.durableWriter ?? writeDurable;
+		this.pruneState(this.state);
 	}
 
 	static async open(path: string, options: OwnedOperationJournalOptions = {}): Promise<OwnedOperationJournal> {
@@ -149,8 +153,11 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 
 	writeStopIntent(record: Omit<DurableStopRecord, "recordedAt">): Promise<void> {
 		return this.update((state) => {
-			if (state.pending && state.pending.token !== record.token) {
-				throw new Error("Another durable stop intent is still pending cleanup");
+			if (state.pending) {
+				if (!sameIntent(state.pending, record)) {
+					throw new Error("Another immutable durable stop intent is still pending cleanup");
+				}
+				return;
 			}
 			state.pending = {
 				...record,
@@ -208,16 +215,16 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 				terminal: this.state.terminal.map((receipt) => ({ ...receipt, operationIds: [...receipt.operationIds] })),
 			};
 			change(next);
-			const previous = this.state;
-			this.state = next;
-			this.prune();
+			this.pruneState(next);
 			try {
-				await writeDurable(this.path, this.state);
+				await this.durableWriter(this.path, next);
+				this.state = next;
 			} catch (error) {
 				if (error instanceof AmbiguousDurableCommitError) {
+					// Rename made `next` externally visible. Keep that conservative state
+					// and prohibit further writes until a reopen reconciles durability.
+					this.state = next;
 					this.writeFenced = true;
-				} else {
-					this.state = previous;
 				}
 				throw error;
 			}
@@ -227,11 +234,11 @@ export class OwnedOperationJournal implements OwnedOperationPersistence {
 		return result;
 	}
 
-	private prune(): void {
+	private pruneState(state: JournalState): void {
 		const oldestAllowed = this.now() - this.terminalReceiptTtlMs;
-		this.state.terminal = this.state.terminal.filter((receipt) => Date.parse(receipt.recordedAt) >= oldestAllowed);
-		if (this.state.terminal.length > this.maxTerminalReceipts) {
-			this.state.terminal.splice(0, this.state.terminal.length - this.maxTerminalReceipts);
+		state.terminal = state.terminal.filter((receipt) => Date.parse(receipt.recordedAt) >= oldestAllowed);
+		if (state.terminal.length > this.maxTerminalReceipts) {
+			state.terminal.splice(0, state.terminal.length - this.maxTerminalReceipts);
 		}
 	}
 }
