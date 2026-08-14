@@ -468,7 +468,12 @@ export type DaemonCommand =
 			workerRecovery?: {
 				version: 1;
 				generation: string;
-				interrupted: Array<{ activeSessionId: string; sessionFile: string; operations: string[] }>;
+				interrupted: Array<{
+					activeSessionId: string;
+					sessionFile: string;
+					operations: string[];
+					terminatedBackgroundProcesses: number;
+				}>;
 			};
 			sessionPath?: string;
 			continueRecent?: boolean;

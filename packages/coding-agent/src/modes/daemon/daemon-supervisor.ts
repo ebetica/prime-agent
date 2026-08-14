@@ -45,12 +45,7 @@ import {
 	migrateLegacyCronJobsToSessionArtifacts,
 	SESSION_SCHEDULED_JOBS_FILENAME,
 } from "../../core/cron-jobs.js";
-import {
-	clearOrphanProcessJournal,
-	isOrphanProcessIdentityCurrent,
-	ORPHAN_PROCESS_JOURNAL_ENV,
-	readActiveOrphanProcesses,
-} from "../../core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, terminateActiveOrphanProcesses } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import {
 	canEvictWorker,
@@ -3331,27 +3326,13 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
-		if (orphanProcessJournalPath) {
-			try {
-				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) continue;
-					try {
-						process.kill(-orphan.pid, "SIGKILL");
-					} catch {
-						try {
-							process.kill(orphan.pid, "SIGKILL");
-						} catch {}
-					}
-				}
-				clearOrphanProcessJournal(orphanProcessJournalPath);
-			} catch (error) {
-				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
-			}
-		}
+		const terminatedBackgroundProcesses = orphanProcessJournalPath
+			? await terminateActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)
+			: 0;
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);
-		if (uncertain.length === 0) return;
+		if (uncertain.length === 0 && terminatedBackgroundProcesses === 0) return;
 		const interrupted = new Map<string, { activeSessionId: string; sessionFile: string; operations: Set<string> }>();
 		for (const record of uncertain) {
 			const sessionFile =
@@ -3369,8 +3350,17 @@ export class DaemonSupervisor {
 			current.operations.add(record.operation);
 			interrupted.set(key, current);
 		}
+		if (interrupted.size === 0 && terminatedBackgroundProcesses > 0 && worker.descriptor.sessionFile) {
+			interrupted.set(`${worker.descriptor.rootActiveSessionId}\0${worker.descriptor.sessionFile}`, {
+				activeSessionId: worker.descriptor.rootActiveSessionId,
+				sessionFile: worker.descriptor.sessionFile,
+				operations: new Set(["background_process"]),
+			});
+		}
 		const generation = createHash("sha256")
 			.update(worker.descriptor.workerId)
+			.update("\0")
+			.update(String(terminatedBackgroundProcesses))
 			.update("\0")
 			.update(
 				JSON.stringify(
@@ -3390,6 +3380,7 @@ export class DaemonSupervisor {
 				activeSessionId: value.activeSessionId,
 				sessionFile: value.sessionFile,
 				operations: [...value.operations],
+				terminatedBackgroundProcesses,
 			})),
 		};
 	}

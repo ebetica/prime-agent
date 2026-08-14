@@ -109,6 +109,11 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import {
+	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+	type WorkerRecoveryActivity,
+	type WorkerRecoveryDetails,
+} from "../../core/messages.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
@@ -428,6 +433,29 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 			error.message.startsWith("Ambiguous") ||
 			error.message === AGENT_FAMILY_REACH_ERROR)
 	);
+}
+
+function workerRecoveryActivities(operations: string[]): WorkerRecoveryActivity[] {
+	const activities = new Set<WorkerRecoveryActivity>();
+	for (const operation of operations) {
+		const value = operation.toLowerCase();
+		if (value.includes("rlm") || value.includes("child")) activities.add("child agent");
+		else if (value.includes("bash") || value.includes("background_process"))
+			activities.add("shell or background command");
+		else if (value.includes("tool")) activities.add("tool execution");
+		else if (
+			value.includes("queue") ||
+			value.includes("prompt") ||
+			value.includes("steer") ||
+			value.includes("follow")
+		)
+			activities.add("queued input");
+		else if (value.includes("compact")) activities.add("context maintenance");
+		else if (value.includes("model") || value.includes("turn") || value.includes("retry"))
+			activities.add("model response");
+		else activities.add("session work");
+	}
+	return [...activities];
 }
 
 export class AgentDaemon {
@@ -1284,6 +1312,7 @@ export class AgentDaemon {
 		const rootFile = root.runtime.session.sessionFile;
 		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
 		const rootPath = resolve(rootFile);
+		let rootRecoveryDetails: WorkerRecoveryDetails | undefined;
 		for (const item of recovery.interrupted) {
 			if (
 				typeof item.activeSessionId !== "string" ||
@@ -1296,7 +1325,10 @@ export class AgentDaemon {
 				item.operations.length > 32 ||
 				item.operations.some(
 					(operation) => typeof operation !== "string" || operation.length === 0 || operation.length > 256,
-				)
+				) ||
+				!Number.isSafeInteger(item.terminatedBackgroundProcesses) ||
+				item.terminatedBackgroundProcesses < 0 ||
+				item.terminatedBackgroundProcesses > 256
 			) {
 				throw new Error("Malformed worker recovery target");
 			}
@@ -1313,21 +1345,35 @@ export class AgentDaemon {
 			const target = SessionManager.open(sessionFile);
 			appendInterruptedToolResults(target);
 			await reconcileInterruptedRlmChild(sessionFile);
+			const details = {
+				generation: recovery.generation,
+				actionId: `worker-recovery:${recovery.generation}`,
+				source: "internal" as const,
+				activities: workerRecoveryActivities(item.operations),
+				terminatedBackgroundProcesses: item.terminatedBackgroundProcesses,
+			};
 			const exists = target
 				.getEntries()
 				.some(
 					(entry) =>
 						entry.type === "custom_message" &&
-						entry.customType === "prime-agent.worker_recovery" &&
+						(entry.customType === WORKER_RECOVERY_INTENT_CUSTOM_TYPE ||
+							entry.customType === "prime-agent.worker_recovery") &&
 						(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
 				);
-			if (!exists)
+			if (!exists) {
 				target.appendCustomMessageEntryWithRollback(
-					"prime-agent.worker_recovery",
-					"<prime_agent_worker_interrupted>\nThe isolated session worker stopped during in-flight work. The saved transcript was recovered, but uncertain model, tool, bash, or child-agent work was not replayed. Inspect external side effects before continuing.\n</prime_agent_worker_interrupted>",
+					WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+					"Worker recovery continuation pending",
 					false,
-					{ generation: recovery.generation, activeSessionId: item.activeSessionId, operations: item.operations },
+					details,
 				);
+			}
+			if (sessionFile === rootPath) rootRecoveryDetails = details;
+		}
+		if (rootRecoveryDetails) {
+			root.runtime.session.admitWorkerRecoveryContinuation(rootRecoveryDetails);
+			root.runtime.session.resumeQueuedWork();
 		}
 	}
 

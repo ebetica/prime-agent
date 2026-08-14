@@ -184,12 +184,17 @@ import {
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	createWorkerRecoveryMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	isWorkerRecoveryDetails,
 	PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
 	PLANNED_RESTART_INTENT_CUSTOM_TYPE,
+	WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE,
+	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+	type WorkerRecoveryDetails,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
@@ -1403,7 +1408,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (this._recoverPlannedRestartContinuationIntents() > 0) {
+		if (this._recoverPlannedRestartContinuationIntents() + this._recoverWorkerRecoveryContinuationIntents() > 0) {
 			// A prior successor may have acknowledged resume and crashed before the
 			// queued continuation reached the transcript. The durable intent is
 			// successor-claim proof, so a later session load may safely finish it.
@@ -4952,6 +4957,108 @@ export class AgentSession {
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
 		});
+	}
+
+	private _workerRecoveryMarker(
+		entry: SessionEntry,
+	): { actionId: string; details: WorkerRecoveryDetails; completed: boolean } | undefined {
+		let customType: string;
+		let display = false;
+		let rawDetails: unknown;
+		if (entry.type === "custom_message") {
+			customType = entry.customType;
+			display = entry.display;
+			rawDetails = entry.details;
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			customType = entry.message.customType;
+			display = entry.message.display;
+			rawDetails = entry.message.details;
+		} else {
+			return undefined;
+		}
+		if (
+			(customType !== WORKER_RECOVERY_INTENT_CUSTOM_TYPE && customType !== WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE) ||
+			!isWorkerRecoveryDetails(rawDetails)
+		)
+			return undefined;
+		const details = rawDetails;
+		return {
+			actionId: details.actionId,
+			details,
+			completed: customType === WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE && display,
+		};
+	}
+
+	private _recoverWorkerRecoveryContinuationIntents(): number {
+		const completed = new Set<string>();
+		const pending = new Map<string, WorkerRecoveryDetails>();
+		for (const entry of this.sessionManager.getEntries()) {
+			const marker = this._workerRecoveryMarker(entry);
+			if (!marker) continue;
+			if (marker.completed) {
+				completed.add(marker.actionId);
+				continue;
+			}
+			const prior = pending.get(marker.actionId);
+			if (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(marker.details)) {
+				throw new Error(`Worker recovery action ${marker.actionId} has conflicting durable intents`);
+			}
+			pending.set(marker.actionId, marker.details);
+		}
+		let recovered = 0;
+		for (const [actionId, details] of pending) {
+			if (completed.has(actionId) || this._actionStore.ownedActions().some((action) => action.id === actionId))
+				continue;
+			this._admitWorkerRecoveryAction(actionId, details);
+			recovered++;
+		}
+		return recovered;
+	}
+
+	private _admitWorkerRecoveryAction(actionId: string, details: WorkerRecoveryDetails): void {
+		const text = createWorkerRecoveryMessage(details);
+		const message: CustomMessage = {
+			role: "custom",
+			customType: WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE,
+			content: text,
+			display: true,
+			timestamp: Date.now(),
+			details,
+		};
+		const action = this._createPreparedTurnAction("followUp", text, undefined, {
+			actionId,
+			agentMessageId: actionId,
+			message,
+			source: "internal",
+			queueVisible: false,
+		});
+		this._admitSessionInput(action, { restore: true });
+	}
+
+	admitWorkerRecoveryContinuation(details: WorkerRecoveryDetails): "admitted" | "already_admitted" {
+		if (!isWorkerRecoveryDetails(details)) throw new Error("Malformed worker recovery continuation");
+		const actionId = details.actionId;
+		const entries = this.sessionManager.getEntries();
+		const matching = entries.filter((entry) => this._workerRecoveryMarker(entry)?.actionId === actionId);
+		for (const entry of matching) {
+			const marker = this._workerRecoveryMarker(entry);
+			if (JSON.stringify(marker?.details) !== JSON.stringify(details)) {
+				throw new Error(`Worker recovery action ${actionId} conflicts with a durable marker`);
+			}
+			if (marker?.completed) return "already_admitted";
+		}
+		const existing = this._actionStore.ownedActions().find((action) => action.id === actionId);
+		if (existing) return "already_admitted";
+		if (matching.length === 0) {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+				"Worker recovery continuation pending",
+				false,
+				details,
+			);
+		}
+		this._admitWorkerRecoveryAction(actionId, details);
+		return "admitted";
 	}
 
 	private _plannedRestartMarker(

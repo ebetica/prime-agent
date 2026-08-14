@@ -90,3 +90,50 @@ export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boo
 export function clearOrphanProcessJournal(path: string): void {
 	rmSync(path, { force: true });
 }
+
+export interface TerminateActiveOrphanProcessOptions {
+	timeoutMs?: number;
+	pollMs?: number;
+	isCurrent?: (orphan: ActiveOrphanProcess) => boolean;
+	signal?: (pid: number) => void;
+	delay?: (milliseconds: number) => Promise<void>;
+}
+
+/** Kill only journaled PID/start-id identities and clear the journal only after
+ * every identity is authoritatively gone. The returned count contains no
+ * process metadata and is safe to include in a recovery notice. */
+export async function terminateActiveOrphanProcesses(
+	path: string,
+	ownerPid: number,
+	options: TerminateActiveOrphanProcessOptions = {},
+): Promise<number> {
+	const isCurrent = options.isCurrent ?? isOrphanProcessIdentityCurrent;
+	const active = readActiveOrphanProcesses(path, ownerPid).filter(isCurrent);
+	if (active.length > 256) {
+		throw new Error("Tracked worker background process count exceeds the bounded recovery payload");
+	}
+	const signal =
+		options.signal ??
+		((pid: number) => {
+			try {
+				process.kill(-pid, "SIGKILL");
+			} catch {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {}
+			}
+		});
+	for (const orphan of active) signal(orphan.pid);
+	const timeoutMs = options.timeoutMs ?? 5_000;
+	const pollMs = options.pollMs ?? 25;
+	const delay =
+		options.delay ??
+		((milliseconds: number) => new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds)));
+	const deadline = Date.now() + timeoutMs;
+	while (active.some(isCurrent) && Date.now() < deadline) await delay(pollMs);
+	if (active.some(isCurrent)) {
+		throw new Error("Tracked worker background processes did not terminate within the cleanup deadline");
+	}
+	clearOrphanProcessJournal(path);
+	return active.length;
+}

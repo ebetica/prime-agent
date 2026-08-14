@@ -8,6 +8,7 @@ import {
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
 	recordOrphanProcessState,
+	terminateActiveOrphanProcesses,
 } from "../src/core/orphan-process-journal.js";
 
 const tempDirs: string[] = [];
@@ -43,5 +44,42 @@ describe("orphan process journal", () => {
 		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([]);
 		clearOrphanProcessJournal(path);
 		expect(existsSync(path)).toBe(false);
+	});
+
+	it("clears only after the exact tracked identity is confirmed gone", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		recordOrphanProcessState(process.pid, true);
+		let current = true;
+		const signaled: number[] = [];
+		await expect(
+			terminateActiveOrphanProcesses(path, process.pid, {
+				isCurrent: () => current,
+				signal: (pid) => {
+					signaled.push(pid);
+					current = false;
+				},
+			}),
+		).resolves.toBe(1);
+		expect(signaled).toEqual([process.pid]);
+		expect(existsSync(path)).toBe(false);
+	});
+
+	it("retains cleanup facts when a tracked identity remains alive", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-blocked-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		recordOrphanProcessState(process.pid, true);
+		await expect(
+			terminateActiveOrphanProcesses(path, process.pid, {
+				isCurrent: () => true,
+				signal: () => {},
+				timeoutMs: 0,
+			}),
+		).rejects.toThrow("did not terminate");
+		expect(existsSync(path)).toBe(true);
 	});
 });
