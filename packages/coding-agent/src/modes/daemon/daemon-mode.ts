@@ -3468,6 +3468,7 @@ export class AgentDaemon {
 					const receipt = await this.sendAgentSessionMessage({
 						targetSelector: command.targetActiveSessionId,
 						message: command.message,
+						messageId: command.messageId,
 						sender: command.sender,
 						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
 						origin: "agent",

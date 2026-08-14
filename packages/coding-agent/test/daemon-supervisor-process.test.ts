@@ -838,23 +838,40 @@ describe("daemon supervisor resident workers", () => {
 		expect(source.workerPid).not.toBe(target.workerPid);
 		await startBlockingBash(client, target.activeSessionId ?? target.id, join(root, "target-root-blocker.ready"));
 
-		const response = await client.request({
-			type: "send_message",
-			fromActiveSessionId: source.activeSessionId ?? source.id,
-			targetActiveSessionId: target.activeSessionId ?? target.id,
-			message: "hello sibling root",
-			agentOrigin: true,
-		});
+		const stableMessageId = "agentmsg-cross-worker-stable";
+		const send = () =>
+			client.request({
+				type: "send_idempotent_message",
+				fromActiveSessionId: source.activeSessionId ?? source.id,
+				targetActiveSessionId: target.activeSessionId ?? target.id,
+				message: "hello sibling root",
+				messageId: stableMessageId,
+				agentOrigin: true,
+			});
+		const response = await send();
 		expect(response.success, JSON.stringify(response)).toBe(true);
 		expect(response).toMatchObject({
 			success: true,
 			data: {
+				id: stableMessageId,
 				source: "agent_message",
 				target: { activeSessionId: target.activeSessionId ?? target.id },
 				message: "hello sibling root",
 				deliveryStatus: "queued",
 			},
 		});
+		// Model a lost first response: replaying the sender-assigned ID must
+		// acknowledge the receiver's original acceptance, not enqueue a duplicate.
+		await expect(send()).resolves.toMatchObject({
+			success: true,
+			data: { id: stableMessageId, deliveryStatus: "queued" },
+		});
+		const listed = await client.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		const targetAfterReplay = requireSessionList(listed.success ? listed.data : undefined).find(
+			(session) => (session.activeSessionId ?? session.id) === (target.activeSessionId ?? target.id),
+		);
+		expect(targetAfterReplay?.sessionActions.queuedCount).toBe(1);
 		const shutdown = await client.request({ type: "shutdown" }, 10_000);
 		expect(shutdown.success).toBe(true);
 		client.close();

@@ -2194,6 +2194,7 @@ export class DaemonSupervisor {
 						type: "worker_deliver_message",
 						targetActiveSessionId,
 						message: command.message,
+						messageId: command.messageId,
 						sender: {
 							activeSessionId: source.summary.activeSessionId ?? source.summary.id,
 							sessionId: source.summary.sessionId,

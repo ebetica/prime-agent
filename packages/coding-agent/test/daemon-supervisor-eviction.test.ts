@@ -330,8 +330,9 @@ describe("daemon supervisor whole-tree eviction", () => {
 
 		const response = await supervisor.handleCommand(client, {
 			id: "message-1",
-			type: "send_message",
+			type: "send_idempotent_message",
 			targetActiveSessionId: "target-session",
+			messageId: "agentmsg-woken-stable",
 			fromActiveSessionId: "source-active",
 			message: "wake up",
 		});
@@ -346,10 +347,11 @@ describe("daemon supervisor whole-tree eviction", () => {
 				type: "worker_deliver_message",
 				targetActiveSessionId: "target-active",
 				message: "wake up",
+				messageId: "agentmsg-woken-stable",
 			}),
 			24 * 60 * 60 * 1000,
 		);
-		expect(response).toMatchObject({ success: true, id: "message-1", command: "send_message" });
+		expect(response).toMatchObject({ success: true, id: "message-1", command: "send_idempotent_message" });
 	});
 
 	it("delivers a same-worker name selector through its canonical active session id", async () => {

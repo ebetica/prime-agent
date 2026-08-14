@@ -76,6 +76,7 @@ export type DaemonWorkerCommand =
 			type: "worker_deliver_message";
 			targetActiveSessionId: string;
 			message: string;
+			messageId?: string;
 			sender: AgentSessionMessageSender;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
