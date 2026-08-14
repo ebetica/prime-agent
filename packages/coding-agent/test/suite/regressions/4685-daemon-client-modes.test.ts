@@ -179,6 +179,24 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("peer unavailable"));
 	});
 
+	it("sanitizes an empty owned-worker launch environment after promotion commits", async () => {
+		const worker = {
+			descriptor: { ownerClientId: "protocol-client" },
+			launchEnv: {},
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			protocolClientId: () => "protocol-client",
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => {}),
+		}) as {
+			promoteOwnedWorker(client: DaemonSocketClient, resident: typeof worker): Promise<void>;
+		};
+
+		await supervisor.promoteOwnedWorker({ id: "client-1" } as DaemonSocketClient, worker);
+
+		expect(worker.launchEnv).toBeUndefined();
+	});
+
 	it("rolls back owned-worker promotion when persistence fails", async () => {
 		const client = { id: "client-1" } as DaemonSocketClient;
 		const descriptor = { ownerClientId: "protocol-client" };

@@ -459,6 +459,8 @@ function launchEnvironmentDigest(environment: Record<string, string>): string {
 	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
+const EMPTY_LAUNCH_ENV_DIGEST = launchEnvironmentDigest({});
+
 function readLaunchEnvironment(value: unknown): Record<string, string> | undefined {
 	if (
 		!value ||
@@ -1047,7 +1049,7 @@ export class DaemonSupervisor {
 			for (const candidate of parsed.sessions) {
 				if (!candidate || typeof candidate !== "object") continue;
 				const session = candidate as { sessionFile?: unknown; launchEnv?: unknown };
-				const environment = readLaunchEnvironment(session.launchEnv);
+				const environment = Object.hasOwn(session, "launchEnv") ? readLaunchEnvironment(session.launchEnv) : {};
 				if (typeof session.sessionFile !== "string" || environment === undefined) continue;
 				environments.set(canonicalSessionPath(session.sessionFile), environment);
 			}
@@ -2613,7 +2615,7 @@ export class DaemonSupervisor {
 				authenticationToken: token,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
-				...(launchEnv !== undefined ? { launchEnvDigest: launchEnvironmentDigest(launchEnv) } : {}),
+				launchEnvDigest: launchEnvironmentDigest(launchEnv ?? {}),
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
@@ -3226,17 +3228,19 @@ export class DaemonSupervisor {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
 		}
-		if (worker.descriptor.launchEnvDigest && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
-			worker.descriptor.lifecycle = "failed";
-			worker.descriptor.lastError = "Waiting for the trusted launch environment checkpoint";
-			this.persistWorker(worker);
-			return;
-		}
-		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
-			worker.descriptor.lifecycle = "failed";
-			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
-			this.persistWorker(worker);
-			return;
+		if (!worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
+			if (worker.descriptor.ownerClientId) {
+				worker.descriptor.lifecycle = "failed";
+				worker.descriptor.lastError = "Waiting for the owning client to reconnect";
+				this.persistWorker(worker);
+				return;
+			}
+			if (worker.descriptor.launchEnvDigest !== EMPTY_LAUNCH_ENV_DIGEST) {
+				worker.descriptor.lifecycle = "failed";
+				worker.descriptor.lastError = "Waiting for the trusted launch environment checkpoint";
+				this.persistWorker(worker);
+				return;
+			}
 		}
 		if (worker.recovery) {
 			return worker.recovery;
@@ -5037,7 +5041,9 @@ export class DaemonSupervisor {
 				if (
 					manifest.sessions.some((session) => {
 						if (!expectedLaunchEnvDigest || !/^[a-f0-9]{64}$/.test(expectedLaunchEnvDigest)) return true;
-						const environment = readLaunchEnvironment(session.launchEnv);
+						const environment = Object.hasOwn(session, "launchEnv")
+							? readLaunchEnvironment(session.launchEnv)
+							: {};
 						return environment === undefined || launchEnvironmentDigest(environment) !== expectedLaunchEnvDigest;
 					})
 				) {

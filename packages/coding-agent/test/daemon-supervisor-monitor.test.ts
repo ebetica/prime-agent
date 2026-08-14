@@ -4,9 +4,10 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getDaemonUpdateRestartManifestPath } from "../src/config.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
@@ -1456,6 +1457,68 @@ describe("daemon worker supervisor monitoring", () => {
 		await stopping;
 	});
 
+	it.each([
+		{ name: "missing digest", launchEnvDigest: undefined },
+		{ name: "nonempty digest", launchEnvDigest: testLaunchEnvironmentDigest({ ALPHA: "one" }) },
+	])("fails dead resident recovery with $name and no trusted raw environment", async ({ launchEnvDigest }) => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-untrusted-launch",
+				pid: 999_999,
+				rootActiveSessionId: "active-1",
+				lifecycle: "recovering",
+				...(launchEnvDigest === undefined ? {} : { launchEnvDigest }),
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker,
+		}) as { recoverWorker(target: typeof worker): Promise<void> };
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			await supervisor.recoverWorker(worker);
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect((worker.descriptor as { lastError?: string }).lastError).toContain("trusted launch environment");
+			expect(persistWorker).toHaveBeenCalledOnce();
+		} finally {
+			aliveSpy.mockRestore();
+		}
+	});
+
+	it("preserves the dead client-owned recovery fence with the canonical empty digest", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-owned-empty-launch",
+				pid: 999_999,
+				rootActiveSessionId: "active-1",
+				ownerClientId: "owner",
+				launchEnvDigest: testLaunchEnvironmentDigest({}),
+				lifecycle: "recovering",
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker,
+		}) as { recoverWorker(target: typeof worker): Promise<void> };
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			await supervisor.recoverWorker(worker);
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect((worker.descriptor as { lastError?: string }).lastError).toContain("owning client");
+			expect(persistWorker).toHaveBeenCalledOnce();
+		} finally {
+			aliveSpy.mockRestore();
+		}
+	});
+
 	it("cancels an in-flight recovery after an intentional stop tombstone", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
@@ -2837,6 +2900,57 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it.each([
+		{ name: "omitted", launchEnv: undefined },
+		{ name: "explicit", launchEnv: { ALPHA: "one" } },
+	])("backfills a legacy descriptor from a committed $name launch environment", ({ launchEnv }) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-launch-checkpoint-"));
+		const descriptorDir = join(root, "workers");
+		const agentDir = join(root, "agent");
+		mkdirSync(descriptorDir, { recursive: true });
+		const worker = createExistingLaunchWorker(root, descriptorDir);
+		const sessionFile = join(root, "session.jsonl");
+		const descriptor = Object.assign(worker.descriptor, { sessionFile });
+		writeFileSync(worker.descriptorPath, `${JSON.stringify(descriptor)}\n`);
+		const manifestPath = getDaemonUpdateRestartManifestPath(worker.descriptor.supervisorSocketPath, agentDir);
+		mkdirSync(dirname(manifestPath), { recursive: true });
+		writeFileSync(
+			manifestPath,
+			`${JSON.stringify({
+				formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+				sessions: [
+					{
+						sessionFile,
+						...(launchEnv === undefined ? {} : { launchEnv }),
+					},
+				],
+			})}\n`,
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			descriptorDir,
+			socketPath: worker.descriptor.supervisorSocketPath,
+			defaultSessionConfig: { agentDir },
+			workers: new Map(),
+			log: vi.fn(),
+		}) as {
+			workers: Map<string, { descriptor: { launchEnvDigest?: string }; launchEnv?: Record<string, string> }>;
+			loadWorkerDescriptors(): void;
+		};
+
+		try {
+			supervisor.loadWorkerDescriptors();
+			const loaded = supervisor.workers.get(worker.descriptor.workerId);
+			const expected = launchEnv ?? {};
+			expect(loaded?.launchEnv).toEqual(expected);
+			expect(loaded?.descriptor.launchEnvDigest).toBe(testLaunchEnvironmentDigest(expected));
+			expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8")).launchEnvDigest).toBe(
+				testLaunchEnvironmentDigest(expected),
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("seeds compact attach streaming from the in-flight assistant message", async () => {
 		const assistant = (text: string): AgentMessage => ({
 			role: "assistant",
@@ -3287,6 +3401,13 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_commit_update" }, expect.any(Number));
 	});
 
+	it("accepts an omitted resident launch environment only with the canonical empty digest", async () => {
+		const fixture = updatePrepareFixture(testLaunchEnvironmentDigest({}), [{ activeSessionId: "root" }]);
+
+		await expect(fixture.supervisor.prepareUpdateRestartFenced()).resolves.toBeDefined();
+		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_commit_update" }, expect.any(Number));
+	});
+
 	it("rejects and cancels when a child returns a mismatched launch environment", async () => {
 		const environment = { ALPHA: "one" };
 		const fixture = updatePrepareFixture(testLaunchEnvironmentDigest(environment), [
@@ -3299,9 +3420,19 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 
 	it.each([
+		{ name: "missing digest", digest: undefined },
+		{ name: "nonempty digest", digest: testLaunchEnvironmentDigest({ ALPHA: "one" }) },
+	])("rejects and cancels an omitted environment with $name", async ({ digest }) => {
+		const fixture = updatePrepareFixture(digest, [{ activeSessionId: "root" }]);
+
+		await expect(fixture.supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/untrusted launch environment/);
+		expect(fixture.client.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
+	it.each([
 		{ name: "missing descriptor digest", digest: undefined, launchEnv: { ALPHA: "one" } },
 		{ name: "malformed descriptor digest", digest: "A".repeat(64), launchEnv: { ALPHA: "one" } },
-		{ name: "omitted environment", digest: "0".repeat(64), launchEnv: undefined },
+		{ name: "present undefined environment", digest: testLaunchEnvironmentDigest({}), launchEnv: undefined },
 		{ name: "array environment", digest: "0".repeat(64), launchEnv: ["one"] },
 		{ name: "numeric environment", digest: "0".repeat(64), launchEnv: 1 },
 		{ name: "null environment", digest: "0".repeat(64), launchEnv: null },

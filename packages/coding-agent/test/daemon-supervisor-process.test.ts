@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -331,6 +331,7 @@ describe("daemon supervisor resident workers", () => {
 		await connection.reload({ ifIdle: true, contextDirectories: [contextDir] });
 		expect(await connection.getSystemPrompt()).toContain("resident resource sentinel");
 		const upgraded = readWorkerDescriptor(agentDir);
+		expect(upgraded.launchEnvDigest).toBe(createHash("sha256").update("[]").digest("hex"));
 		expect(upgraded.createCommand.config?.contextDirectories).toEqual([contextDir]);
 		expect(upgraded.pendingResourceReload).toBeUndefined();
 
