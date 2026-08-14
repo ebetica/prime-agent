@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
+import { getDaemonUpdateRestartManifestPath } from "../src/config.js";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
@@ -12,6 +13,7 @@ import {
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
+import type { SessionActionRecoverySnapshot } from "../src/core/agent-session.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
 import {
@@ -9101,37 +9103,117 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
-	it("does not trust caller-supplied restore_actions provenance", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const restoreSessionActions = vi.fn(async () => 1);
-		const state = makeState("active-1");
-		state.runtime = { ...state.runtime, session: { restoreSessionActions } } as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		const snapshot = { formatVersion: 1 as const, actions: [] };
-		await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
-			type: "restore_actions",
-			activeSessionId: state.activeSessionId,
-			snapshot,
-		});
-		expect(restoreSessionActions).toHaveBeenCalledWith(snapshot, false);
+	it("trusts only exact unconsumed private restart manifests across daemon replacement", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-action-origin-recovery-"));
+		try {
+			const socketPath = join(tempDir, "daemon.sock");
+			const daemon = new AgentDaemon(socketPath, {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const restoreSessionActions = vi.fn(async () => 1);
+			const state = makeState("active-1");
+			state.runtime = {
+				...state.runtime,
+				session: { restoreSessionActions, sessionId: "session-1", sessionFile: join(tempDir, "session.jsonl") },
+			} as never;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const snapshot = {
+				formatVersion: 1,
+				actions: [
+					{
+						id: "action-1",
+						source: "external",
+						delivery: "when_run_idle",
+						wake: "external_resume",
+						payload: {
+							kind: "turn",
+							text: "formatted agent prompt",
+							records: [],
+							executionPolicy: {},
+							queueVisible: true,
+							acceptedAgentMessage: true,
+							acceptedBeforeCompletion: false,
+							queuedOrigin: {
+								kind: "agent",
+								source: "agent_message",
+								messageId: "message-1",
+								sender: { sessionId: "sender-1" },
+							},
+						},
+					},
+				],
+			} as unknown as SessionActionRecoverySnapshot;
+			const restore = (id: string, candidate = snapshot) =>
+				internals.handleCommand(makeClient(id, state.activeSessionId), {
+					type: "restore_actions",
+					activeSessionId: state.activeSessionId,
+					snapshot: candidate,
+				});
 
-		const trusted = Reflect.get(daemon, "trustedActionRecoverySnapshots") as WeakMap<ActiveSessionState, string>;
-		trusted.set(state, JSON.stringify(snapshot));
-		await internals.handleCommand(makeClient("client-2", state.activeSessionId), {
-			type: "restore_actions",
-			activeSessionId: state.activeSessionId,
-			snapshot,
-		});
-		expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, true);
+			await restore("public-before-manifest");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, false);
+
+			const manifestPath = getDaemonUpdateRestartManifestPath(socketPath, tempDir);
+			mkdirSync(resolve(manifestPath, ".."), { recursive: true, mode: 0o700 });
+			const manifestText = JSON.stringify({
+				formatVersion: 2,
+				createdAt: new Date().toISOString(),
+				sessions: [
+					{
+						activeSessionId: state.activeSessionId,
+						sessionId: "session-1",
+						sessionFile: join(tempDir, "session.jsonl"),
+						queue: { actions: snapshot },
+					},
+				],
+			});
+			const untrustedManifest = join(tempDir, "caller-manifest.json");
+			writeFileSync(untrustedManifest, manifestText, { mode: 0o600 });
+			symlinkSync(untrustedManifest, manifestPath);
+			await restore("symlink-manifest");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, false);
+			rmSync(manifestPath);
+
+			writeFileSync(manifestPath, manifestText, { mode: 0o644 });
+			await restore("insecure-mode-manifest");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, false);
+			rmSync(manifestPath);
+
+			const predecessor = new AgentDaemon(socketPath, {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			Reflect.get(predecessor, "writeUpdateRestartManifest").call(predecessor, JSON.parse(manifestText));
+			const partial = {
+				...snapshot,
+				actions: [{ id: "partial", payload: { kind: "turn", text: "same" } }],
+			} as unknown as typeof snapshot;
+			await restore("partial-match", partial);
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(partial, false);
+
+			restoreSessionActions.mockRejectedValueOnce(new Error("restore interrupted"));
+			await expect(restore("failed-cross-process")).rejects.toThrow("restore interrupted");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, true);
+
+			await restore("exact-cross-process-retry");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, true);
+
+			await restore("replayed");
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(snapshot, false);
+			await restore("tampered", { ...snapshot, formatVersion: 2 as 1 });
+			expect(restoreSessionActions).toHaveBeenLastCalledWith(expect.objectContaining({ formatVersion: 2 }), false);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it.each(["steer", "follow_up"] as const)("rejects spoofed daemon %s provenance", async (type) => {

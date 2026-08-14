@@ -13,10 +13,14 @@ import {
 	chmodSync,
 	closeSync,
 	existsSync,
+	constants as fsConstants,
+	fstatSync,
 	fsyncSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
@@ -82,6 +86,7 @@ import {
 	type PreparedSessionReload,
 	type PromptOptions,
 	rlmChildLabel,
+	type SessionActionRecoverySnapshot,
 } from "../../core/agent-session.js";
 import {
 	type AgentSessionResourceConfig,
@@ -507,9 +512,6 @@ export class AgentDaemon {
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
 	private readonly remoteAgentPeers = new Map<string, AgentSessionMessageAgentSummary>();
 	private readonly agentMessagePendingReservations = new Map<string, number>();
-	// Exact update-restart snapshots are trusted only while held by this daemon;
-	// public restore_actions callers cannot mint agent provenance.
-	private readonly trustedActionRecoverySnapshots = new WeakMap<ActiveSessionState, string>();
 	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
 	private readonly agentMessageAcceptingTargets = new Set<string>();
 	// Refcount of prompts in preflight (accepted but not yet streaming); >0 makes
@@ -3992,11 +3994,11 @@ export class AgentDaemon {
 
 			case "restore_actions": {
 				const state = this.getSessionState(command.activeSessionId);
-				const expectedSnapshot = this.trustedActionRecoverySnapshots.get(state);
-				const trustQueuedOrigins =
-					expectedSnapshot !== undefined && expectedSnapshot === JSON.stringify(command.snapshot);
-				if (trustQueuedOrigins) this.trustedActionRecoverySnapshots.delete(state);
-				const restored = await state.runtime.session.restoreSessionActions(command.snapshot, trustQueuedOrigins);
+				const trust = this.trustedActionRecovery(state, command.snapshot);
+				const restored = await state.runtime.session.restoreSessionActions(command.snapshot, trust !== undefined);
+				if (trust && restored === command.snapshot.actions.length) {
+					this.consumeTrustedActionRecovery(state.activeSessionId, trust);
+				}
 				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
 				return success(command.id, "restore_actions", { restored });
 			}
@@ -5773,7 +5775,6 @@ export class AgentDaemon {
 			actions: session.getSessionActionRecoverySnapshot(),
 			nextTurn: [...session.getPendingNextTurnMessageSnapshots()],
 		};
-		this.trustedActionRecoverySnapshots.set(state, JSON.stringify(queue.actions));
 		const hasQueuedMessages = queue.actions.actions.length > 0 || queue.nextTurn.length > 0;
 		const wasStreaming = session.isStreaming;
 		const wasCompacting = session.isCompacting;
@@ -5840,6 +5841,151 @@ export class AgentDaemon {
 				hadAcceptedPromptInFlight: restartSession.hadAcceptedPromptInFlight,
 			},
 		);
+	}
+
+	private updateRestartTrustPath(): string {
+		return `${getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir)}.queued-origin-consumed.json`;
+	}
+
+	private readPrivateRestartFile(path: string): string | undefined {
+		let descriptor: number | undefined;
+		try {
+			const directory = dirname(path);
+			const directoryStat = lstatSync(directory);
+			if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return undefined;
+			descriptor = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+			const fileStat = fstatSync(descriptor);
+			if (!fileStat.isFile()) return undefined;
+			if (realpathSync(dirname(realpathSync(path))) !== realpathSync(directory)) return undefined;
+			if (process.getuid) {
+				const uid = process.getuid();
+				if (directoryStat.uid !== uid || fileStat.uid !== uid) return undefined;
+				if ((directoryStat.mode & 0o077) !== 0 || (fileStat.mode & 0o077) !== 0) return undefined;
+			}
+			return readFileSync(descriptor, "utf8");
+		} catch {
+			return undefined;
+		} finally {
+			if (descriptor !== undefined) closeSync(descriptor);
+		}
+	}
+
+	private trustedActionRecovery(
+		state: ActiveSessionState,
+		snapshot: SessionActionRecoverySnapshot,
+	): { manifestDigest: string; snapshotDigest: string } | undefined {
+		const manifestPath = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
+		const rawManifest = this.readPrivateRestartFile(manifestPath);
+		if (rawManifest === undefined) return undefined;
+		let manifest: DaemonUpdateRestartManifest;
+		try {
+			manifest = JSON.parse(rawManifest) as DaemonUpdateRestartManifest;
+		} catch {
+			return undefined;
+		}
+		if (
+			manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION ||
+			typeof manifest.createdAt !== "string" ||
+			!Number.isFinite(Date.parse(manifest.createdAt)) ||
+			!Array.isArray(manifest.sessions)
+		) {
+			return undefined;
+		}
+		const matches = manifest.sessions.filter((candidate) => candidate.activeSessionId === state.activeSessionId);
+		if (matches.length !== 1) return undefined;
+		const expected = matches[0]!;
+		if (
+			expected.sessionId !== state.runtime.session.sessionId ||
+			expected.sessionFile !== state.runtime.session.sessionFile ||
+			expected.queue?.actions === undefined ||
+			JSON.stringify(expected.queue.actions) !== JSON.stringify(snapshot)
+		) {
+			return undefined;
+		}
+		const ids = snapshot.actions.map((action) => action.id);
+		if (ids.some((id) => typeof id !== "string" || id.length === 0) || new Set(ids).size !== ids.length) {
+			return undefined;
+		}
+		const manifestDigest = createHash("sha256")
+			.update(
+				JSON.stringify({
+					formatVersion: manifest.formatVersion,
+					createdAt: manifest.createdAt,
+					sessions: manifest.sessions.map((session) => ({
+						activeSessionId: session.activeSessionId,
+						sessionId: session.sessionId,
+						sessionFile: session.sessionFile,
+						actions: session.queue?.actions,
+					})),
+				}),
+			)
+			.digest("hex");
+		const snapshotDigest = createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+		const receiptPath = this.updateRestartTrustPath();
+		if (existsSync(receiptPath)) {
+			const rawReceipt = this.readPrivateRestartFile(receiptPath);
+			if (rawReceipt === undefined) return undefined;
+			try {
+				const receipt = JSON.parse(rawReceipt) as {
+					formatVersion?: unknown;
+					manifestDigest?: unknown;
+					consumed?: Record<string, unknown>;
+				};
+				if (receipt.formatVersion !== 1 || typeof receipt.manifestDigest !== "string" || !receipt.consumed) {
+					return undefined;
+				}
+				if (
+					receipt.manifestDigest === manifestDigest &&
+					receipt.consumed[state.activeSessionId] === snapshotDigest
+				) {
+					return undefined;
+				}
+			} catch {
+				return undefined;
+			}
+		}
+		return { manifestDigest, snapshotDigest };
+	}
+
+	private consumeTrustedActionRecovery(
+		activeSessionId: string,
+		trust: { manifestDigest: string; snapshotDigest: string },
+	): void {
+		const path = this.updateRestartTrustPath();
+		const directory = dirname(path);
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
+		let consumed: Record<string, string> = {};
+		const existing = this.readPrivateRestartFile(path);
+		if (existing !== undefined) {
+			const parsed = JSON.parse(existing) as {
+				formatVersion?: unknown;
+				manifestDigest?: unknown;
+				consumed?: Record<string, string>;
+			};
+			if (parsed.formatVersion === 1 && parsed.manifestDigest === trust.manifestDigest && parsed.consumed) {
+				consumed = { ...parsed.consumed };
+			}
+		}
+		consumed[activeSessionId] = trust.snapshotDigest;
+		const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+		const descriptor = openSync(tempPath, "wx", 0o600);
+		try {
+			writeSync(
+				descriptor,
+				`${JSON.stringify({ formatVersion: 1, manifestDigest: trust.manifestDigest, consumed })}\n`,
+			);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(tempPath, path);
+		const directoryDescriptor = openSync(directory, "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
 	}
 
 	private writeUpdateRestartManifest(manifest: DaemonUpdateRestartManifest): void {
