@@ -66,8 +66,8 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 adds authenticated, durable planned-restart handoffs.
 // Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 22 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-eb48ac5a9731";
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-5e2238a64cad";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -586,11 +586,23 @@ export type DaemonCommand =
 			type: "send_message";
 			targetActiveSessionId: string;
 			message: string;
+			/** Stable sender-assigned id retained across remote retries. */
+			messageId?: string;
 			fromActiveSessionId?: string;
 			/** Internal worker-origin marker; public clients remain unrestricted. */
 			agentOrigin?: boolean;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
+	| {
+			id?: string;
+			type: "send_idempotent_message";
+			targetActiveSessionId: string;
+			message: string;
+			messageId: string;
+			fromActiveSessionId?: string;
+			agentOrigin?: boolean;
+	  }
+	| { id?: string; type: "acknowledge_message"; activeSessionId: string; messageId: string; senderSessionId: string }
 	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
@@ -775,6 +787,7 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const IDEMPOTENT_AGENT_MESSAGE_COMMAND = { minProtocol: 7, minSchemaRevision: 23 } as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
@@ -844,6 +857,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
+	send_idempotent_message: IDEMPOTENT_AGENT_MESSAGE_COMMAND,
+	acknowledge_message: IDEMPOTENT_AGENT_MESSAGE_COMMAND,
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,

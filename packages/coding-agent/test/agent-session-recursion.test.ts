@@ -819,7 +819,7 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
-	it("delivers an id-addressed send while a completed child's terminal injection is pending", async () => {
+	it("delivers an id-addressed send while a child's terminal injection is pending", async () => {
 		let releaseTerminalInjection: () => void = () => {};
 		const terminalInjectionGate = new Promise<void>((resolve) => {
 			releaseTerminalInjection = resolve;
@@ -859,8 +859,8 @@ describe("AgentSession rlm recursion", () => {
 			promptInjectedMessage;
 		const spawned = await root.runRlmChild("completed task", { name: "completed-worker" });
 		const internals = root as unknown as InspectableRlmSession;
-		await waitFor(() => internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.status === "done");
 		await waitFor(() => promptInjectedMessage.mock.calls.length === 1);
+		expect(internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.status).toBe("running");
 		const send = internals._createKernelHostHandlers()["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 

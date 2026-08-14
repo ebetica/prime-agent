@@ -207,6 +207,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
+	"send_idempotent_message",
+	"acknowledge_message",
 	"agent_messages_status",
 	"agent_messages_pause",
 	"agent_messages_resume",
@@ -2132,7 +2134,7 @@ export class DaemonSupervisor {
 				break;
 		}
 
-		if (command.type === "send_message") {
+		if (command.type === "send_message" || command.type === "send_idempotent_message") {
 			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)

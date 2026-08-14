@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
+	createAgentSessionMessage,
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
@@ -1359,6 +1360,7 @@ describe("daemon mode helpers", () => {
 			sendAgentSessionMessage(options: {
 				targetSelector: string;
 				message: string;
+				messageId?: string;
 				fromState: ActiveSessionState;
 				origin: "agent";
 			}): Promise<unknown>;
@@ -1382,11 +1384,17 @@ describe("daemon mode helpers", () => {
 			internals.sendAgentSessionMessage({
 				targetSelector: remoteSelector,
 				message: "continue remotely",
+				messageId: "agentmsg-stable-remote",
 				fromState: source,
 				origin: "agent",
 			}),
 		).resolves.toEqual(receipt);
-		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, remoteSelector, "continue remotely");
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(
+			source,
+			remoteSelector,
+			"continue remotely",
+			"agentmsg-stable-remote",
+		);
 	});
 
 	it("routes nonresident agent-message targets through the supervisor wake path", async () => {
@@ -1417,6 +1425,7 @@ describe("daemon mode helpers", () => {
 			sendAgentSessionMessage(options: {
 				targetSelector: string;
 				message: string;
+				messageId?: string;
 				fromState: ActiveSessionState;
 				origin: "agent";
 			}): Promise<unknown>;
@@ -1432,7 +1441,7 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("Unknown active session: deleted-child");
-		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue");
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue", undefined);
 	});
 
 	it("rejects invalid nonresident agent messages before remote fallback", async () => {
@@ -1451,6 +1460,7 @@ describe("daemon mode helpers", () => {
 			sendAgentSessionMessage(options: {
 				targetSelector: string;
 				message: string;
+				messageId?: string;
 				fromState: ActiveSessionState;
 				origin: "agent";
 			}): Promise<unknown>;
@@ -1745,6 +1755,81 @@ describe("daemon mode helpers", () => {
 			target: { activeSessionId: targetState.activeSessionId },
 		});
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({ streamingBehavior: "steer" });
+	});
+
+	it("acknowledges a crash-replayed stable id without delivering it twice", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		const existing = createAgentSessionMessage({
+			id: "agentmsg-crash-replay",
+			source: "agent_message",
+			message: "committed before crash",
+			from: { sessionId: "session-source", sessionName: "Source", activeSessionId: fromState.activeSessionId },
+			target: { activeSessionId: targetState.activeSessionId, sessionId: "session-target" },
+		});
+		const acceptAgentMessagePrompt = vi.fn();
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+				findAcceptedAgentMessage: vi.fn(() => ({
+					id: existing.details.id,
+					message: existing.details.message,
+					fromSessionId: existing.details.from?.sessionId,
+					status: "queued",
+					acceptedMessage: existing,
+					needsDelivery: false,
+					senderAcknowledged: false,
+				})),
+				acceptAgentMessagePrompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				messageId?: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "committed before crash",
+				messageId: "agentmsg-crash-replay",
+				fromState,
+				origin: "agent",
+			}),
+		).resolves.toMatchObject({ id: "agentmsg-crash-replay", deliveryStatus: "queued" });
+		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "different payload",
+				messageId: "agentmsg-crash-replay",
+				fromState,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Agent message id collision");
 	});
 
 	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
