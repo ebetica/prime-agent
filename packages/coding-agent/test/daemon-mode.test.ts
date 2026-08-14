@@ -5788,6 +5788,73 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("appends root recovery tool results through the live runtime manager", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-live-root-recovery-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const persistedRoot = SessionManager.open(fixture.parentSessionFile);
+			persistedRoot.appendMessage({
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "interrupted-tool", name: "bash", arguments: { command: "touch side-effect" } },
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "fixture-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			});
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				applyWorkerRecovery(
+					command: Extract<DaemonCommand, { type: "create" }>,
+					root: ActiveSessionState,
+				): Promise<void>;
+			};
+			const root = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			root.runtime.session.admitWorkerRecoveryContinuation = vi.fn();
+			root.runtime.session.resumeQueuedWork = vi.fn();
+
+			await internals.applyWorkerRecovery(
+				{
+					type: "create",
+					workerRecovery: {
+						version: 1,
+						generation: "a".repeat(64),
+						interrupted: [
+							{
+								activeSessionId: root.activeSessionId,
+								sessionFile: fixture.parentSessionFile,
+								operations: ["tool_execution"],
+								terminatedBackgroundProcesses: 0,
+							},
+						],
+					},
+				},
+				root,
+			);
+
+			const liveMessages = root.runtime.session.sessionManager.buildSessionContext().messages;
+			const interruptedResults = liveMessages.filter(
+				(message) => message.role === "toolResult" && message.toolCallId === "interrupted-tool",
+			);
+			expect(interruptedResults).toHaveLength(1);
+			expect(interruptedResults[0]).toMatchObject({ isError: true });
+			expect(root.runtime.session.admitWorkerRecoveryContinuation).toHaveBeenCalledOnce();
+			expect(root.runtime.session.resumeQueuedWork).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects malformed worker recovery facts before mutating transcripts", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-malformed-worker-recovery-"));
 		try {
@@ -8528,6 +8595,92 @@ describe("daemon mode helpers", () => {
 			}),
 		).resolves.toMatchObject({ success: true, data: { maxDepth: 3, globalSaved: true } });
 		expect(setRlmMaxDepth).toHaveBeenCalledWith(3, { global: true });
+	});
+
+	it("atomically sets and toggles automatic parent report mute on a child", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const setAutomaticParentReportsMuted = vi.fn(() => ({ muted: true, revision: 4 }));
+		const toggleAutomaticParentReportsMuted = vi.fn(() => ({ muted: false, revision: 5 }));
+		const state = makeState("child-active") as ActiveSessionState;
+		(state.runtime as { metadata: unknown }).metadata = {
+			kind: "top-level",
+			createdAt: 1,
+			parentActiveSessionId: "parent-active",
+		};
+		(state.runtime as { session: unknown }).session = {
+			setAutomaticParentReportsMuted,
+			toggleAutomaticParentReportsMuted,
+		};
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+
+		await expect(
+			internals.handleCommand(client, {
+				type: "set_automatic_parent_reports_muted",
+				activeSessionId: state.activeSessionId,
+				muted: true,
+			}),
+		).resolves.toMatchObject({ success: true, data: { muted: true, revision: 4 } });
+		await expect(
+			internals.handleCommand(client, {
+				type: "toggle_automatic_parent_reports_muted",
+				activeSessionId: state.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, data: { muted: false, revision: 5 } });
+		expect(setAutomaticParentReportsMuted).toHaveBeenCalledWith(true);
+		expect(toggleAutomaticParentReportsMuted).toHaveBeenCalledOnce();
+
+		(state.runtime as { metadata: unknown }).metadata = { kind: "top-level", createdAt: 1 };
+		await expect(
+			internals.handleCommand(client, {
+				type: "set_automatic_parent_reports_muted",
+				activeSessionId: state.activeSessionId,
+				muted: false,
+			}),
+		).rejects.toThrow("requires a parent session");
+	});
+
+	it("applies automatic parent report mute before a create command succeeds", async () => {
+		const setAutomaticParentReportsMuted = vi.fn(() => ({ muted: true, revision: 1 }));
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async (options) =>
+				({
+					session: Object.assign(makeRuntimeSession(options.sessionManager), {
+						isStreaming: false,
+						unfinishedActionCount: 0,
+						hasRunningRlmChildren: vi.fn(() => false),
+						getSessionActionSnapshot: vi.fn(() => []),
+						state: { pendingToolCalls: new Map(), streamingMessage: undefined },
+						automaticParentReportsMuteState: { muted: true, revision: 1 },
+						setAutomaticParentReportsMuted,
+					}),
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				}) as unknown as Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>,
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+
+		await expect(
+			internals.handleCommand(makeClient("client-1", "parent-active"), {
+				type: "create",
+				automaticParentReportsMuted: true,
+				runtimeMetadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent-active" },
+			}),
+		).resolves.toMatchObject({ success: true });
+		expect(setAutomaticParentReportsMuted).toHaveBeenCalledWith(true);
 	});
 
 	it.each([

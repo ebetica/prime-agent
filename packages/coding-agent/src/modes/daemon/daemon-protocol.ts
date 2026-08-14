@@ -66,8 +66,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 adds authenticated, durable planned-restart handoffs.
 // Revision 21 adds crash-safe completion proof and handoff acknowledgement/cancellation.
 // Revision 22 preserves immutable worker launch environment across planned restarts.
-export const DAEMON_SCHEMA_REVISION = 23;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-5e2238a64cad";
+// Revision 23 adds durable, atomic child-to-parent automatic report mute controls.
+// Revision 24 carries confirmed background-process cleanup counts in worker recovery handoffs.
+// Revision 25 adds durable idempotent agent-message send and acknowledgement commands.
+export const DAEMON_SCHEMA_REVISION = 25;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-005330bf46e2";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -111,7 +114,8 @@ export type DaemonServerCapability =
 	| "atomic_resource_reload"
 	| "queued_action_cancellation"
 	| "planned_restart_handoff"
-	| "planned_restart_handoff_lifecycle";
+	| "planned_restart_handoff_lifecycle"
+	| "automatic_parent_report_mute";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -160,6 +164,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"queued_action_cancellation",
 	"planned_restart_handoff",
 	"planned_restart_handoff_lifecycle",
+	"automatic_parent_report_mute",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -468,12 +473,18 @@ export type DaemonCommand =
 			workerRecovery?: {
 				version: 1;
 				generation: string;
-				interrupted: Array<{ activeSessionId: string; sessionFile: string; operations: string[] }>;
+				interrupted: Array<{
+					activeSessionId: string;
+					sessionFile: string;
+					operations: string[];
+					terminatedBackgroundProcesses: number;
+				}>;
 			};
 			sessionPath?: string;
 			continueRecent?: boolean;
 			noSession?: boolean;
 			name?: string;
+			automaticParentReportsMuted?: boolean;
 			config?: AgentSessionRuntimeConfig;
 			runtimeMetadata?: AgentSessionRuntimeMetadata;
 			lifecycle?: DaemonSessionLifecycle;
@@ -732,6 +743,8 @@ export type DaemonCommand =
 	| { id?: string; type: "export_html"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "export_jsonl"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "set_session_name"; activeSessionId: string; name: string; workerToken?: string }
+	| { id?: string; type: "set_automatic_parent_reports_muted"; activeSessionId: string; muted: boolean }
+	| { id?: string; type: "toggle_automatic_parent_reports_muted"; activeSessionId: string }
 	| { id?: string; type: "get_rlm_max_depth_status"; activeSessionId: string }
 	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
 	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
@@ -787,8 +800,13 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
-const IDEMPOTENT_AGENT_MESSAGE_COMMAND = { minProtocol: 7, minSchemaRevision: 23 } as const;
+const IDEMPOTENT_AGENT_MESSAGE_COMMAND = { minProtocol: 7, minSchemaRevision: 25 } as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
+const AUTOMATIC_PARENT_REPORT_MUTE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 23,
+	capability: "automatic_parent_report_mute",
+} as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
 	capability: "session_input_admission",
@@ -923,6 +941,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	export_html: LEGACY_DAEMON_COMMAND,
 	export_jsonl: LEGACY_DAEMON_COMMAND,
 	set_session_name: LEGACY_DAEMON_COMMAND,
+	set_automatic_parent_reports_muted: AUTOMATIC_PARENT_REPORT_MUTE_COMMAND,
+	toggle_automatic_parent_reports_muted: AUTOMATIC_PARENT_REPORT_MUTE_COMMAND,
 	get_rlm_max_depth_status: RLM_MAX_DEPTH_COMMAND,
 	set_rlm_max_depth: RLM_MAX_DEPTH_COMMAND,
 	rename_saved_session: LEGACY_DAEMON_COMMAND,
@@ -949,6 +969,14 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	const carriesTelemetryPolicy =
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
+	if (command.type === "create") {
+		const requirements: DaemonCommandCompatibility[] = [];
+		if (carriesTelemetryPolicy) requirements.push(TELEMETRY_POLICY_COMMAND);
+		if (command.automaticParentReportsMuted !== undefined) {
+			requirements.push(AUTOMATIC_PARENT_REPORT_MUTE_COMMAND);
+		}
+		return [...requirements, compatibility];
+	}
 	if (carriesTelemetryPolicy) {
 		return [TELEMETRY_POLICY_COMMAND, compatibility];
 	}
@@ -1025,6 +1053,8 @@ export interface DaemonSavedSessionInfo {
 	id: string;
 	cwd: string;
 	name?: string;
+	automaticParentReportsMuted?: boolean;
+	automaticParentReportsMuteRevision?: number;
 	state?: AgentConnectionSavedSessionState;
 	parentSessionPath?: string;
 	rlmDepth?: number;
