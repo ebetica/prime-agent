@@ -1606,6 +1606,63 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.launchWorker).toHaveBeenCalledWith(worker.descriptor.createCommand, worker);
 	});
 
+	it("does not reconcile or launch a replacement when orphan reaping fails", async () => {
+		vi.useFakeTimers();
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				processStartId: string;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle?: string;
+				consecutiveFailures: number;
+				lastError?: string;
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-orphan-reap-failure",
+				pid: process.pid,
+				processStartId: "different-process-start",
+				rootActiveSessionId: "active-1",
+				createCommand: { type: "create" },
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const recoverUncertainWorkerOperations = vi.fn(async () => {
+			throw new Error("orphan reap failed");
+		});
+		const launchWorker = vi.fn(async () => worker);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			connectWorker: vi.fn(),
+			recoverUncertainWorkerOperations,
+			launchWorker,
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => {}),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as unknown as { recoverWorker(worker: RecoveryWorker): Promise<void> };
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.advanceTimersByTimeAsync(10_000);
+		await recovery;
+		vi.useRealTimers();
+
+		expect(recoverUncertainWorkerOperations).toHaveBeenCalled();
+		expect(launchWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("failed");
+		expect(worker.descriptor.lastError).toContain("orphan reap failed");
+	});
+
 	it("does not relaunch a live worker whose process identity is unknown", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {

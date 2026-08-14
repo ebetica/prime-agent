@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ExtensionContext } from "../src/core/extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../src/core/kernel/bootstrap.js";
 import { type ExecuteResult, KernelBusyAfterInterruptError, KernelManager } from "../src/core/kernel/index.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
 import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 let tempDir = "";
@@ -28,6 +29,7 @@ function writeFakePython(opts: { sleepSeconds?: number } = {}): { python: string
 		python,
 		[
 			"#!/bin/sh",
+			'case "$2" in *"os.getpid()"*) exit 125;; esac',
 			`echo run >> "${countFile}"`,
 			...(opts.sleepSeconds ? [`sleep ${opts.sleepSeconds}`] : []),
 			"exit 42",
@@ -74,9 +76,11 @@ function createBusyKernelContext(
 describe("IpythonKernelProvisioner", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-provisioner-"));
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = join(tempDir, "orphans.jsonl");
 	});
 
 	afterEach(() => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";
@@ -339,14 +343,34 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(dill)).toBe(true);
 		expect(existsSync(manifest)).toBe(true);
 	});
+
+	it("propagates verified kill failure after startup succeeded", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir);
+		const failure = new Error("verified reap failed");
+		const manager = {
+			kill: vi.fn(async () => {
+				throw failure;
+			}),
+		} as unknown as KernelManager;
+		Object.assign(provisioner, {
+			managerPromise: Promise.resolve(manager),
+			startedManager: manager,
+		});
+
+		await expect(provisioner.kill()).rejects.toBe(failure);
+		expect(manager.kill).toHaveBeenCalledOnce();
+		expect(provisioner.manager).toBeUndefined();
+	});
 });
 
 describe("KernelManager session cleanup during startup", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-cleanup-"));
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = join(tempDir, "orphans.jsonl");
 	});
 
 	afterEach(() => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";

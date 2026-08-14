@@ -1,4 +1,15 @@
-import { closeSync, fsyncSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
+import {
+	closeSync,
+	fsyncSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import { getProcessStartId } from "./session-lease.js";
 
 export const ORPHAN_PROCESS_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL";
@@ -9,6 +20,7 @@ interface OrphanProcessRecord {
 	ownerPid: number;
 	processStartId?: string;
 	active: boolean;
+	legacy?: boolean;
 	recordedAt: string;
 }
 
@@ -17,30 +29,120 @@ export interface ActiveOrphanProcess {
 	processStartId: string;
 }
 
-export function recordOrphanProcessState(pid: number, active: boolean): void {
-	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
-	if (!path || !Number.isInteger(pid) || pid <= 0) {
-		return;
-	}
-	const processStartId = active ? getProcessStartId(pid) : undefined;
-	const record: OrphanProcessRecord = {
-		version: 1,
-		pid,
-		ownerPid: process.pid,
-		...(processStartId ? { processStartId } : {}),
-		active,
-		recordedAt: new Date().toISOString(),
-	};
-	try {
-		const descriptor = openSync(path, "a", 0o600);
+const COMPACT_BYTES = 64 * 1024;
+
+/** Synchronous APIs serialize appends/compaction within one worker event loop. */
+function compactOrphanJournal(path: string): void {
+	const latest = new Map<string, OrphanProcessRecord>();
+	for (const line of readFileSync(path, "utf8").split("\n")) {
+		if (!line) continue;
 		try {
-			writeSync(descriptor, `${JSON.stringify(record)}\n`);
+			const record = JSON.parse(line) as OrphanProcessRecord;
+			if (record.version !== 1 || !Number.isInteger(record.pid) || !Number.isInteger(record.ownerPid)) continue;
+			const key = record.legacy
+				? `${record.ownerPid}:${record.pid}:legacy`
+				: `${record.ownerPid}:${record.pid}:${record.processStartId ?? "invalid"}`;
+			latest.set(key, record);
+		} catch {
+			// A crash may truncate only the final append.
+		}
+	}
+	const active = [...latest.values()].filter((record) => record.active && (record.legacy || record.processStartId));
+	const temp = `${path}.compact.tmp`;
+	try {
+		unlinkSync(temp);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	let renamed = false;
+	try {
+		const descriptor = openSync(temp, "wx", 0o600);
+		try {
+			const contents = active.map((record) => JSON.stringify(record)).join("\n") + (active.length ? "\n" : "");
+			const written = writeSync(descriptor, contents);
+			if (written !== Buffer.byteLength(contents)) throw new Error("Short write compacting orphan process journal");
 			fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
 		}
+		renameSync(temp, path);
+		renamed = true;
+		const parent = openSync(dirname(path), "r");
+		try {
+			fsyncSync(parent);
+		} finally {
+			closeSync(parent);
+		}
+	} finally {
+		if (!renamed) {
+			try {
+				unlinkSync(temp);
+			} catch {
+				/* no residue */
+			}
+		}
+	}
+}
+
+function appendOrphanRecord(record: OrphanProcessRecord): void {
+	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+	if (!path) throw new Error(`${ORPHAN_PROCESS_JOURNAL_ENV} is not configured`);
+	const descriptor = openSync(path, "a", 0o600);
+	try {
+		const line = `${JSON.stringify(record)}\n`;
+		const written = writeSync(descriptor, line);
+		if (written !== Buffer.byteLength(line)) throw new Error("Short write to orphan process journal");
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+	if (!record.active || statSync(path).size > COMPACT_BYTES) compactOrphanJournal(path);
+}
+
+/** Durably register before admitting contained work; failure is fatal. */
+export function registerOrphanProcessDurably(pid: number): ActiveOrphanProcess {
+	if (!Number.isInteger(pid) || pid <= 0) throw new Error(`Invalid orphan process pid: ${pid}`);
+	const processStartId = getProcessStartId(pid);
+	if (!processStartId) throw new Error(`Could not establish start identity for orphan process ${pid}`);
+	const identity = { pid, processStartId };
+	appendOrphanRecord({
+		version: 1,
+		pid,
+		ownerPid: process.pid,
+		processStartId,
+		active: true,
+		recordedAt: new Date().toISOString(),
+	});
+	return identity;
+}
+
+export function unregisterOrphanProcessDurably(identity: ActiveOrphanProcess): void {
+	appendOrphanRecord({
+		version: 1,
+		pid: identity.pid,
+		ownerPid: process.pid,
+		processStartId: identity.processStartId,
+		active: false,
+		recordedAt: new Date().toISOString(),
+	});
+}
+
+export function recordOrphanProcessState(pid: number, active: boolean): void {
+	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+	if (!path || !Number.isInteger(pid) || pid <= 0) return;
+	try {
+		const processStartId = active ? getProcessStartId(pid) : undefined;
+		appendOrphanRecord({
+			version: 1,
+			pid,
+			ownerPid: process.pid,
+			...(processStartId ? { processStartId } : {}),
+			active,
+			legacy: true,
+			recordedAt: new Date().toISOString(),
+		});
 	} catch {
-		// Process tracking must not make a successfully spawned command fail.
+		// Legacy tracking must not make a successfully spawned command fail.
 	}
 }
 
@@ -54,7 +156,7 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 		}
 		throw error;
 	}
-	const latest = new Map<number, OrphanProcessRecord>();
+	const latest = new Map<string, OrphanProcessRecord>();
 	for (const line of contents.split("\n")) {
 		if (!line) {
 			continue;
@@ -69,7 +171,9 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 				typeof record.active === "boolean" &&
 				typeof record.recordedAt === "string"
 			) {
-				latest.set(record.pid!, record as OrphanProcessRecord);
+				const parsed = record as OrphanProcessRecord;
+				const key = parsed.legacy ? `${parsed.pid}:legacy` : `${parsed.pid}:${parsed.processStartId ?? "legacy"}`;
+				latest.set(key, parsed);
 			}
 		} catch {
 			// A crash can truncate only the final append.

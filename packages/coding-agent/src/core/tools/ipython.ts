@@ -382,12 +382,14 @@ export class IpythonKernelProvisioner {
 			this.options.kernelManagerRef.current = undefined;
 		}
 		if (!pending) return;
+		let manager: KernelManager;
 		try {
-			const m = await pending;
-			await m.dispose();
+			manager = await pending;
 		} catch {
-			// a failed startup already cleaned up after itself
+			// A failed startup already cleaned up after itself.
+			return;
 		}
+		await manager.dispose();
 	}
 
 	async kill(): Promise<void> {
@@ -398,12 +400,14 @@ export class IpythonKernelProvisioner {
 			this.options.kernelManagerRef.current = undefined;
 		}
 		if (!pending) return;
+		let manager: KernelManager;
 		try {
-			const m = await pending;
-			await m.kill();
+			manager = await pending;
 		} catch {
-			// a failed startup already cleaned up after itself
+			// A failed startup already cleaned up after itself.
+			return;
 		}
+		await manager.kill();
 	}
 
 	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelManager> {
@@ -523,10 +527,17 @@ export class IpythonKernelProvisioner {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
 				}
-			} catch (error) {
-				// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.
-				void m.dispose();
-				throw error;
+			} catch (startupError) {
+				// A retry cannot overlap a generation whose verified cleanup has not settled.
+				try {
+					await m.dispose();
+				} catch (cleanupError) {
+					throw new Error(
+						`IPython startup cleanup was not verified: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+						{ cause: startupError },
+					);
+				}
+				throw startupError;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —
 			// a notice claiming restored state must never outlive a failed bootstrap.
