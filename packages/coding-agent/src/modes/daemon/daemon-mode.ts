@@ -3997,7 +3997,7 @@ export class AgentDaemon {
 				const trust = this.trustedActionRecovery(state, command.snapshot);
 				const restored = await state.runtime.session.restoreSessionActions(command.snapshot, trust !== undefined);
 				if (trust && restored === command.snapshot.actions.length) {
-					this.consumeTrustedActionRecovery(state.activeSessionId, trust);
+					this.consumeTrustedActionRecovery(trust);
 				}
 				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
 				return success(command.id, "restore_actions", { restored });
@@ -5873,7 +5873,7 @@ export class AgentDaemon {
 	private trustedActionRecovery(
 		state: ActiveSessionState,
 		snapshot: SessionActionRecoverySnapshot,
-	): { manifestDigest: string; snapshotDigest: string } | undefined {
+	): { manifestDigest: string; snapshotDigest: string; sourceActiveSessionId: string } | undefined {
 		const manifestPath = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
 		const rawManifest = this.readPrivateRestartFile(manifestPath);
 		if (rawManifest === undefined) return undefined;
@@ -5891,12 +5891,16 @@ export class AgentDaemon {
 		) {
 			return undefined;
 		}
-		const matches = manifest.sessions.filter((candidate) => candidate.activeSessionId === state.activeSessionId);
+		const matches = manifest.sessions.filter(
+			(candidate) =>
+				candidate.sessionId === state.runtime.session.sessionId &&
+				candidate.sessionFile === state.runtime.session.sessionFile,
+		);
 		if (matches.length !== 1) return undefined;
 		const expected = matches[0]!;
 		if (
-			expected.sessionId !== state.runtime.session.sessionId ||
-			expected.sessionFile !== state.runtime.session.sessionFile ||
+			typeof expected.activeSessionId !== "string" ||
+			expected.activeSessionId.length === 0 ||
 			expected.queue?.actions === undefined ||
 			JSON.stringify(expected.queue.actions) !== JSON.stringify(snapshot)
 		) {
@@ -5936,7 +5940,7 @@ export class AgentDaemon {
 				}
 				if (
 					receipt.manifestDigest === manifestDigest &&
-					receipt.consumed[state.activeSessionId] === snapshotDigest
+					receipt.consumed[expected.activeSessionId] === snapshotDigest
 				) {
 					return undefined;
 				}
@@ -5944,13 +5948,14 @@ export class AgentDaemon {
 				return undefined;
 			}
 		}
-		return { manifestDigest, snapshotDigest };
+		return { manifestDigest, snapshotDigest, sourceActiveSessionId: expected.activeSessionId };
 	}
 
-	private consumeTrustedActionRecovery(
-		activeSessionId: string,
-		trust: { manifestDigest: string; snapshotDigest: string },
-	): void {
+	private consumeTrustedActionRecovery(trust: {
+		manifestDigest: string;
+		snapshotDigest: string;
+		sourceActiveSessionId: string;
+	}): void {
 		const path = this.updateRestartTrustPath();
 		const directory = dirname(path);
 		mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -5967,7 +5972,7 @@ export class AgentDaemon {
 				consumed = { ...parsed.consumed };
 			}
 		}
-		consumed[activeSessionId] = trust.snapshotDigest;
+		consumed[trust.sourceActiveSessionId] = trust.snapshotDigest;
 		const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 		const descriptor = openSync(tempPath, "wx", 0o600);
 		try {

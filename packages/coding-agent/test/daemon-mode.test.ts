@@ -9167,7 +9167,7 @@ describe("daemon mode helpers", () => {
 				createdAt: new Date().toISOString(),
 				sessions: [
 					{
-						activeSessionId: state.activeSessionId,
+						activeSessionId: "predecessor-active-1",
 						sessionId: "session-1",
 						sessionFile: join(tempDir, "session.jsonl"),
 						queue: { actions: snapshot },
