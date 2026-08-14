@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { OwnedOperationPersistence } from "./owned-operation-registry.js";
@@ -87,10 +86,12 @@ class AmbiguousDurableCommitError extends Error {
 async function writeDurable(path: string, state: JournalState): Promise<void> {
 	const directory = dirname(path);
 	await mkdir(directory, { recursive: true, mode: 0o700 });
-	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	// A fixed sibling bounds crash residue to one file; this journal has one
+	// session-lease owner and serializes writes within that owner.
+	const temporary = `${path}.tmp`;
 	let renamed = false;
 	try {
-		const file = await open(temporary, "wx", 0o600);
+		const file = await open(temporary, "w", 0o600);
 		try {
 			await file.writeFile(`${JSON.stringify(state)}\n`, "utf8");
 			await file.sync();
