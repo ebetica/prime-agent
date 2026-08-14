@@ -116,6 +116,14 @@ describe("daemon protocol helpers", () => {
 		};
 		expect(DAEMON_COMMAND_COMPATIBILITY.set_automatic_parent_reports_muted).toEqual(compatibility);
 		expect(DAEMON_COMMAND_COMPATIBILITY.toggle_automatic_parent_reports_muted).toEqual(compatibility);
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "create",
+				automaticParentReportsMuted: true,
+				runtimeMetadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent-active" },
+			}),
+		).toContainEqual(compatibility);
+		expect(getDaemonCommandCompatibilities({ type: "create" })).toEqual([{ minProtocol: 7 }]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("automatic_parent_report_mute");
 	});
 

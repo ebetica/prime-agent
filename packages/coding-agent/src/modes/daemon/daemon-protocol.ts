@@ -950,6 +950,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if (carriesTelemetryPolicy) {
 		return [TELEMETRY_POLICY_COMMAND, compatibility];
 	}
+	if (command.type === "create" && command.automaticParentReportsMuted !== undefined) {
+		return [AUTOMATIC_PARENT_REPORT_MUTE_COMMAND, compatibility];
+	}
 	if (command.type === "prepare_update_restart" && command.handoffRequestId !== undefined) {
 		return [PLANNED_RESTART_HANDOFF_COMMAND, compatibility];
 	}

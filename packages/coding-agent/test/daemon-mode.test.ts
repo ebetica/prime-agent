@@ -8497,6 +8497,40 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow("requires a parent session");
 	});
 
+	it("applies automatic parent report mute before a create command succeeds", async () => {
+		const setAutomaticParentReportsMuted = vi.fn(() => ({ muted: true, revision: 1 }));
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async (options) =>
+				({
+					session: Object.assign(makeRuntimeSession(options.sessionManager), {
+						isStreaming: false,
+						unfinishedActionCount: 0,
+						hasRunningRlmChildren: vi.fn(() => false),
+						getSessionActionSnapshot: vi.fn(() => []),
+						state: { pendingToolCalls: new Map(), streamingMessage: undefined },
+						automaticParentReportsMuteState: { muted: true, revision: 1 },
+						setAutomaticParentReportsMuted,
+					}),
+					extensionsResult: { extensions: [], errors: [], runtime: {} },
+					services: { cwd: options.cwd, agentDir: options.agentDir },
+					diagnostics: [],
+				}) as unknown as Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>,
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+
+		await expect(
+			internals.handleCommand(makeClient("client-1", "parent-active"), {
+				type: "create",
+				automaticParentReportsMuted: true,
+				runtimeMetadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent-active" },
+			}),
+		).resolves.toMatchObject({ success: true });
+		expect(setAutomaticParentReportsMuted).toHaveBeenCalledWith(true);
+	});
+
 	it.each([
 		{
 			name: "defers busy heartbeat cron jobs instead of queueing a follow-up",
