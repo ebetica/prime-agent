@@ -437,7 +437,7 @@ function withoutCommandId(command: DaemonCommand): DaemonCommandBody {
 }
 
 function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCreateCommand {
-	const { launchEnv: _launchEnv, lifecycle: _lifecycle, ...workerCommand } = command;
+	const { launchEnv: _launchEnv, lifecycle: _lifecycle, workerRecovery: _workerRecovery, ...workerCommand } = command;
 	return workerCommand;
 }
 

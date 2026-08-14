@@ -1349,9 +1349,10 @@ export class AgentDaemon {
 				owned = cursor === rootPath;
 			}
 			if (!owned) throw new Error("Worker recovery target is outside its owned root");
-			const target = SessionManager.open(sessionFile);
+			const target =
+				sessionFile === rootPath ? root.runtime.session.sessionManager : SessionManager.open(sessionFile);
 			appendInterruptedToolResults(target);
-			await reconcileInterruptedRlmChild(sessionFile);
+			await reconcileInterruptedRlmChild(sessionFile, root.runtime.session.sessionManager);
 			for (const activity of workerRecoveryActivities(item.operations)) activities.add(activity);
 			if (sessionFile !== rootPath) activities.add("child agent");
 		}

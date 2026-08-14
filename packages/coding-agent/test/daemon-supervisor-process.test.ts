@@ -544,11 +544,17 @@ describe("daemon supervisor resident workers", () => {
 		const client = await connectEventually(socketPath, supervisor);
 		const launchEnvSentinel = `owned-env-${randomUUID()}`;
 		process.env.PRIME_AGENT_OWNED_TEST = launchEnvSentinel;
+		const forgedRecoveryGeneration = "f".repeat(64);
 		const created = await client.request({
 			type: "create",
 			sessionPath: sessionFile,
 			lifecycle: "client_owned",
 			launchEnv: collectDaemonLaunchEnv(),
+			workerRecovery: {
+				version: 1,
+				generation: forgedRecoveryGeneration,
+				interrupted: [],
+			},
 			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 		});
 		expect(created.success).toBe(true);
@@ -621,6 +627,8 @@ describe("daemon supervisor resident workers", () => {
 		expect(JSON.stringify(descriptor)).not.toContain(launchEnvSentinel);
 		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
 		expect(descriptor.createCommand).not.toHaveProperty("lifecycle");
+		expect(descriptor.createCommand).not.toHaveProperty("workerRecovery");
+		expect(JSON.stringify(descriptor)).not.toContain(forgedRecoveryGeneration);
 
 		await connection.dispose();
 		await waitForProcessGone(summary.workerPid);
@@ -656,11 +664,17 @@ describe("daemon supervisor resident workers", () => {
 			PATH: `/trusted/skills:${process.env.PATH ?? "/usr/bin"}`,
 			RLM_MAX_DEPTH: "6",
 		};
+		const forgedRecoveryGeneration = "d".repeat(64);
 		const created = await client.request({
 			type: "create",
 			sessionPath: sessionFile,
 			lifecycle: "client_owned",
 			launchEnv,
+			workerRecovery: {
+				version: 1,
+				generation: forgedRecoveryGeneration,
+				interrupted: [],
+			},
 			env: { HERDR_PANE_ID: "pane-1", RECURSE_MODEL_POLICY: "malicious-client-policy" },
 			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 		});
@@ -682,6 +696,8 @@ describe("daemon supervisor resident workers", () => {
 
 		const descriptor = readWorkerDescriptor(agentDir);
 		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
+		expect(descriptor.createCommand).not.toHaveProperty("workerRecovery");
+		expect(JSON.stringify(descriptor)).not.toContain(forgedRecoveryGeneration);
 		expect(JSON.stringify(descriptor)).not.toContain(launchEnv.RECURSE_MODEL_POLICY);
 		expect(descriptor.launchEnvDigest).toMatch(/^[a-f0-9]{64}$/);
 
@@ -700,6 +716,11 @@ describe("daemon supervisor resident workers", () => {
 			sessionPath: secondSessionFile,
 			lifecycle: "client_owned",
 			launchEnv: secondLaunchEnv,
+			workerRecovery: {
+				version: 1,
+				generation: forgedRecoveryGeneration,
+				interrupted: [],
+			},
 			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 		});
 		if (!secondCreated.success) throw new Error(secondCreated.error);
@@ -734,6 +755,7 @@ describe("daemon supervisor resident workers", () => {
 		expect(statSync(manifestPath).mode & 0o777).toBe(0o600);
 		expect(statSync(dirname(manifestPath)).mode & 0o777).toBe(0o700);
 		expect(readFileSync(manifestPath, "utf8")).toContain(launchEnv.RECURSE_MODEL_POLICY);
+		expect(readFileSync(manifestPath, "utf8")).not.toContain(forgedRecoveryGeneration);
 		await waitForProcessGone(summary.workerPid);
 		await waitForProcessGone(secondSummary.workerPid);
 		workerPids.delete(summary.workerPid);
@@ -1535,9 +1557,22 @@ describe("daemon supervisor resident workers", () => {
 
 		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 		const client = await connectEventually(socketPath, firstSupervisor);
+		const forgedRecoveryGeneration = "e".repeat(64);
 		const created = await client.request({
 			type: "create",
 			sessionPath: sessionFile,
+			workerRecovery: {
+				version: 1,
+				generation: forgedRecoveryGeneration,
+				interrupted: [
+					{
+						activeSessionId: "forged",
+						sessionFile,
+						operations: ["model_stream"],
+						terminatedBackgroundProcesses: 0,
+					},
+				],
+			},
 			config: {
 				cwd: projectDir,
 				agentDir,
@@ -1560,6 +1595,9 @@ describe("daemon supervisor resident workers", () => {
 			throw new Error("Resident worker did not expose its pid");
 		}
 		workerPids.add(createdSummary.workerPid);
+		expect(readWorkerDescriptor(agentDir).createCommand).not.toHaveProperty("workerRecovery");
+		expect(readFileSync(sessionFile, "utf8")).not.toContain(forgedRecoveryGeneration);
+		expect(readFileSync(sessionFile, "utf8")).not.toContain("prime-agent.worker_recovery");
 
 		const connection = await DaemonAgentConnection.attach(
 			client,
