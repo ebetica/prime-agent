@@ -167,6 +167,5 @@ export async function terminateActiveOrphanProcesses(
 	if (hasLiveIdentity()) {
 		throw new Error("Tracked worker background processes did not terminate within the cleanup deadline");
 	}
-	clearOrphanProcessJournal(path);
 	return journaled.length;
 }

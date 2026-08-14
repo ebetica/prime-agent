@@ -46,7 +46,7 @@ describe("orphan process journal", () => {
 		expect(existsSync(path)).toBe(false);
 	});
 
-	it("clears only after the exact tracked identity is confirmed gone", async () => {
+	it("retains the cleanup receipt after the exact tracked identity is confirmed gone", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-test-"));
 		tempDirs.push(directory);
 		const path = join(directory, "orphans.jsonl");
@@ -64,7 +64,7 @@ describe("orphan process journal", () => {
 			}),
 		).resolves.toBe(1);
 		expect(signaled).toEqual([process.pid]);
-		expect(existsSync(path)).toBe(false);
+		expect(existsSync(path)).toBe(true);
 	});
 
 	it("keeps the confirmed-gone count stable across a recovery retry", async () => {
@@ -81,7 +81,7 @@ describe("orphan process journal", () => {
 				},
 			}),
 		).resolves.toBe(1);
-		expect(existsSync(path)).toBe(false);
+		expect(existsSync(path)).toBe(true);
 	});
 
 	it("retains cleanup facts when a tracked identity remains alive", async () => {

@@ -1671,6 +1671,7 @@ describe("daemon supervisor resident workers", () => {
 		}
 		workerPids.add(recovered.workerPid);
 		expect(readFileSync(sessionFile, "utf8")).toContain("prime-agent.worker_recovery");
+		expect(readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid)).toEqual([]);
 		await expect(connection.getState()).resolves.toMatchObject({ sessionId: createdSummary.sessionId });
 
 		await connection.dispose();

@@ -45,7 +45,11 @@ import {
 	migrateLegacyCronJobsToSessionArtifacts,
 	SESSION_SCHEDULED_JOBS_FILENAME,
 } from "../../core/cron-jobs.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV, terminateActiveOrphanProcesses } from "../../core/orphan-process-journal.js";
+import {
+	clearOrphanProcessJournal,
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	terminateActiveOrphanProcesses,
+} from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import {
 	canEvictWorker,
@@ -2681,10 +2685,15 @@ export class DaemonSupervisor {
 			await this.assertRecoveryAllowed();
 			if (worker.pendingRecovery) {
 				if (worker.descriptor.createCommand.workerRecovery) {
+					// Keep cleanup facts until the replacement worker has durably accepted its
+					// idempotent recovery action. If the supervisor crashes before this point,
+					// the same generation and confirmed-gone count are reconstructed.
+					if (worker.descriptor.orphanProcessJournalPath) {
+						clearOrphanProcessJournal(worker.descriptor.orphanProcessJournalPath);
+					}
 					const { workerRecovery: _recovery, ...acknowledgedCreateCommand } = worker.descriptor.createCommand;
 					worker.descriptor.createCommand = acknowledgedCreateCommand;
-					// Persist the no-replay boundary before acknowledging journal facts. A crash
-					// before this point safely retries idempotently; after it cannot replay them.
+					// Persist the no-replay boundary before acknowledging recovery-journal facts.
 					this.persistWorker(worker);
 				}
 				const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
