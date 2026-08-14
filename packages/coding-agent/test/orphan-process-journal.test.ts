@@ -56,7 +56,7 @@ describe("orphan process journal", () => {
 		const signaled: number[] = [];
 		await expect(
 			terminateActiveOrphanProcesses(path, process.pid, {
-				isCurrent: () => current,
+				identityStatus: () => (current ? "current" : "gone"),
 				signal: (pid) => {
 					signaled.push(pid);
 					current = false;
@@ -75,11 +75,28 @@ describe("orphan process journal", () => {
 		recordOrphanProcessState(process.pid, true);
 		await expect(
 			terminateActiveOrphanProcesses(path, process.pid, {
-				isCurrent: () => true,
+				identityStatus: () => "current",
 				signal: () => {},
 				timeoutMs: 0,
 			}),
 		).rejects.toThrow("did not terminate");
+		expect(existsSync(path)).toBe(true);
+	});
+
+	it("retains cleanup facts when process identity is temporarily unobservable", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-unknown-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		recordOrphanProcessState(process.pid, true);
+		await expect(
+			terminateActiveOrphanProcesses(path, process.pid, {
+				identityStatus: () => "unknown",
+				signal: () => {
+					throw new Error("must not signal an unverified identity");
+				},
+			}),
+		).rejects.toThrow("could not be verified");
 		expect(existsSync(path)).toBe(true);
 	});
 });

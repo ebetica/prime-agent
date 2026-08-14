@@ -1306,13 +1306,15 @@ export class AgentDaemon {
 			recovery.version !== 1 ||
 			!/^[0-9a-f]{64}$/.test(recovery.generation) ||
 			!Array.isArray(recovery.interrupted) ||
+			recovery.interrupted.length === 0 ||
 			recovery.interrupted.length > 256
 		)
 			throw new Error("Unsupported or malformed worker recovery payload");
 		const rootFile = root.runtime.session.sessionFile;
 		if (!rootFile) throw new Error("Worker recovery requires a persisted root session");
 		const rootPath = resolve(rootFile);
-		let rootRecoveryDetails: WorkerRecoveryDetails | undefined;
+		const activities = new Set<WorkerRecoveryActivity>();
+		let terminatedBackgroundProcesses: number | undefined;
 		for (const item of recovery.interrupted) {
 			if (
 				typeof item.activeSessionId !== "string" ||
@@ -1328,10 +1330,13 @@ export class AgentDaemon {
 				) ||
 				!Number.isSafeInteger(item.terminatedBackgroundProcesses) ||
 				item.terminatedBackgroundProcesses < 0 ||
-				item.terminatedBackgroundProcesses > 256
+				item.terminatedBackgroundProcesses > 256 ||
+				(terminatedBackgroundProcesses !== undefined &&
+					terminatedBackgroundProcesses !== item.terminatedBackgroundProcesses)
 			) {
 				throw new Error("Malformed worker recovery target");
 			}
+			terminatedBackgroundProcesses = item.terminatedBackgroundProcesses;
 			const sessionFile = resolve(item.sessionFile);
 			let cursor = sessionFile;
 			let owned = cursor === rootPath;
@@ -1345,36 +1350,35 @@ export class AgentDaemon {
 			const target = SessionManager.open(sessionFile);
 			appendInterruptedToolResults(target);
 			await reconcileInterruptedRlmChild(sessionFile);
-			const details = {
-				generation: recovery.generation,
-				actionId: `worker-recovery:${recovery.generation}`,
-				source: "internal" as const,
-				activities: workerRecoveryActivities(item.operations),
-				terminatedBackgroundProcesses: item.terminatedBackgroundProcesses,
-			};
-			const exists = target
-				.getEntries()
-				.some(
-					(entry) =>
-						entry.type === "custom_message" &&
-						(entry.customType === WORKER_RECOVERY_INTENT_CUSTOM_TYPE ||
-							entry.customType === "prime-agent.worker_recovery") &&
-						(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
-				);
-			if (!exists) {
-				target.appendCustomMessageEntryWithRollback(
-					WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
-					"Worker recovery continuation pending",
-					false,
-					details,
-				);
-			}
-			if (sessionFile === rootPath) rootRecoveryDetails = details;
+			for (const activity of workerRecoveryActivities(item.operations)) activities.add(activity);
+			if (sessionFile !== rootPath) activities.add("child agent");
 		}
-		if (rootRecoveryDetails) {
-			root.runtime.session.admitWorkerRecoveryContinuation(rootRecoveryDetails);
-			root.runtime.session.resumeQueuedWork();
+		const details: WorkerRecoveryDetails = {
+			generation: recovery.generation,
+			actionId: `worker-recovery:${recovery.generation}`,
+			source: "internal",
+			activities: [...activities],
+			terminatedBackgroundProcesses: terminatedBackgroundProcesses ?? 0,
+		};
+		const exists = root.runtime.session.sessionManager
+			.getEntries()
+			.some(
+				(entry) =>
+					entry.type === "custom_message" &&
+					(entry.customType === WORKER_RECOVERY_INTENT_CUSTOM_TYPE ||
+						entry.customType === "prime-agent.worker_recovery") &&
+					(entry.details as { generation?: unknown } | undefined)?.generation === recovery.generation,
+			);
+		if (!exists) {
+			root.runtime.session.sessionManager.appendCustomMessageEntryWithRollback(
+				WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
+				"Worker recovery continuation pending",
+				false,
+				details,
+			);
 		}
+		root.runtime.session.admitWorkerRecoveryContinuation(details);
+		root.runtime.session.resumeQueuedWork();
 	}
 
 	private async createRuntime(

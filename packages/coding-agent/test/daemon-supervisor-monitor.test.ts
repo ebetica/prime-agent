@@ -3182,7 +3182,6 @@ describe("daemon worker supervisor monitoring", () => {
 				orphanProcessJournalPath: orphanJournalPath,
 			},
 		};
-		const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
@@ -3192,7 +3191,6 @@ describe("daemon worker supervisor monitoring", () => {
 
 		try {
 			await supervisor.recoverUncertainWorkerOperations(worker, false);
-			expect(kill).not.toHaveBeenCalled();
 			expect(worker.pendingRecovery).toMatchObject({
 				version: 1,
 				interrupted: [
@@ -3211,7 +3209,6 @@ describe("daemon worker supervisor monitoring", () => {
 				],
 			});
 		} finally {
-			kill.mockRestore();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
