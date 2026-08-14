@@ -24,8 +24,18 @@ export interface OwnedOperationHooks {
 }
 
 export interface OwnedOperationPersistence {
-	writeStopIntent(record: { token: string; ownerId: string; operationIds: readonly string[] }): Promise<void>;
-	writeStopped(record: { token: string; ownerId: string; operationIds: readonly string[] }): Promise<void>;
+	writeStopIntent(record: {
+		token: string;
+		ownerId: string;
+		operationIds: readonly string[];
+		kernelRestarted: boolean;
+	}): Promise<void>;
+	writeStopped(record: {
+		token: string;
+		ownerId: string;
+		operationIds: readonly string[];
+		kernelRestarted: boolean;
+	}): Promise<void>;
 }
 
 export type StopOwnedOperationResult =
@@ -53,6 +63,7 @@ interface TerminalReceipt {
 
 export interface OwnedOperationRegistryOptions {
 	persistence?: OwnedOperationPersistence;
+	terminalReceipts?: readonly { token: string; kernelRestarted: boolean; recordedAt: string }[];
 	maxTerminalReceipts?: number;
 	terminalReceiptTtlMs?: number;
 	now?: () => number;
@@ -71,6 +82,13 @@ export class OwnedOperationRegistry {
 		this.maxTerminalReceipts = options.maxTerminalReceipts ?? 128;
 		this.terminalReceiptTtlMs = options.terminalReceiptTtlMs ?? 24 * 60 * 60 * 1000;
 		this.now = options.now ?? Date.now;
+		for (const receipt of options.terminalReceipts ?? []) {
+			this.terminal.set(receipt.token, {
+				completion: Promise.resolve({ status: "stopped", kernelRestarted: receipt.kernelRestarted }),
+				createdAt: Date.parse(receipt.recordedAt),
+			});
+		}
+		this.pruneTerminal();
 	}
 
 	admitRoot(kind: Exclude<OwnedOperationKind, "subprocess">, hooks: OwnedOperationHooks): OwnedOperationDescriptor {
@@ -139,11 +157,11 @@ export class OwnedOperationRegistry {
 		const operationIds = Object.freeze(records.map((record) => record.id));
 		const kernelRestarted = records.some((record) => record.kind === "kernel_cell");
 		const completion = (async (): Promise<StopOwnedOperationResult> => {
-			await this.persistence?.writeStopIntent({ token, ownerId: root.ownerId, operationIds });
+			await this.persistence?.writeStopIntent({ token, ownerId: root.ownerId, operationIds, kernelRestarted });
 			await Promise.all(records.map((record) => record.hooks.interrupt()));
 			await Promise.all(records.map((record) => record.hooks.settled));
 			await Promise.all(records.map((record) => record.hooks.cleanup?.()));
-			await this.persistence?.writeStopped({ token, ownerId: root.ownerId, operationIds });
+			await this.persistence?.writeStopped({ token, ownerId: root.ownerId, operationIds, kernelRestarted });
 			if (this.root === root) this.root = undefined;
 			return { status: "stopped", kernelRestarted };
 		})();
