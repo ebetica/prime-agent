@@ -329,6 +329,8 @@ function applyShellSettingsToBashMagicCell(
 export class IpythonKernelProvisioner {
 	private managerPromise?: Promise<KernelManager>;
 	private startedManager?: KernelManager;
+	/** A generation whose cleanup failed remains the admission fence until a verified retry succeeds. */
+	private failedCleanupManager?: KernelManager;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
@@ -375,39 +377,36 @@ export class IpythonKernelProvisioner {
 		// in-flight startKernel before it spawns, so a disposed session's boot
 		// doesn't waste a slot during a fan-out.
 		this.disposeController.abort();
-		const pending = this.managerPromise;
-		this.managerPromise = undefined;
-		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
-		}
-		if (!pending) return;
-		let manager: KernelManager;
-		try {
-			manager = await pending;
-		} catch {
-			// A failed startup already cleaned up after itself.
-			return;
-		}
-		await manager.dispose();
+		await this.terminateKernel("dispose");
 	}
 
 	async kill(): Promise<void> {
+		await this.terminateKernel("kill");
+	}
+
+	private async terminateKernel(method: "dispose" | "kill"): Promise<void> {
 		const pending = this.managerPromise;
-		this.managerPromise = undefined;
-		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
+		let manager = this.failedCleanupManager;
+		if (!manager && pending) {
+			try {
+				manager = await pending;
+			} catch {
+				manager = this.failedCleanupManager;
+				// Ordinary startup failures already completed verified cleanup.
+				if (!manager) return;
+			}
+		}
+		if (!manager) return;
+
+		// Do not publish an empty slot until verified teardown succeeds. A rejection
+		// preserves the manager and cached startup failure as the generation fence.
+		await manager[method]();
+		if (this.managerPromise === pending) this.managerPromise = undefined;
+		if (this.startedManager === manager) this.startedManager = undefined;
+		if (this.failedCleanupManager === manager) this.failedCleanupManager = undefined;
+		if (this.options?.kernelManagerRef?.current === manager) {
 			this.options.kernelManagerRef.current = undefined;
 		}
-		if (!pending) return;
-		let manager: KernelManager;
-		try {
-			manager = await pending;
-		} catch {
-			// A failed startup already cleaned up after itself.
-			return;
-		}
-		await manager.kill();
 	}
 
 	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelManager> {
@@ -438,9 +437,9 @@ export class IpythonKernelProvisioner {
 					this.settleStartup();
 				},
 				() => {
-					// Clear the memo so the next ensure() retries instead of
-					// rethrowing a cached rejection forever.
-					if (this.managerPromise === startup) {
+					// Retry only after startup completed verified cleanup. An unverified
+					// generation retains this rejected memo as an admission fence.
+					if (this.managerPromise === startup && !this.failedCleanupManager) {
 						this.managerPromise = undefined;
 					}
 					this.settleStartup();
@@ -532,6 +531,7 @@ export class IpythonKernelProvisioner {
 				try {
 					await m.dispose();
 				} catch (cleanupError) {
+					this.failedCleanupManager = m;
 					throw new Error(
 						`IPython startup cleanup was not verified: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
 						{ cause: startupError },

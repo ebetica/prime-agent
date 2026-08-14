@@ -79,7 +79,7 @@ describe("KernelManager startup", () => {
 		}
 	}, 10_000);
 
-	it("falls back after verified cleanup when the durable journal is unavailable", async () => {
+	it("fails closed when durable containment registration is unavailable", async () => {
 		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		const configuredJournal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
@@ -88,13 +88,10 @@ describe("KernelManager startup", () => {
 				if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 				else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
 				const manager = new KernelManager({ python: "python3", cwd: tempDir });
-				try {
-					const result = await manager.execute("print('fallback')");
-					expect(result.stdout.trim()).toBe("fallback");
-					expect(manager.containedGenerationId).toBeUndefined();
-				} finally {
-					await manager.kill();
-				}
+				await expect(manager.execute("print('must not launch')")).rejects.toThrow(
+					"Durable containment monitor registration failed",
+				);
+				expect(manager.containedGenerationId).toBeUndefined();
 			}
 		} finally {
 			if (configuredJournal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -128,6 +125,24 @@ describe("KernelManager startup", () => {
 			await manager.kill();
 		}
 	}, 20_000);
+
+	it("retains a contained operation after verified reap rejects", async () => {
+		const manager = new KernelManager({ cwd: tempDir });
+		const failure = new Error("receipt timeout");
+		const killAndWaitVerified = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce({
+			generationId: "generation",
+			exitCode: null,
+			signal: "SIGKILL",
+		});
+		const operation = { killAndWaitVerified } as unknown as PidNamespaceOperation;
+		Object.assign(manager, { kernelOperation: operation });
+
+		await expect(manager.kill()).rejects.toBe(failure);
+		expect((manager as unknown as { kernelOperation?: PidNamespaceOperation }).kernelOperation).toBe(operation);
+		await expect(manager.kill()).resolves.toBeUndefined();
+		expect(killAndWaitVerified).toHaveBeenCalledTimes(2);
+		expect((manager as unknown as { kernelOperation?: PidNamespaceOperation }).kernelOperation).toBeUndefined();
+	});
 
 	it("does not start a replacement when verified shutdown rejects", async () => {
 		const manager = new KernelManager({ cwd: tempDir });

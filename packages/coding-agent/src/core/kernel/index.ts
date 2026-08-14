@@ -636,9 +636,7 @@ export class KernelManager {
 		let operation: PidNamespaceOperation | undefined;
 		try {
 			const launchContained = this.options.containmentLauncher ?? launchPidNamespaceOperation;
-			operation = await launchContained(python, kernelArgs, spawnOptions, this.options.sessionId, {
-				initCommand: python,
-			});
+			operation = await launchContained(python, kernelArgs, spawnOptions, this.options.sessionId);
 			this.kernelGenerationId = operation.generationId;
 			this.kernelStderr += operation.stderrTail;
 		} catch (error) {
@@ -689,12 +687,28 @@ export class KernelManager {
 				this.kernelStderr += s;
 			});
 
+			const finalizeExitedKernel = () => {
+				this.state = "shutdown";
+				liveKernels.delete(this);
+				if (!operation) {
+					this.cleanupResources();
+					return;
+				}
+				// Preserve the operation identity until its durable unregister and all
+				// inherited transports settle. A rejection remains fenced for Stop/retry.
+				void operation.waitForReapAndTransportClose().then(
+					() => {
+						if (this.kernelOperation === operation) this.cleanupResources();
+					},
+					(error) =>
+						this.appendKernelDiagnostic(`contained exit cleanup was not verified: ${errorMessage(error)}`),
+				);
+			};
+
 			kernel.on("error", (err) => {
 				if (this.kernel !== kernel) return;
 				this.appendKernelDiagnostic(`spawn error: ${err.message}`);
-				this.state = "shutdown";
-				liveKernels.delete(this);
-				this.cleanupResources();
+				finalizeExitedKernel();
 			});
 
 			kernel.on("exit", (code, signal) => {
@@ -702,9 +716,7 @@ export class KernelManager {
 				if (this.state !== "shutdown") {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
 				}
-				this.state = "shutdown";
-				liveKernels.delete(this);
-				this.cleanupResources();
+				finalizeExitedKernel();
 			});
 		}
 
@@ -1346,6 +1358,7 @@ export class KernelManager {
 		} catch {
 			// Kernel already exited.
 		}
+		this.kernelOperation = undefined;
 		this.kernel = undefined;
 		this.kernelPid = undefined;
 		this.connection = undefined;
@@ -1384,11 +1397,8 @@ export class KernelManager {
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
 			const containedOperation = this.kernelOperation;
-			try {
-				if (containedOperation) await containedOperation.killAndWaitVerified();
-			} finally {
-				this.cleanupResources();
-			}
+			if (containedOperation) await containedOperation.killAndWaitVerified();
+			this.cleanupResources();
 			return;
 		}
 		// Best-effort final flush (bounded) before teardown — used by signal handlers
@@ -1412,11 +1422,8 @@ export class KernelManager {
 			);
 		}
 
-		try {
-			if (containedOperation) await containedOperation.killAndWaitVerified();
-		} finally {
-			this.cleanupResources();
-		}
+		if (containedOperation) await containedOperation.killAndWaitVerified();
+		this.cleanupResources();
 	}
 
 	async restart(): Promise<void> {
@@ -1441,11 +1448,8 @@ export class KernelManager {
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		const containedOperation = this.kernelOperation;
-		try {
-			if (containedOperation) await containedOperation.killAndWaitVerified();
-		} finally {
-			this.cleanupResources("SIGKILL");
-		}
+		if (containedOperation) await containedOperation.killAndWaitVerified();
+		this.cleanupResources("SIGKILL");
 	}
 
 	/**

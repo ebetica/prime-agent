@@ -457,7 +457,8 @@ export async function runOwnedSessionWorkerFrontend(
 		detachRpcInput?.();
 		detachRpcOutput?.();
 		rmSync(recoveryDescriptorPath, { force: true });
-		clearOrphanProcessJournal(orphanProcessJournalPath);
+		// The per-worker reap path clears only after every journaled identity is
+		// authoritatively gone. Preserve facts here when verification rejected.
 	}
 }
 

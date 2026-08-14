@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,8 +11,11 @@ import {
 	recordOrphanProcessState,
 	registerOrphanProcessDurably,
 	terminateActiveOrphanProcesses,
+	terminateOrphanProcessIdentity,
 	unregisterOrphanProcessDurably,
 } from "../src/core/orphan-process-journal.js";
+import { getProcessStartId } from "../src/core/session-lease.js";
+import { processIdExists } from "../src/utils/child-process.js";
 
 const tempDirs: string[] = [];
 const originalJournalPath = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -84,6 +88,25 @@ describe("orphan process journal", () => {
 			}),
 		).resolves.toBe(1);
 		expect(existsSync(path)).toBe(true);
+	});
+
+	it("binds recovery signals to the recorded pidfd identity", async () => {
+		if (process.platform !== "linux") return;
+		const child = spawn("/bin/sleep", ["60"]);
+		if (!child.pid) throw new Error("sleep did not expose a pid");
+		try {
+			await terminateOrphanProcessIdentity({ pid: child.pid, processStartId: "proc:not-the-child" });
+			expect(processIdExists(child.pid)).toBe(true);
+			const processStartId = getProcessStartId(child.pid);
+			if (!processStartId) throw new Error("sleep identity unavailable");
+			await terminateOrphanProcessIdentity({ pid: child.pid, processStartId });
+			if (child.exitCode === null && child.signalCode === null) {
+				await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			}
+			expect(processIdExists(child.pid)).toBe(false);
+		} finally {
+			if (processIdExists(child.pid)) child.kill("SIGKILL");
+		}
 	});
 
 	it("retains cleanup facts when a tracked identity remains alive", async () => {

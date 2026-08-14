@@ -45,6 +45,25 @@ if (process.env.PRIME_AGENT_INTERNAL_OWNED_WORKER === "1") {
 				process.exit(0);
 			}
 			if (process.env.PRIME_AGENT_TEST_CRASH_ON_COMMAND === command.type) {
+				if (process.env.PRIME_AGENT_TEST_POISON_ORPHAN_JOURNAL === "1") {
+					const journal = process.env.PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL;
+					if (journal) {
+						const recordedAt = new Date().toISOString();
+						writeFileSync(
+							journal,
+							`${Array.from({ length: 257 }, (_, index) =>
+								JSON.stringify({
+									version: 1,
+									pid: 10000 + index,
+									ownerPid: process.pid,
+									processStartId: `fixture-${index}`,
+									active: true,
+									recordedAt,
+								}),
+							).join("\n")}\n`,
+						);
+					}
+				}
 				process.exit(1);
 			}
 			if (command.type === "ack_result") {

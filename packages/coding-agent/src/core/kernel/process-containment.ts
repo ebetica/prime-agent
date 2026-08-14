@@ -5,6 +5,8 @@
  */
 import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { accessSync, constants, realpathSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import {
@@ -16,11 +18,13 @@ import {
 const UNSHARE_ARGS = ["--user", "--map-current-user", "--pid", "--fork", "--kill-child=SIGKILL", "--"] as const;
 const HANDSHAKE_TIMEOUT_MS = 3000;
 const REAP_TIMEOUT_MS = 5000;
+const CONTAINED_KERNEL_ENV = "PRIME_AGENT_INTERNAL_CONTAINED_KERNEL_ENV";
 const NAMESPACE_INIT = `
-import os, signal, subprocess, sys
+import json, os, signal, subprocess, sys
 if os.getpid() != 1:
     sys.exit(125)
-kernel = subprocess.Popen(sys.argv[1:])
+kernel_env = json.loads(os.environ.pop("PRIME_AGENT_INTERNAL_CONTAINED_KERNEL_ENV"))
+kernel = subprocess.Popen(sys.argv[1:], env=kernel_env)
 
 def forward(signum, _frame):
     if kernel.poll() is None:
@@ -74,6 +78,38 @@ export interface ContainmentLaunchOptions {
 	handshakeTimeoutMs?: number;
 	reapTimeoutMs?: number;
 	initCommand?: string;
+}
+
+function executableRealpath(path: string): string | undefined {
+	try {
+		accessSync(path, constants.X_OK);
+		return realpathSync(path);
+	} catch {
+		return undefined;
+	}
+}
+
+function trustedSystemExecutable(name: "unshare" | "python3"): string {
+	for (const directory of ["/usr/bin", "/bin"]) {
+		const resolved = executableRealpath(join(directory, name));
+		if (resolved) return resolved;
+	}
+	throw new ContainmentUnavailableError(`Trusted system ${name} executable is unavailable`);
+}
+
+function trustedInitExecutable(command: string | undefined): string {
+	if (!command) return trustedSystemExecutable("python3");
+	if (isAbsolute(command)) {
+		const resolved = executableRealpath(command);
+		if (resolved) return resolved;
+		throw new ContainmentUnavailableError("Configured namespace init executable is unavailable");
+	}
+	for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+		if (!directory || !isAbsolute(directory)) continue;
+		const resolved = executableRealpath(join(directory, command));
+		if (resolved) return resolved;
+	}
+	throw new ContainmentUnavailableError("Configured namespace init executable is not on the trusted host PATH");
 }
 
 interface RegisteredOperation {
@@ -326,11 +362,18 @@ export async function launchPidNamespaceOperation(
 	const generationId = randomUUID();
 	if (process.platform !== "linux") throw new ContainmentUnavailableError("PID namespace containment requires Linux");
 	const spawnProcess: ContainmentSpawn = launchOptions.spawn ?? spawn;
-	const monitor = spawnProcess(
-		"unshare",
-		[...UNSHARE_ARGS, launchOptions.initCommand ?? "python3", "-c", NAMESPACE_INIT, command, ...args],
-		{ ...options, stdio: ["ignore", "pipe", "pipe", "pipe"] },
-	);
+	const unshare = trustedSystemExecutable("unshare");
+	const init = trustedInitExecutable(launchOptions.initCommand);
+	const targetEnvironment = options.env ?? process.env;
+	const initEnvironment = {
+		...process.env,
+		[CONTAINED_KERNEL_ENV]: JSON.stringify(targetEnvironment),
+	};
+	const monitor = spawnProcess(unshare, [...UNSHARE_ARGS, init, "-c", NAMESPACE_INIT, command, ...args], {
+		...options,
+		env: initEnvironment,
+		stdio: ["ignore", "pipe", "pipe", "pipe"],
+	});
 	const reapTimeoutMs = launchOptions.reapTimeoutMs ?? REAP_TIMEOUT_MS;
 	if (!monitor.pid) {
 		try {
@@ -354,8 +397,9 @@ export async function launchPidNamespaceOperation(
 			reapTimeoutMs,
 			`Unregistered containment monitor ${generationId} did not reap`,
 		);
-		throw new ContainmentUnavailableError(
-			`Durable containment monitor journal unavailable: ${error instanceof Error ? error.message : String(error)}`,
+		throw new Error(
+			`Durable containment monitor registration failed: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
 		);
 	}
 	try {

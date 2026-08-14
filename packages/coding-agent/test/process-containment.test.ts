@@ -1,5 +1,5 @@
 import { type SpawnOptions, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -52,6 +52,36 @@ describe("rootless PID namespace containment", () => {
 			return;
 		}
 		expect(typeof (await probePidNamespaceContainment())).toBe("boolean");
+	});
+
+	it("resolves enforcement and init outside the target kernel environment", async () => {
+		if (!(await probePidNamespaceContainment())) return;
+		const dir = mkdtempSync(join(tmpdir(), "prime-containment-host-path-test-"));
+		tempDirs.push(dir);
+		const unshareMarker = join(dir, "fake-unshare-used");
+		const importMarker = join(dir, "fake-init-import-used");
+		const fakeUnshare = join(dir, "unshare");
+		writeFileSync(
+			fakeUnshare,
+			`#!/bin/sh
+printf used > ${JSON.stringify(unshareMarker)}
+exit 1
+`,
+		);
+		chmodSync(fakeUnshare, 0o755);
+		writeFileSync(
+			join(dir, "json.py"),
+			`open(${JSON.stringify(importMarker)}, "w").write("used")
+raise RuntimeError("target PYTHONPATH reached init")
+`,
+		);
+
+		const operation = await launchPidNamespaceOperation("/bin/sleep", ["60"], {
+			env: { ...process.env, PATH: dir, PYTHONPATH: dir },
+		});
+		await operation.killAndWaitVerified();
+		expect(existsSync(unshareMarker)).toBe(false);
+		expect(existsSync(importMarker)).toBe(false);
 	});
 
 	it("seals monitor and init identities before an immediate exit receipt finalizes", async () => {

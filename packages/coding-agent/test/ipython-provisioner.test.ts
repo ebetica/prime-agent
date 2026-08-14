@@ -344,22 +344,40 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(manifest)).toBe(true);
 	});
 
-	it("propagates verified kill failure after startup succeeded", async () => {
+	it("keeps a failed verified kill fenced until a cleanup retry succeeds", async () => {
 		const provisioner = new IpythonKernelProvisioner(tempDir);
 		const failure = new Error("verified reap failed");
-		const manager = {
-			kill: vi.fn(async () => {
-				throw failure;
-			}),
-		} as unknown as KernelManager;
+		const kill = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined);
+		const manager = { kill, isRunning: true } as unknown as KernelManager;
 		Object.assign(provisioner, {
 			managerPromise: Promise.resolve(manager),
 			startedManager: manager,
 		});
 
 		await expect(provisioner.kill()).rejects.toBe(failure);
-		expect(manager.kill).toHaveBeenCalledOnce();
+		expect(await provisioner.ensure()).toBe(manager);
+		expect(provisioner.manager).toBe(manager);
+		await expect(provisioner.kill()).resolves.toBeUndefined();
+		expect(kill).toHaveBeenCalledTimes(2);
 		expect(provisioner.manager).toBeUndefined();
+	});
+
+	it("does not admit a replacement after startup cleanup is unverified", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir);
+		const failure = new Error("startup cleanup was not verified");
+		const failed = Promise.reject<KernelManager>(failure);
+		void failed.catch(() => {});
+		const failedManager = { kill: vi.fn(async () => {}) } as unknown as KernelManager;
+		Object.assign(provisioner, {
+			managerPromise: failed,
+			failedCleanupManager: failedManager,
+		});
+
+		await expect(provisioner.ensure()).rejects.toBe(failure);
+		await expect(provisioner.ensure()).rejects.toBe(failure);
+		expect((provisioner as unknown as { managerPromise?: Promise<KernelManager> }).managerPromise).toBe(failed);
+		await provisioner.kill();
+		expect(failedManager.kill).toHaveBeenCalledOnce();
 	});
 });
 

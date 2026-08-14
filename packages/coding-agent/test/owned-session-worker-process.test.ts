@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -270,6 +270,28 @@ describe("owned session worker processes", () => {
 				error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
 			})}\n`,
 		);
+		await waitForProcessGone(workerPid);
+	});
+
+	it("preserves orphan recovery facts when frontend reaping rejects", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-orphan-failure-"));
+		tempDirs.push(root);
+		const pidPath = join(root, "worker.pid");
+		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+			TMPDIR: root,
+			PRIME_AGENT_TEST_CRASH_ON_COMMAND: "get_state",
+			PRIME_AGENT_TEST_POISON_ORPHAN_JOURNAL: "1",
+		});
+		frontend.stdin?.end(`${JSON.stringify({ id: "request-1", type: "get_state" })}
+`);
+		const workerPid = await waitForWorkerPid(pidPath);
+		const exit = await waitForExit(frontend);
+		children.delete(frontend);
+
+		expect(exit.code).not.toBe(0);
+		const journalName = readdirSync(root).find((name) => name.endsWith(".orphans.jsonl"));
+		expect(journalName).toBeDefined();
+		expect(readFileSync(join(root, journalName!), "utf8").trim().split("\n")).toHaveLength(257);
 		await waitForProcessGone(workerPid);
 	});
 

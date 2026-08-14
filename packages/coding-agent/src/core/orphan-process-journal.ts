@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import {
 	closeSync,
 	fsyncSync,
@@ -213,8 +214,63 @@ export interface TerminateActiveOrphanProcessOptions {
 	timeoutMs?: number;
 	pollMs?: number;
 	identityStatus?: (orphan: ActiveOrphanProcess) => OrphanProcessIdentityStatus;
-	signal?: (pid: number) => void;
+	signal?: (pid: number) => void | Promise<void>;
 	delay?: (milliseconds: number) => Promise<void>;
+}
+
+const PIDFD_KILL_SCRIPT = `
+import os, signal, sys
+pid = int(sys.argv[1])
+expected = sys.argv[2]
+def start_id():
+    try:
+        stat = open("/proc/%d/stat" % pid).read()
+        fields = stat[stat.rfind(")") + 2:].split(" ")
+        return "proc:" + fields[19]
+    except (OSError, IndexError):
+        return None
+if start_id() != expected:
+    sys.exit(3)
+try:
+    fd = os.pidfd_open(pid)
+except ProcessLookupError:
+    sys.exit(0)
+try:
+    if start_id() != expected:
+        sys.exit(3)
+    try:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+finally:
+    os.close(fd)
+`;
+
+export async function terminateOrphanProcessIdentity(orphan: ActiveOrphanProcess): Promise<void> {
+	if (process.platform !== "linux") {
+		throw new Error("Identity-bound orphan termination requires Linux pidfd support");
+	}
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn("/usr/bin/python3", ["-c", PIDFD_KILL_SCRIPT, String(orphan.pid), orphan.processStartId], {
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr = `${stderr}${chunk.toString()}`.slice(-4096);
+		});
+		child.once("error", (error) =>
+			reject(new Error(`Could not start identity-bound orphan termination: ${error.message}`)),
+		);
+		child.once("exit", (code, signalName) => {
+			// 3 means the numeric PID no longer names the recorded identity. The
+			// identity-aware poll below authoritatively classifies that state.
+			if (code === 0 || code === 3) resolve();
+			else
+				reject(
+					new Error(`Identity-bound orphan termination failed (code=${code}, signal=${signalName}): ${stderr}`),
+				);
+		});
+	});
 }
 
 /** Kill only journaled PID/start-id identities and clear the journal only after
@@ -238,21 +294,10 @@ export async function terminateActiveOrphanProcesses(
 		}
 		if (status === "current") active.push(orphan);
 	}
-	const signal =
-		options.signal ??
-		((pid: number) => {
-			try {
-				process.kill(-pid, "SIGKILL");
-			} catch {
-				try {
-					process.kill(pid, "SIGKILL");
-				} catch {
-					// The identity-aware polling below decides whether cleanup succeeded;
-					// signaling is best-effort so an already-exited PID is not an error.
-				}
-			}
-		});
-	for (const orphan of active) signal(orphan.pid);
+	for (const orphan of active) {
+		if (options.signal) await options.signal(orphan.pid);
+		else await terminateOrphanProcessIdentity(orphan);
+	}
 	const timeoutMs = options.timeoutMs ?? 5_000;
 	const pollMs = options.pollMs ?? 25;
 	const delay =
