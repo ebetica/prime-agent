@@ -947,11 +947,16 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	const carriesTelemetryPolicy =
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
+	if (command.type === "create") {
+		const requirements: DaemonCommandCompatibility[] = [];
+		if (carriesTelemetryPolicy) requirements.push(TELEMETRY_POLICY_COMMAND);
+		if (command.automaticParentReportsMuted !== undefined) {
+			requirements.push(AUTOMATIC_PARENT_REPORT_MUTE_COMMAND);
+		}
+		return [...requirements, compatibility];
+	}
 	if (carriesTelemetryPolicy) {
 		return [TELEMETRY_POLICY_COMMAND, compatibility];
-	}
-	if (command.type === "create" && command.automaticParentReportsMuted !== undefined) {
-		return [AUTOMATIC_PARENT_REPORT_MUTE_COMMAND, compatibility];
 	}
 	if (command.type === "prepare_update_restart" && command.handoffRequestId !== undefined) {
 		return [PLANNED_RESTART_HANDOFF_COMMAND, compatibility];
