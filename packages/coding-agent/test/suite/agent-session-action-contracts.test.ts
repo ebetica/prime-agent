@@ -115,6 +115,28 @@ describe("AgentSession action contracts", () => {
 		expect(extensionCommandRuns).toBe(0);
 	});
 
+	it("keeps accepted agent messages non-withdrawable when queueIfBusy races with pending work", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+		await harness.session.followUp("operator work");
+		withStreaming(harness, false);
+
+		await harness.session.acceptAgentMessagePrompt("accepted agent message", {
+			queueIfBusy: true,
+			streamingBehavior: "followUp",
+		});
+
+		expect(harness.session.getFollowUpMessages()).toEqual(["operator work", "accepted agent message"]);
+		expect(harness.session.getQueuedUserActions().map((action) => action.text)).toEqual(["operator work"]);
+		const acceptedAction = harness.session
+			.getSessionActionRecoverySnapshot()
+			.actions.find((action) => action.payload.text === "accepted agent message");
+		expect(acceptedAction).toBeDefined();
+		expect(await harness.session.withdrawQueuedUserActions([acceptedAction!.id])).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toContain("accepted agent message");
+	});
+
 	it("projects only trusted operator provenance across both normalized queue lanes", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

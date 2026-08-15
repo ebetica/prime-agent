@@ -4661,6 +4661,7 @@ export class AgentSession {
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		await this._prompt(text, {
 			...options,
+			source: "internal",
 			expandPromptTemplates: false,
 			skipInputHandlers: true,
 			skipPrePromptWork: true,
