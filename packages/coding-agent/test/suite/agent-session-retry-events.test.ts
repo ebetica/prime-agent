@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "./harness.js";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -205,6 +205,40 @@ describe("AgentSession retry and event characterization", () => {
 		await prompt;
 		expect(harness.faux.state.callCount).toBe(1);
 		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "already_stopped" });
+	});
+
+	it("cancels an owned retry continuation timer before stopped returns", async () => {
+		const realSetTimeout = globalThis.setTimeout;
+		const delayedZeroTimers = vi
+			.spyOn(globalThis, "setTimeout")
+			.mockImplementation(((callback: Parameters<typeof setTimeout>[0], delay?: number) =>
+				realSetTimeout(callback, delay === 0 ? 100 : delay)) as typeof setTimeout);
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not run"),
+		]);
+		try {
+			const prompt = harness.session.prompt("retry timer");
+			const internals = harness.session as unknown as {
+				_retryContinuationTimer?: ReturnType<typeof setTimeout>;
+			};
+			const deadline = Date.now() + 2_000;
+			while (internals._retryContinuationTimer === undefined) {
+				if (Date.now() >= deadline) throw new Error("retry continuation timer was not scheduled");
+				await new Promise<void>((resolve) => realSetTimeout(resolve, 1));
+			}
+			const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+			expect(token).toBeDefined();
+			expect(await harness.session.stopActiveOperations(token!)).toEqual({ status: "stopped" });
+			expect(internals._retryContinuationTimer).toBeUndefined();
+			await prompt;
+			await new Promise<void>((resolve) => realSetTimeout(resolve, 150));
+			expect(harness.faux.state.callCount).toBe(1);
+		} finally {
+			delayedZeroTimers.mockRestore();
+		}
 	});
 
 	it("preserves the root token into the automatic retry continuation", async () => {

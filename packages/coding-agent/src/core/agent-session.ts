@@ -1218,6 +1218,7 @@ export class AgentSession {
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
+	private _retryContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
@@ -11310,8 +11311,10 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
-		// Retry via continue() - use setTimeout to break out of event handler chain
-		setTimeout(() => {
+		// Retry via continue() - use setTimeout to break out of event handler chain.
+		// The owned handle lets exact Stop close the post-backoff/pre-dispatch gap.
+		this._retryContinuationTimer = setTimeout(() => {
+			this._retryContinuationTimer = undefined;
 			this.agent.continue().catch(() => {
 				// Retry failed - will be caught by next agent_end
 			});
@@ -11324,6 +11327,10 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
+		if (this._retryContinuationTimer !== undefined) {
+			clearTimeout(this._retryContinuationTimer);
+			this._retryContinuationTimer = undefined;
+		}
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
 			return;
