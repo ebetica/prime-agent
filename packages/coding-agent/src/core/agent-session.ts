@@ -576,8 +576,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Coalesce follow-up queueing so only one pending follow-up exists for this key. */
 	followUpQueueKey?: string;
-	/** Source of input for extension input event handlers. Defaults to "interactive". */
-	source?: InputSource;
+	/** Source of input for extension input event handlers and queued-action provenance. Defaults to "interactive". */
+	source?: InputSource | "internal";
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean, queued?: boolean) => void;
 	/** Queue instead of starting immediately when the session is idle but already has queued work. */
@@ -4661,6 +4661,7 @@ export class AgentSession {
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		await this._prompt(text, {
 			...options,
+			source: "internal",
 			expandPromptTemplates: false,
 			skipInputHandlers: true,
 			skipPrePromptWork: true,
@@ -4796,7 +4797,9 @@ export class AgentSession {
 					parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
 					extensionCommands: expandPromptTemplates ? "execute" : "ignore",
 					inputSource:
-						!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
+						!isInternalPrompt && !options?.skipInputHandlers && options?.source !== "internal"
+							? (options?.source ?? "interactive")
+							: undefined,
 					expandSkills: expandPromptTemplates,
 					expandPromptTemplates,
 				});
@@ -5034,6 +5037,7 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			source?: InputSource | "internal";
 		} = {},
 	): Promise<void> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5050,6 +5054,7 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			source: options.source ?? "interactive",
 		});
 	}
 
@@ -5067,6 +5072,7 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
+			source?: InputSource | "internal";
 		} = {},
 	): Promise<boolean> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5083,6 +5089,7 @@ export class AgentSession {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
+			source: options.source ?? "interactive",
 		});
 	}
 
@@ -5407,6 +5414,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		schedule: SessionInputSchedule,
 		agentMessageId: string | undefined,
+		source: InputSource | "internal",
 	): boolean | undefined {
 		if (!isSessionSlashCommandMessage(customMessage) || text !== customMessage.details.command.text) {
 			return undefined;
@@ -5414,20 +5422,24 @@ export class AgentSession {
 		return this._admitSessionInput(
 			this._createSessionCommandAction(text, customMessage.details.command, images, schedule, {
 				agentMessageId,
-				source: "internal",
+				source,
 			}),
 			{ restore: true },
 		).accepted;
 	}
 
-	private _restorePromptInput(schedule: SessionInputSchedule, snapshot: RestoredPromptInput): Promise<boolean> {
+	private _restorePromptInput(
+		schedule: SessionInputSchedule,
+		snapshot: RestoredPromptInput,
+		source: InputSource | "internal",
+	): Promise<boolean> {
 		return this._queuePreparedPrompt(schedule, snapshot.text, snapshot.images, {
 			queueKey: snapshot.queueKey,
 			agentMessageId: snapshot.agentMessageId,
 			content: snapshot.content,
 			message: snapshot.customMessage,
 			prefixMessages: snapshot.prefixMessages,
-			source: "internal",
+			source,
 		});
 	}
 
@@ -5440,22 +5452,34 @@ export class AgentSession {
 			content?: (TextContent | ImageContent)[];
 			customMessage?: CustomMessage;
 			prefixMessages?: CustomMessage[];
+			source?: InputSource | "internal";
 		} = {},
 	): Promise<void> {
 		if (
-			this._restoreSessionCommand(text, options.customMessage, images, "steer", options.agentMessageId) !== undefined
+			this._restoreSessionCommand(
+				text,
+				options.customMessage,
+				images,
+				"steer",
+				options.agentMessageId,
+				options.source ?? "internal",
+			) !== undefined
 		)
 			return;
 
-		await this._restorePromptInput("steer", {
-			text,
-			images,
-			queueKey: options.queueKey,
-			agentMessageId: options.agentMessageId,
-			content: options.content,
-			customMessage: options.customMessage,
-			prefixMessages: options.prefixMessages,
-		});
+		await this._restorePromptInput(
+			"steer",
+			{
+				text,
+				images,
+				queueKey: options.queueKey,
+				agentMessageId: options.agentMessageId,
+				content: options.content,
+				customMessage: options.customMessage,
+				prefixMessages: options.prefixMessages,
+			},
+			options.source ?? "internal",
+		);
 	}
 
 	async restoreFollowUpMessage(
@@ -5467,6 +5491,7 @@ export class AgentSession {
 			content?: (TextContent | ImageContent)[];
 			customMessage?: CustomMessage;
 			prefixMessages?: CustomMessage[];
+			source?: InputSource | "internal";
 		} = {},
 	): Promise<boolean> {
 		const restoredCommand = this._restoreSessionCommand(
@@ -5475,18 +5500,23 @@ export class AgentSession {
 			images,
 			"followUp",
 			options.agentMessageId,
+			options.source ?? "internal",
 		);
 		if (restoredCommand !== undefined) return restoredCommand;
 
-		return this._restorePromptInput("followUp", {
-			text,
-			images,
-			queueKey: options.queueKey,
-			agentMessageId: options.agentMessageId,
-			content: options.content,
-			customMessage: options.customMessage,
-			prefixMessages: options.prefixMessages,
-		});
+		return this._restorePromptInput(
+			"followUp",
+			{
+				text,
+				images,
+				queueKey: options.queueKey,
+				agentMessageId: options.agentMessageId,
+				content: options.content,
+				customMessage: options.customMessage,
+				prefixMessages: options.prefixMessages,
+			},
+			options.source ?? "internal",
+		);
 	}
 
 	private _buildPromptContent(text: string, images?: ImageContent[]): (TextContent | ImageContent)[] {

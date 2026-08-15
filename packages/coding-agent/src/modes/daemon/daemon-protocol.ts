@@ -151,6 +151,12 @@ export const QUEUED_ACTION_CANCELLATION_COMMAND_TYPES = [
 	"cancel_queued_action",
 ] as const satisfies readonly DaemonCommand["type"][];
 
+export const QUEUED_ACTION_WITHDRAWAL_COMMAND_TYPES = [
+	"withdraw_queued_actions",
+] as const satisfies readonly DaemonCommand["type"][];
+
+export const EXACT_STOP_COMMAND_TYPES = ["stop_active_operations"] as const satisfies readonly DaemonCommand["type"][];
+
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"delete_rlm_subagent",

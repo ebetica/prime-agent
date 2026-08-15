@@ -394,20 +394,48 @@ describe("daemon supervisor resident workers", () => {
 		});
 
 		await startBlockingBash(client, activeSessionId, join(root, "queue-blocker.ready"));
+		await connection.steer("steer");
 		await connection.followUp("same");
 		await connection.followUp("same");
 		await connection.followUp("last");
+		const restoredSteer = await client.request({
+			type: "steer",
+			activeSessionId,
+			message: "restored steer",
+			expandPromptTemplates: false,
+		});
+		expect(restoredSteer.success).toBe(true);
+		const restoredFollowUp = await client.request({
+			type: "follow_up",
+			activeSessionId,
+			message: "restored follow-up",
+			expandPromptTemplates: false,
+		});
+		expect(restoredFollowUp.success).toBe(true);
 
 		const initial = await connection.getQueuedUserActions();
-		expect(initial.map((action) => action.text)).toEqual(["same", "same", "last"]);
-		expect(new Set(initial.map((action) => action.id)).size).toBe(3);
+		expect(initial.map(({ text, delivery }) => ({ text, delivery }))).toEqual([
+			{ text: "steer", delivery: "steering" },
+			{ text: "restored steer", delivery: "steering" },
+			{ text: "same", delivery: "followUp" },
+			{ text: "same", delivery: "followUp" },
+			{ text: "last", delivery: "followUp" },
+			{ text: "restored follow-up", delivery: "followUp" },
+		]);
+		expect(new Set(initial.map((action) => action.id)).size).toBe(initial.length);
 		expect(await connection.getQueuedUserActions()).toEqual(initial);
-		expect(await connection.cancelQueuedAction(initial[1]!.id)).toBe(true);
-		expect(await connection.cancelQueuedAction(initial[1]!.id)).toBe(false);
+		expect(await connection.cancelQueuedAction(initial[3]!.id)).toBe(true);
+		expect(await connection.cancelQueuedAction(initial[3]!.id)).toBe(false);
 		expect(await connection.cancelQueuedAction("missing-action")).toBe(false);
-		expect(await connection.getQueuedUserActions()).toEqual([initial[0], initial[2]]);
+		const withdrawn = await connection.withdrawQueuedActions([initial[2]!.id, initial[1]!.id]);
+		expect(withdrawn).toEqual([initial[1], initial[2]]);
+		expect(await connection.withdrawQueuedActions([initial[1]!.id])).toEqual([]);
+		expect(await connection.getQueuedUserActions()).toEqual([initial[0], initial[4], initial[5]]);
 
-		await client.request({ type: "abort_bash", activeSessionId });
+		const operationSetToken = (await connection.getState()).sessionActions.activeOperationSet?.token;
+		expect(operationSetToken).toBeDefined();
+		expect(await connection.stopActiveOperations(operationSetToken!)).toEqual({ status: "stopped" });
+		expect(await connection.stopActiveOperations(operationSetToken!)).toEqual({ status: "already_stopped" });
 		await connection.dispose();
 		await client.request({ type: "shutdown" });
 		client.close();

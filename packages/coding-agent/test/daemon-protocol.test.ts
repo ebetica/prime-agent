@@ -17,10 +17,12 @@ import {
 	DAEMON_SCHEMA_REVISION,
 	type DaemonCommand,
 	type DaemonOutbound,
+	EXACT_STOP_COMMAND_TYPES,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
+	QUEUED_ACTION_WITHDRAWAL_COMMAND_TYPES,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 
@@ -239,6 +241,20 @@ describe("daemon protocol helpers", () => {
 			});
 		}
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queued_action_cancellation");
+		expect(QUEUED_ACTION_WITHDRAWAL_COMMAND_TYPES).toEqual(["withdraw_queued_actions"]);
+		expect(DAEMON_COMMAND_COMPATIBILITY.withdraw_queued_actions).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 26,
+			capability: "queued_withdrawal_v2",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queued_withdrawal_v2");
+		expect(EXACT_STOP_COMMAND_TYPES).toEqual(["stop_active_operations"]);
+		expect(DAEMON_COMMAND_COMPATIBILITY.stop_active_operations).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 26,
+			capability: "atomic_stop_v2",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("atomic_stop_v2");
 		// A new daemon keeps the old queue snapshot command available to clients
 		// that do not negotiate the optional identity surface.
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_queue).toEqual({ minProtocol: 7 });

@@ -8760,7 +8760,10 @@ describe("daemon mode helpers", () => {
 
 		await fixture.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: fixture.activeSessionId }));
 
-		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
+		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, {
+			resumeIfIdle: true,
+			source: "internal",
+		});
 		expect(fixture.prompt).not.toHaveBeenCalled();
 		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 	});
@@ -8789,7 +8792,7 @@ describe("daemon mode helpers", () => {
 
 		await fixture.runCronJob(makeCronJob({ ...job, activeSessionId: fixture.activeSessionId }));
 
-		const expectedOptions = expect.objectContaining({ streamingBehavior, source: "rpc" });
+		const expectedOptions = expect.objectContaining({ streamingBehavior, source: "internal" });
 		if (method === "promptHeartbeat") {
 			expect(fixture.promptHeartbeat).toHaveBeenCalledWith(
 				expect.objectContaining({ id: job.id, prompt: "heartbeat prompt" }),
@@ -8920,6 +8923,7 @@ describe("daemon mode helpers", () => {
 				queueKey: undefined,
 				agentMessageId: undefined,
 				resumeIfIdle: true,
+				source: "rpc",
 			});
 			if (type === "follow_up") {
 				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
@@ -9336,6 +9340,7 @@ describe("daemon mode helpers", () => {
 			queueKey: "heartbeat:expanded",
 			agentMessageId: `agentmsg_expanded_${type}`,
 			resumeIfIdle: true,
+			source: "rpc",
 		});
 
 		const replayFields = {
@@ -9381,6 +9386,7 @@ describe("daemon mode helpers", () => {
 			queueKey: "heartbeat:job-1",
 			agentMessageId: `agentmsg_${type}`,
 			...replayFields,
+			source: "rpc",
 		});
 		expect(queue).toHaveBeenCalledOnce();
 
