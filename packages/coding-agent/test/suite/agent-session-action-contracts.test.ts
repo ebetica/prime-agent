@@ -196,11 +196,11 @@ describe("AgentSession action contracts", () => {
 		expect(running.activeOperationSet).toBeDefined();
 		expect(running.queuedUserActions?.some((action) => action.id === stableId)).toBe(false);
 		expect(
-			observed.every(
-				(snapshot) =>
-					snapshot.activeOperationSet !== undefined ||
-					snapshot.queuedUserActions?.some((action) => action.id === stableId) === true,
-			),
+			observed.every((snapshot) => {
+				const hasToken = snapshot.activeOperationSet !== undefined;
+				const hasExactId = snapshot.queuedUserActions?.some((action) => action.id === stableId) === true;
+				return hasToken !== hasExactId;
+			}),
 		).toBe(true);
 		holdRelease.resolve();
 		await prompt;

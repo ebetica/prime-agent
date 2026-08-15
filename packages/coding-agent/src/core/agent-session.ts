@@ -6658,7 +6658,7 @@ export class AgentSession {
 				state === "queued" ||
 				state === "selected" ||
 				state === "preparing" ||
-				(state === "committing" && !primaryDeliveryRecord(action).started)
+				(state === "committing" && !primaryDeliveryRecord(action).started && !this._activeAgentOperation)
 			);
 		});
 	}

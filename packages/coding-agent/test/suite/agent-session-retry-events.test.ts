@@ -207,6 +207,51 @@ describe("AgentSession retry and event characterization", () => {
 		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "already_stopped" });
 	});
 
+	it("preserves the root token into the automatic retry continuation", async () => {
+		let releaseRetry: () => void = () => {};
+		const retryRelease = new Promise<void>((resolve) => {
+			releaseRetry = resolve;
+		});
+		let markRetryToolStarted: () => void = () => {};
+		const retryToolStarted = new Promise<void>((resolve) => {
+			markRetryToolStarted = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait_retry",
+			label: "Wait retry",
+			description: "Keep the retry continuation active",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markRetryToolStarted();
+				await retryRelease;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [waitTool],
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage(fauxToolCall("wait_retry", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("recovered"),
+		]);
+		let backoffToken: string | undefined;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") {
+				backoffToken = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+			}
+		});
+		const prompt = harness.session.prompt("retry through");
+		await retryToolStarted;
+		unsubscribe();
+		expect(backoffToken).toBeDefined();
+		expect(harness.session.getSessionActionSnapshot().activeOperationSet?.token).toBe(backoffToken);
+		releaseRetry();
+		await prompt;
+	});
+
 	it("does not retry when retry is disabled", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: false } } });
 		harnesses.push(harness);
@@ -479,7 +524,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect(normalizeEventOrder(harness.events)).toEqual([
 			"session_action_update",
 			"agent_start",
-			"session_action_update",
 			"turn_start",
 			"message_start:user",
 			"message_end:user",
@@ -518,7 +562,6 @@ describe("AgentSession retry and event characterization", () => {
 		expect(normalizeEventOrder(harness.events)).toEqual([
 			"session_action_update",
 			"agent_start",
-			"session_action_update",
 			"turn_start",
 			"message_start:user",
 			"message_end:user",
