@@ -184,12 +184,14 @@ import {
 	type DaemonSessionSnapshot,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
+	EXACT_STOP_COMMAND_TYPES,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
 	isDaemonRestartLaunchEnvKey,
 	QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
+	QUEUED_ACTION_WITHDRAWAL_COMMAND_TYPES,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -309,6 +311,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"mutate_queued_message",
 	...QUEUED_ACTION_CANCELLATION_COMMAND_TYPES,
+	...QUEUED_ACTION_WITHDRAWAL_COMMAND_TYPES,
+	...EXACT_STOP_COMMAND_TYPES,
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
@@ -1670,6 +1674,7 @@ export class AgentDaemon {
 			}
 			await session.followUp(runnableJob.prompt, undefined, {
 				resumeIfIdle: true,
+				source: "internal",
 			});
 			return;
 		}
@@ -4011,12 +4016,14 @@ export class AgentDaemon {
 						content: command.content,
 						customMessage: command.customMessage,
 						prefixMessages: command.prefixMessages,
+						source: "rpc",
 					});
 				} else {
 					await state.runtime.session.steer(command.message, command.images, {
 						queueKey: command.queueKey,
 						agentMessageId: command.agentMessageId,
 						resumeIfIdle: true,
+						source: "rpc",
 					});
 				}
 				this.recordWorkerRecoveryState(state, "steer_queued", true);
@@ -4034,6 +4041,7 @@ export class AgentDaemon {
 						content: command.content,
 						customMessage: command.customMessage,
 						prefixMessages: command.prefixMessages,
+						source: "rpc",
 					});
 					admitted = queued;
 				} else {
@@ -4041,6 +4049,7 @@ export class AgentDaemon {
 						queueKey: command.queueKey,
 						agentMessageId: command.agentMessageId,
 						resumeIfIdle: true,
+						source: "rpc",
 					});
 					admitted = queued;
 				}

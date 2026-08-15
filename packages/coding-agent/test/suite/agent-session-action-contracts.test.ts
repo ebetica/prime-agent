@@ -115,6 +115,26 @@ describe("AgentSession action contracts", () => {
 		expect(extensionCommandRuns).toBe(0);
 	});
 
+	it("projects only trusted operator provenance across both normalized queue lanes", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+
+		await harness.session.steer("public steer");
+		await harness.session.followUp("public follow-up");
+		await harness.session.restoreSteeringMessage("recovered steer");
+		await harness.session.restoreFollowUpMessage("recovered follow-up");
+		await harness.session.restoreSteeringMessage("rpc restored steer", undefined, { source: "rpc" });
+		await harness.session.restoreFollowUpMessage("rpc restored follow-up", undefined, { source: "rpc" });
+
+		expect(harness.session.getQueuedUserActions().map(({ text, delivery }) => ({ text, delivery }))).toEqual([
+			{ text: "public steer", delivery: "steering" },
+			{ text: "rpc restored steer", delivery: "steering" },
+			{ text: "public follow-up", delivery: "followUp" },
+			{ text: "rpc restored follow-up", delivery: "followUp" },
+		]);
+	});
+
 	it("withdraws queued operator messages atomically by stable identity", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
