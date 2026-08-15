@@ -7,9 +7,8 @@ import type { AgentSession } from "../core/agent-session.js";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
 import {
 	clearOrphanProcessJournal,
-	isOrphanProcessIdentityCurrent,
 	ORPHAN_PROCESS_JOURNAL_ENV,
-	readActiveOrphanProcesses,
+	terminateActiveOrphanProcesses,
 } from "../core/orphan-process-journal.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../modes/rpc/jsonl.js";
@@ -285,7 +284,7 @@ export async function runOwnedSessionWorkerFrontend(
 		}
 		pendingRpcCommands.clear();
 	};
-	const reapWorkerResources = (workerPid: number | undefined) => {
+	const reapWorkerResources = async (workerPid: number | undefined): Promise<void> => {
 		if (!workerPid) {
 			return;
 		}
@@ -296,21 +295,7 @@ export async function runOwnedSessionWorkerFrontend(
 				// The worker process group may already be fully reaped.
 			}
 		}
-		for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, workerPid)) {
-			if (!isOrphanProcessIdentityCurrent(orphan)) {
-				continue;
-			}
-			const { pid } = orphan;
-			try {
-				process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL");
-			} catch {
-				try {
-					process.kill(pid, "SIGKILL");
-				} catch {
-					// The detached resource may already have exited.
-				}
-			}
-		}
+		await terminateActiveOrphanProcesses(orphanProcessJournalPath, workerPid);
 		clearOrphanProcessJournal(orphanProcessJournalPath);
 	};
 
@@ -437,7 +422,7 @@ export async function runOwnedSessionWorkerFrontend(
 			if (child.connected) {
 				child.disconnect();
 			}
-			reapWorkerResources(workerPid);
+			await reapWorkerResources(workerPid);
 			const rpcCrashed =
 				profile === "rpc" &&
 				!terminating &&
@@ -472,7 +457,8 @@ export async function runOwnedSessionWorkerFrontend(
 		detachRpcInput?.();
 		detachRpcOutput?.();
 		rmSync(recoveryDescriptorPath, { force: true });
-		clearOrphanProcessJournal(orphanProcessJournalPath);
+		// The per-worker reap path clears only after every journaled identity is
+		// authoritatively gone. Preserve facts here when verification rejected.
 	}
 }
 

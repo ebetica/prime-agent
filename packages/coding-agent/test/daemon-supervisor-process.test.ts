@@ -777,7 +777,7 @@ describe("daemon supervisor resident workers", () => {
 			type: "create",
 			lifecycle: "client_owned",
 			noSession: true,
-			launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+			launchEnv: collectDaemonLaunchEnv(),
 			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
 		});
 		if (!created.success) {

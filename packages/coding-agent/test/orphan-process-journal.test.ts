@@ -1,4 +1,5 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,8 +9,13 @@ import {
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
 	recordOrphanProcessState,
+	registerOrphanProcessDurably,
 	terminateActiveOrphanProcesses,
+	terminateOrphanProcessIdentity,
+	unregisterOrphanProcessDurably,
 } from "../src/core/orphan-process-journal.js";
+import { getProcessStartId } from "../src/core/session-lease.js";
+import { processIdExists } from "../src/utils/child-process.js";
 
 const tempDirs: string[] = [];
 const originalJournalPath = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -84,6 +90,25 @@ describe("orphan process journal", () => {
 		expect(existsSync(path)).toBe(true);
 	});
 
+	it("binds recovery signals to the recorded pidfd identity", async () => {
+		if (process.platform !== "linux") return;
+		const child = spawn("/bin/sleep", ["60"]);
+		if (!child.pid) throw new Error("sleep did not expose a pid");
+		try {
+			await terminateOrphanProcessIdentity({ pid: child.pid, processStartId: "proc:not-the-child" });
+			expect(processIdExists(child.pid)).toBe(true);
+			const processStartId = getProcessStartId(child.pid);
+			if (!processStartId) throw new Error("sleep identity unavailable");
+			await terminateOrphanProcessIdentity({ pid: child.pid, processStartId });
+			if (child.exitCode === null && child.signalCode === null) {
+				await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			}
+			expect(processIdExists(child.pid)).toBe(false);
+		} finally {
+			if (processIdExists(child.pid)) child.kill("SIGKILL");
+		}
+	});
+
 	it("retains cleanup facts when a tracked identity remains alive", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-cleanup-blocked-test-"));
 		tempDirs.push(directory);
@@ -115,5 +140,57 @@ describe("orphan process journal", () => {
 			}),
 		).rejects.toThrow("could not be verified");
 		expect(existsSync(path)).toBe(true);
+	});
+
+	it("strict registration returns identity and requires durable storage", () => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		expect(() => registerOrphanProcessDurably(process.pid)).toThrow("is not configured");
+
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-strict-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		const identity = registerOrphanProcessDurably(process.pid);
+		expect(identity.processStartId).toBeTypeOf("string");
+		unregisterOrphanProcessDurably(identity);
+		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([]);
+	});
+
+	it("does not let delayed strict unregister cancel a reused pid identity", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-reuse-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		const base = { version: 1, pid: 4242, ownerPid: process.pid, recordedAt: new Date().toISOString() };
+		writeFileSync(
+			path,
+			`${[
+				JSON.stringify({ ...base, processStartId: "old", active: true }),
+				JSON.stringify({ ...base, processStartId: "new", active: true }),
+				JSON.stringify({ ...base, processStartId: "old", active: false }),
+			].join("\n")}\n`,
+		);
+		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([{ pid: 4242, processStartId: "new" }]);
+	});
+
+	it("compacts completed history while preserving multiple live identities", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-orphan-compact-test-"));
+		tempDirs.push(directory);
+		const path = join(directory, "orphans.jsonl");
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = path;
+		for (let index = 0; index < 200; index++) {
+			const identity = registerOrphanProcessDurably(process.pid);
+			unregisterOrphanProcessDurably(identity);
+		}
+		expect(readFileSync(path, "utf8")).toBe("");
+		const base = { version: 1, ownerPid: process.pid, active: true, recordedAt: new Date().toISOString() };
+		writeFileSync(
+			path,
+			`${JSON.stringify({ ...base, pid: 1001, processStartId: "one" })}\n${JSON.stringify({ ...base, pid: 1002, processStartId: "two" })}\n`,
+		);
+		recordOrphanProcessState(process.pid, false);
+		expect(readActiveOrphanProcesses(path, process.pid)).toEqual([
+			{ pid: 1001, processStartId: "one" },
+			{ pid: 1002, processStartId: "two" },
+		]);
 	});
 });

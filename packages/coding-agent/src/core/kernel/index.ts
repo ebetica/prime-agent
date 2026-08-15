@@ -1,5 +1,5 @@
 // TODO: reconsider persistent kernel vs stateless `python -c` once RLM-1 weights land.
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,8 +8,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
+import {
+	type ContainmentLauncher,
+	ContainmentUnavailableError,
+	launchPidNamespaceOperation,
+	type PidNamespaceOperation,
+} from "./process-containment.js";
 import {
 	buildListNamesCode,
 	buildRestoreCode,
@@ -82,12 +89,16 @@ export interface KernelManagerOptions {
 	cwd?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
+	/** Required mode fails instead of falling back to an unmanaged kernel. */
+	kernelContainment?: "best-effort" | "required";
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
 	/** Default: "prime-agent". */
 	username?: string;
+	/** Test/embedding seam for selecting a containment provider. */
+	containmentLauncher?: ContainmentLauncher;
 }
 
 export interface KernelStartOptions {
@@ -475,7 +486,7 @@ let signalHandlersInstalled = false;
 registerSessionResourceCleanup((sessionId) => {
 	for (const k of liveKernels) {
 		if (!sessionId || k.ownerSessionId === sessionId) {
-			void k.dispose();
+			k.disposeBestEffort();
 		}
 	}
 });
@@ -511,13 +522,24 @@ function installSignalHandlersOnce(): void {
 export class KernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills" | "snapshot"
+		| "python"
+		| "cwd"
+		| "env"
+		| "sessionId"
+		| "kernelContainment"
+		| "hostHandlers"
+		| "pythonSkills"
+		| "snapshot"
+		| "containmentLauncher"
 	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
 	private kernel?: ChildProcess;
+	/** Outer unshare monitor when this kernel generation has PID-namespace containment. */
+	private kernelOperation?: PidNamespaceOperation;
+	private kernelGenerationId?: string;
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
 	private kernelPid?: number;
@@ -552,15 +574,21 @@ export class KernelManager {
 			cwd: options.cwd,
 			env: options.env,
 			sessionId: options.sessionId,
+			kernelContainment: options.kernelContainment,
 			hostHandlers: options.hostHandlers,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
+			containmentLauncher: options.containmentLauncher,
 			username: options.username ?? "prime-agent",
 		};
 	}
 
 	get ownerSessionId(): string | undefined {
 		return this.options.sessionId;
+	}
+
+	get containedGenerationId(): string | undefined {
+		return this.kernelGenerationId;
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -609,12 +637,30 @@ export class KernelManager {
 
 		let connection = makeConnection();
 		this.tempDir = connection.tempDir;
+		this.kernelOperation = undefined;
 
-		// Fast path: fork a pre-imported kernel from the forkserver. Any failure
-		// (disabled, unavailable, fork error) degrades to the direct-spawn path so
-		// correctness never depends on fork.
+		const spawnOptions: SpawnOptions = {
+			cwd: this.options.cwd,
+			env: modelSubprocessEnv(this.options.env),
+			stdio: ["ignore", "pipe", "pipe"],
+		};
+		const kernelArgs = ["-m", "ipykernel_launcher", "-f", connection.path];
+		let operation: PidNamespaceOperation | undefined;
+		try {
+			const launchContained = this.options.containmentLauncher ?? launchPidNamespaceOperation;
+			operation = await launchContained(python, kernelArgs, spawnOptions, this.options.sessionId);
+			this.kernelGenerationId = operation.generationId;
+			this.kernelStderr += operation.stderrTail;
+		} catch (error) {
+			if (!(error instanceof ContainmentUnavailableError)) throw error;
+			if (this.options.kernelContainment === "required") throw error;
+			this.appendKernelDiagnostic(`PID namespace unavailable, using unmanaged kernel: ${error.message}`);
+			this.kernelGenerationId = undefined;
+		}
+
+		// Forkserver is only eligible when no generation was admitted to containment.
 		let forked = false;
-		if (isForkServerEnabled()) {
+		if (!operation && isForkServerEnabled()) {
 			try {
 				this.kernelPid = await forkKernel(python, {
 					connectionPath: connection.path,
@@ -622,7 +668,7 @@ export class KernelManager {
 					// Match the direct-spawn env exactly: merge the current host env with
 					// the per-kernel overrides, applied fresh in the child (the template's
 					// inherited env snapshot may be stale by fork time).
-					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
+					env: spawnOptions.env,
 				});
 				forked = true;
 			} catch (err) {
@@ -644,11 +690,9 @@ export class KernelManager {
 		}
 
 		if (!forked) {
-			const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], {
-				cwd: this.options.cwd,
-				env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
+			const kernel =
+				operation?.monitor ?? spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], spawnOptions);
+			this.kernelOperation = operation;
 			this.kernel = kernel;
 
 			kernel.stderr?.on("data", (buf: Buffer) => {
@@ -656,12 +700,28 @@ export class KernelManager {
 				this.kernelStderr += s;
 			});
 
+			const finalizeExitedKernel = () => {
+				this.state = "shutdown";
+				liveKernels.delete(this);
+				if (!operation) {
+					this.cleanupResources();
+					return;
+				}
+				// Preserve the operation identity until its durable unregister and all
+				// inherited transports settle. A rejection remains fenced for Stop/retry.
+				void operation.waitForReapAndTransportClose().then(
+					() => {
+						if (this.kernelOperation === operation) this.cleanupResources();
+					},
+					(error) =>
+						this.appendKernelDiagnostic(`contained exit cleanup was not verified: ${errorMessage(error)}`),
+				);
+			};
+
 			kernel.on("error", (err) => {
 				if (this.kernel !== kernel) return;
 				this.appendKernelDiagnostic(`spawn error: ${err.message}`);
-				this.state = "shutdown";
-				liveKernels.delete(this);
-				this.cleanupResources();
+				finalizeExitedKernel();
 			});
 
 			kernel.on("exit", (code, signal) => {
@@ -669,9 +729,7 @@ export class KernelManager {
 				if (this.state !== "shutdown") {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
 				}
-				this.state = "shutdown";
-				liveKernels.delete(this);
-				this.cleanupResources();
+				finalizeExitedKernel();
 			});
 		}
 
@@ -709,6 +767,7 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.kernelOperation?.sealGeneration();
 		this.startForkedLivenessMonitor();
 	}
 
@@ -1301,6 +1360,7 @@ export class KernelManager {
 		this.control = undefined;
 		this.iopubPumpPromise = undefined;
 		try {
+			this.kernelOperation?.killSync();
 			if (this.kernel) {
 				this.kernel.kill(killSignal);
 			} else if (this.kernelPid !== undefined && !this.forkedKernelDied()) {
@@ -1311,6 +1371,7 @@ export class KernelManager {
 		} catch {
 			// Kernel already exited.
 		}
+		this.kernelOperation = undefined;
 		this.kernel = undefined;
 		this.kernelPid = undefined;
 		this.connection = undefined;
@@ -1348,6 +1409,8 @@ export class KernelManager {
 	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
+			const containedOperation = this.kernelOperation;
+			if (containedOperation) await containedOperation.killAndWaitVerified();
 			this.cleanupResources();
 			return;
 		}
@@ -1358,6 +1421,7 @@ export class KernelManager {
 		}
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		const containedOperation = this.kernelOperation;
 
 		try {
 			if (this.control && this.connection) {
@@ -1371,6 +1435,7 @@ export class KernelManager {
 			);
 		}
 
+		if (containedOperation) await containedOperation.killAndWaitVerified();
 		this.cleanupResources();
 	}
 
@@ -1395,6 +1460,8 @@ export class KernelManager {
 	async kill(): Promise<void> {
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		const containedOperation = this.kernelOperation;
+		if (containedOperation) await containedOperation.killAndWaitVerified();
 		this.cleanupResources("SIGKILL");
 	}
 
@@ -1496,23 +1563,22 @@ export class KernelManager {
 		}
 	}
 
-	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
-	dispose(): Promise<void> {
-		return (async () => {
-			// Final namespace flush while the kernel is still live (session end / reload).
-			await this.flushSnapshotForDispose();
-			this.state = "shutdown";
-			liveKernels.delete(this);
-			const inFlightHostRequests = [...this.inFlightHostRequests];
-			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
-			try {
-				if (inFlightHostRequests.length > 0) {
-					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
-				}
-			} finally {
-				this.cleanupResources();
-			}
-		})();
+	/** Graceful cleanup. Verified containment failures propagate to the caller. */
+	async dispose(): Promise<void> {
+		await this.flushSnapshotForDispose();
+		const inFlightHostRequests = [...this.inFlightHostRequests];
+		if (inFlightHostRequests.length > 0) {
+			await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
+		}
+		await this.shutdown();
+	}
+
+	/** Emergency/session-hook cleanup only. This is not the verified Stop path. */
+	disposeBestEffort(): void {
+		this.state = "shutdown";
+		liveKernels.delete(this);
+		this.kernelOperation?.killBestEffort();
+		this.cleanupResources();
 	}
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */

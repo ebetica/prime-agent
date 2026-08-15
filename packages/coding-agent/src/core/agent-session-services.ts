@@ -86,6 +86,8 @@ export interface AgentSessionCreationOptions {
 	serializedRefine?: boolean;
 	/** User-facing client mode that created the top-level session. */
 	executionMode?: AgentExecutionMode;
+	/** Explicit host policy: built-in IPython must not downgrade containment. */
+	kernelContainment?: "best-effort" | "required";
 	/** Explicit daemon-carried opt-out; cannot enable telemetry. */
 	telemetryDisabled?: true;
 	/** Initial goal to seed at session creation (rlmDepth 0 only, idempotent). */
@@ -299,6 +301,7 @@ export async function createAgentSessionFromServices(
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
+		kernelContainment: options.kernelContainment,
 		autonomous: options.autonomous,
 		serializedRefine: options.serializedRefine,
 		initialGoal: options.initialGoal,

@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ExtensionContext } from "../src/core/extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../src/core/kernel/bootstrap.js";
 import { type ExecuteResult, KernelBusyAfterInterruptError, KernelManager } from "../src/core/kernel/index.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV } from "../src/core/orphan-process-journal.js";
 import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 let tempDir = "";
@@ -28,6 +29,7 @@ function writeFakePython(opts: { sleepSeconds?: number } = {}): { python: string
 		python,
 		[
 			"#!/bin/sh",
+			'case "$2" in *"os.getpid()"*) exit 125;; esac',
 			`echo run >> "${countFile}"`,
 			...(opts.sleepSeconds ? [`sleep ${opts.sleepSeconds}`] : []),
 			"exit 42",
@@ -74,12 +76,29 @@ function createBusyKernelContext(
 describe("IpythonKernelProvisioner", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-provisioner-"));
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = join(tempDir, "orphans.jsonl");
 	});
 
 	afterEach(() => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";
+		}
+	});
+
+	it("propagates required containment and never starts without a journal", async () => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		const { python, countRuns } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			kernelContainment: "required",
+		});
+		try {
+			await expect(provisioner.ensure()).rejects.toThrow("Durable containment journal is not configured");
+			expect(countRuns()).toBe(0);
+		} finally {
+			await provisioner.dispose();
 		}
 	});
 
@@ -339,14 +358,52 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(dill)).toBe(true);
 		expect(existsSync(manifest)).toBe(true);
 	});
+
+	it("keeps a failed verified kill fenced until a cleanup retry succeeds", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir);
+		const failure = new Error("verified reap failed");
+		const kill = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined);
+		const manager = { kill, isRunning: true } as unknown as KernelManager;
+		Object.assign(provisioner, {
+			managerPromise: Promise.resolve(manager),
+			startedManager: manager,
+		});
+
+		await expect(provisioner.kill()).rejects.toBe(failure);
+		expect(await provisioner.ensure()).toBe(manager);
+		expect(provisioner.manager).toBe(manager);
+		await expect(provisioner.kill()).resolves.toBeUndefined();
+		expect(kill).toHaveBeenCalledTimes(2);
+		expect(provisioner.manager).toBeUndefined();
+	});
+
+	it("does not admit a replacement after startup cleanup is unverified", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir);
+		const failure = new Error("startup cleanup was not verified");
+		const failed = Promise.reject<KernelManager>(failure);
+		void failed.catch(() => {});
+		const failedManager = { kill: vi.fn(async () => {}) } as unknown as KernelManager;
+		Object.assign(provisioner, {
+			managerPromise: failed,
+			failedCleanupManager: failedManager,
+		});
+
+		await expect(provisioner.ensure()).rejects.toBe(failure);
+		await expect(provisioner.ensure()).rejects.toBe(failure);
+		expect((provisioner as unknown as { managerPromise?: Promise<KernelManager> }).managerPromise).toBe(failed);
+		await provisioner.kill();
+		expect(failedManager.kill).toHaveBeenCalledOnce();
+	});
 });
 
 describe("KernelManager session cleanup during startup", () => {
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-cleanup-"));
+		process.env[ORPHAN_PROCESS_JOURNAL_ENV] = join(tempDir, "orphans.jsonl");
 	});
 
 	afterEach(() => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";

@@ -276,6 +276,8 @@ export interface IpythonToolOptions {
 	/** Optional explicit shell path for bare %%bash cells. */
 	shellPath?: string;
 	sessionId?: string;
+	/** Host-owned containment policy. Required mode never launches unmanaged. */
+	kernelContainment?: "best-effort" | "required";
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
@@ -329,6 +331,8 @@ function applyShellSettingsToBashMagicCell(
 export class IpythonKernelProvisioner {
 	private managerPromise?: Promise<KernelManager>;
 	private startedManager?: KernelManager;
+	/** A generation whose cleanup failed remains the admission fence until a verified retry succeeds. */
+	private failedCleanupManager?: KernelManager;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
@@ -375,34 +379,35 @@ export class IpythonKernelProvisioner {
 		// in-flight startKernel before it spawns, so a disposed session's boot
 		// doesn't waste a slot during a fan-out.
 		this.disposeController.abort();
-		const pending = this.managerPromise;
-		this.managerPromise = undefined;
-		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
-		}
-		if (!pending) return;
-		try {
-			const m = await pending;
-			await m.dispose();
-		} catch {
-			// a failed startup already cleaned up after itself
-		}
+		await this.terminateKernel("dispose");
 	}
 
 	async kill(): Promise<void> {
+		await this.terminateKernel("kill");
+	}
+
+	private async terminateKernel(method: "dispose" | "kill"): Promise<void> {
 		const pending = this.managerPromise;
-		this.managerPromise = undefined;
-		this.startedManager = undefined;
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = undefined;
+		let manager = this.failedCleanupManager;
+		if (!manager && pending) {
+			try {
+				manager = await pending;
+			} catch {
+				manager = this.failedCleanupManager;
+				// Ordinary startup failures already completed verified cleanup.
+				if (!manager) return;
+			}
 		}
-		if (!pending) return;
-		try {
-			const m = await pending;
-			await m.kill();
-		} catch {
-			// a failed startup already cleaned up after itself
+		if (!manager) return;
+
+		// Do not publish an empty slot until verified teardown succeeds. A rejection
+		// preserves the manager and cached startup failure as the generation fence.
+		await manager[method]();
+		if (this.managerPromise === pending) this.managerPromise = undefined;
+		if (this.startedManager === manager) this.startedManager = undefined;
+		if (this.failedCleanupManager === manager) this.failedCleanupManager = undefined;
+		if (this.options?.kernelManagerRef?.current === manager) {
+			this.options.kernelManagerRef.current = undefined;
 		}
 	}
 
@@ -434,9 +439,9 @@ export class IpythonKernelProvisioner {
 					this.settleStartup();
 				},
 				() => {
-					// Clear the memo so the next ensure() retries instead of
-					// rethrowing a cached rejection forever.
-					if (this.managerPromise === startup) {
+					// Retry only after startup completed verified cleanup. An unverified
+					// generation retains this rejected memo as an admission fence.
+					if (this.managerPromise === startup && !this.failedCleanupManager) {
 						this.managerPromise = undefined;
 					}
 					this.settleStartup();
@@ -480,6 +485,7 @@ export class IpythonKernelProvisioner {
 				cwd: this.cwd,
 				env: this.options?.env,
 				sessionId: this.options?.sessionId,
+				kernelContainment: this.options?.kernelContainment,
 				hostHandlers: this.options?.hostHandlers,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
@@ -523,10 +529,18 @@ export class IpythonKernelProvisioner {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
 				}
-			} catch (error) {
-				// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.
-				void m.dispose();
-				throw error;
+			} catch (startupError) {
+				// A retry cannot overlap a generation whose verified cleanup has not settled.
+				try {
+					await m.dispose();
+				} catch (cleanupError) {
+					this.failedCleanupManager = m;
+					throw new Error(
+						`IPython startup cleanup was not verified: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+						{ cause: startupError },
+					);
+				}
+				throw startupError;
 			}
 			// Only tell the model what was revived once the kernel is actually usable —
 			// a notice claiming restored state must never outlive a failed bootstrap.
