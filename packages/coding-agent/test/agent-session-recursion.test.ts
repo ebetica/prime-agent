@@ -2355,6 +2355,64 @@ describe("AgentSession rlm recursion", () => {
 		expect(promptAndWait).not.toHaveBeenCalled();
 	});
 
+	it("keeps a predecessor detached child independent when exact Stop targets its successor", async () => {
+		let releaseChild: () => void = () => {};
+		const childRelease = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let releaseSuccessor: () => void = () => {};
+		const successorRelease = new Promise<void>((resolve) => {
+			releaseSuccessor = resolve;
+		});
+		let childStarted = false;
+		let successorStarted = false;
+		let root!: AgentSession;
+		root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "predecessor") {
+					void root.runRlmChild("slow shard");
+					queueMicrotask(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("predecessor done") });
+					});
+				} else if (text === "slow shard") {
+					childStarted = true;
+					void childRelease.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("child done") });
+					});
+				} else if (text === "successor") {
+					successorStarted = true;
+					void successorRelease.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("successor done") });
+					});
+				}
+				return stream;
+			},
+		});
+
+		await root.prompt("predecessor");
+		await waitFor(() => childStarted);
+		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		const child = [...runs.values()][0];
+		expect(child.status).toBe("running");
+		expect(root.getSessionActionSnapshot().activeOperationSet).toBeUndefined();
+
+		const successor = root.prompt("successor");
+		await waitFor(() => successorStarted);
+		const token = root.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(token).toBeDefined();
+		const stopping = root.stopActiveOperations(token!);
+		releaseSuccessor();
+		expect(await stopping).toEqual({ status: "stopped" });
+		await successor;
+		expect(child.status).toBe("running");
+		expect(runs.has(child.id)).toBe(true);
+
+		releaseChild();
+		await waitFor(() => child.status === "done");
+	});
+
 	it("does not cancel active rlm children when only the parent turn is interrupted", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {

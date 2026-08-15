@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "./harness.js";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -13,7 +13,10 @@ function normalizeEventOrder(events: Harness["events"]): string[] {
 				: event.type === "tool_execution_start" || event.type === "tool_execution_end"
 					? `${event.type}:${event.toolName}`
 					: event.type;
-		if (label === "message_update" && normalized[normalized.length - 1] === "message_update") {
+		if (
+			(label === "message_update" && normalized[normalized.length - 1] === "message_update") ||
+			(label === "session_action_update" && normalized[normalized.length - 1] === "session_action_update")
+		) {
 			continue;
 		}
 		normalized.push(label);
@@ -172,6 +175,115 @@ describe("AgentSession retry and event characterization", () => {
 			harness.session.prompt("second", { queueIfBusy: true, streamingBehavior: "followUp" }),
 		).resolves.toBeUndefined();
 		expect(harness.session.queuedActionCount).toBe(1);
+	});
+
+	it("keeps one Stop token through retry backoff and lets Stop cancel that retry", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 30_000 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not run"),
+		]);
+		const retryStarted = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const prompt = harness.session.prompt("retry me");
+		await retryStarted;
+		const before = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(before).toBeDefined();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(harness.session.getSessionActionSnapshot().activeOperationSet?.token).toBe(before);
+
+		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "stopped" });
+		await prompt;
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "already_stopped" });
+	});
+
+	it("cancels an owned retry continuation timer before stopped returns", async () => {
+		const realSetTimeout = globalThis.setTimeout;
+		const delayedZeroTimers = vi
+			.spyOn(globalThis, "setTimeout")
+			.mockImplementation(((callback: Parameters<typeof setTimeout>[0], delay?: number) =>
+				realSetTimeout(callback, delay === 0 ? 100 : delay)) as typeof setTimeout);
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not run"),
+		]);
+		try {
+			const prompt = harness.session.prompt("retry timer");
+			const internals = harness.session as unknown as {
+				_retryContinuationTimer?: ReturnType<typeof setTimeout>;
+			};
+			const deadline = Date.now() + 2_000;
+			while (internals._retryContinuationTimer === undefined) {
+				if (Date.now() >= deadline) throw new Error("retry continuation timer was not scheduled");
+				await new Promise<void>((resolve) => realSetTimeout(resolve, 1));
+			}
+			const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+			expect(token).toBeDefined();
+			expect(await harness.session.stopActiveOperations(token!)).toEqual({ status: "stopped" });
+			expect(internals._retryContinuationTimer).toBeUndefined();
+			await prompt;
+			await new Promise<void>((resolve) => realSetTimeout(resolve, 150));
+			expect(harness.faux.state.callCount).toBe(1);
+		} finally {
+			delayedZeroTimers.mockRestore();
+		}
+	});
+
+	it("preserves the root token into the automatic retry continuation", async () => {
+		let releaseRetry: () => void = () => {};
+		const retryRelease = new Promise<void>((resolve) => {
+			releaseRetry = resolve;
+		});
+		let markRetryToolStarted: () => void = () => {};
+		const retryToolStarted = new Promise<void>((resolve) => {
+			markRetryToolStarted = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait_retry",
+			label: "Wait retry",
+			description: "Keep the retry continuation active",
+			parameters: Type.Object({}),
+			execute: async () => {
+				markRetryToolStarted();
+				await retryRelease;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [waitTool],
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage(fauxToolCall("wait_retry", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("recovered"),
+		]);
+		let backoffToken: string | undefined;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") {
+				backoffToken = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+			}
+		});
+		const prompt = harness.session.prompt("retry through");
+		await retryToolStarted;
+		unsubscribe();
+		expect(backoffToken).toBeDefined();
+		expect(harness.session.getSessionActionSnapshot().activeOperationSet?.token).toBe(backoffToken);
+		releaseRetry();
+		await prompt;
 	});
 
 	it("does not retry when retry is disabled", async () => {
@@ -444,6 +556,7 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("hi");
 
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"session_action_update",
 			"agent_start",
 			"turn_start",
 			"message_start:user",
@@ -452,6 +565,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_update",
 			"message_end:assistant",
 			"turn_end",
+			"session_action_update",
 			"agent_end",
 		]);
 	});
@@ -480,6 +594,7 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(toolRuns).toEqual(["hello"]);
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"session_action_update",
 			"agent_start",
 			"turn_start",
 			"message_start:user",
@@ -497,6 +612,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_update",
 			"message_end:assistant",
 			"turn_end",
+			"session_action_update",
 			"agent_end",
 		]);
 	});

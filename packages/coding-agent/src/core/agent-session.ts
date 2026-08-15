@@ -200,6 +200,7 @@ import {
 	type WorkerRecoveryDetails,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { OwnedOperationRegistry } from "./owned-operation-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
@@ -1159,6 +1160,14 @@ export class AgentSession {
 		queuedCount: 0,
 		steering: [],
 		followUps: [],
+		queuedUserActions: [],
+	};
+	private readonly _ownedOperations = new OwnedOperationRegistry();
+	private _activeAgentOperation?: {
+		id: string;
+		settle(): void;
+		touchedIpythonGeneration: boolean;
+		retrySettlementScheduled: boolean;
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
@@ -1209,6 +1218,7 @@ export class AgentSession {
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
+	private _retryContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
@@ -3410,9 +3420,50 @@ export class AgentSession {
 			);
 	}
 
+	private _completeActiveAgentOperation(expectedId: string): void {
+		const operation = this._activeAgentOperation;
+		if (!operation || operation.id !== expectedId) return;
+		operation.settle();
+		this._ownedOperations.complete(operation.id);
+		this._activeAgentOperation = undefined;
+		this._emitQueueUpdate();
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
+		if (event.type === "tool_execution_start" && event.toolName === "ipython" && this._activeAgentOperation) {
+			this._activeAgentOperation.touchedIpythonGeneration = true;
+		}
+		if (event.type === "agent_start" && !this._activeAgentOperation) {
+			let settle!: () => void;
+			const settled = new Promise<void>((resolve) => {
+				settle = resolve;
+			});
+			let killActiveKernelGeneration = false;
+			const operation = this._ownedOperations.admitRoot("agent_run", {
+				interrupt: () => {
+					killActiveKernelGeneration =
+						this._activeAgentOperation?.id === operation.id
+							? this._activeAgentOperation.touchedIpythonGeneration
+							: false;
+					this.requestAbort();
+				},
+				settled,
+				cleanup: async () => {
+					await this.agent.waitForIdle();
+					await this._agentEventQueue;
+					if (killActiveKernelGeneration) await this._ipythonKernelProvisioner?.kill();
+				},
+			});
+			this._activeAgentOperation = {
+				id: operation.id,
+				settle,
+				touchedIpythonGeneration: false,
+				retrySettlementScheduled: false,
+			};
+			this._emitQueueUpdate();
+		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
 				if (
@@ -3428,6 +3479,18 @@ export class AgentSession {
 				}
 			}
 		} else if (event.type === "agent_end") {
+			const operation = this._activeAgentOperation;
+			const retry = this._retryPromise;
+			if (operation && retry && !operation.retrySettlementScheduled) {
+				operation.retrySettlementScheduled = true;
+				void retry.then(async () => {
+					await this.agent.waitForIdle();
+					await this._agentEventQueue;
+					this._completeActiveAgentOperation(operation.id);
+				});
+			} else if (operation && !retry) {
+				this._completeActiveAgentOperation(operation.id);
+			}
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
 				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
@@ -5714,8 +5777,10 @@ export class AgentSession {
 			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
 		if (options.front) this._actionStore.enqueueFront(action);
 		else this._actionStore.enqueue(action);
-		let disposition: "starts_when_admitted" | "queued" = "queued";
-		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
+		// Selection is performed only by the input pump while it owns the session
+		// action fence. Keeping the item queued here gives withdrawal and selection
+		// one linearization point instead of letting synchronous admission bypass it.
+		const disposition: "starts_when_admitted" | "queued" = canStartImmediately ? "starts_when_admitted" : "queued";
 		const controller = this._actionStore.ticketFor(action);
 		controller.settleAccepted({
 			status: "accepted",
@@ -5804,7 +5869,8 @@ export class AgentSession {
 	}
 
 	private _scheduleSessionInputPump(): void {
-		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
+		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0 || this._ownedOperations.isStopping)
+			return;
 		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
 			return;
 		}
@@ -5847,34 +5913,42 @@ export class AgentSession {
 					this._notifySessionInputCheckpointChange();
 					return;
 				}
-				const first = preselected ?? this._actionStore.selectFirst();
-				if (!first) return;
+				// Selection and exact withdrawal are writers on the same fence. The stable
+				// action ID remains withdrawable through preparation and until primary
+				// dispatch starts; then agent_start publishes the replacement Stop token.
+				const selectionFence = await this._acquireSessionActionCommitFence();
+				let first: QueuedSessionAction | undefined;
+				const actions: QueuedSessionAction[] = [];
+				try {
+					if (this._isSessionInputHandoffDeferred(epoch)) return;
+					first = preselected?.lifecycle.state === "selected" ? preselected : this._actionStore.selectFirst();
+					if (!first) return;
+					if (first.payload.kind !== "session_command") {
+						const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+						actions.push(first);
+						while (!preselected && mode === "all") {
+							const next = this._actionStore.queuedActions(first.delivery)[0];
+							if (
+								!next ||
+								next.payload.kind !== "turn" ||
+								!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
+							) {
+								break;
+							}
+							this._actionStore.selectFirst();
+							actions.push(next);
+						}
+						for (const action of actions) transitionSessionAction(action, { state: "preparing" });
+					}
+					this._notifySessionInputCheckpointChange();
+					this._emitQueueUpdate();
+				} finally {
+					selectionFence.release();
+				}
 				if (first.payload.kind === "session_command") {
 					await this._executeSelectedSessionCommand(first, epoch);
 					return;
 				}
-
-				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
-				const actions: QueuedSessionAction[] = [first];
-				while (!preselected && mode === "all") {
-					const next = this._actionStore.queuedActions(first.delivery)[0];
-					if (
-						!next ||
-						next.payload.kind !== "turn" ||
-						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
-					) {
-						break;
-					}
-					this._actionStore.selectFirst();
-					actions.push(next);
-				}
-				if (epoch !== this._sessionInputPumpEpoch) {
-					for (const action of actions) this._actionStore.rollback(action);
-					return;
-				}
-				for (const action of actions) transitionSessionAction(action, { state: "preparing" });
-				this._notifySessionInputCheckpointChange();
-				this._emitQueueUpdate();
 				try {
 					await this._startPreparedTurnActions(actions, epoch);
 					for (const action of actions) {
@@ -6023,7 +6097,8 @@ export class AgentSession {
 	}
 
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
-		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
+		const externalBusy =
+			this.isCompacting || this.isRetrying || this.isBashRunning || this._ownedOperations.isStopping;
 		if (point === "pump") {
 			return (
 				externalBusy ||
@@ -6574,14 +6649,70 @@ export class AgentSession {
 		return "applied";
 	}
 
+	private _withdrawableQueuedUserActionRecords(): readonly QueuedSessionAction[] {
+		return this._actionStore.ownedActions().filter((action) => {
+			if (action.payload.kind !== "turn" || (action.source !== "interactive" && action.source !== "rpc")) {
+				return false;
+			}
+			const state = action.lifecycle.state;
+			return (
+				state === "queued" ||
+				state === "selected" ||
+				state === "preparing" ||
+				(state === "committing" && !primaryDeliveryRecord(action).started && !this._activeAgentOperation)
+			);
+		});
+	}
+
 	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
-		return visibleSessionActionProjection(this._actionStore.queuedActions())
-			.filter((action) => action.payload.kind === "turn")
-			.map((action) => ({
-				id: action.id,
-				text: queuedAgentMessagePreview(action),
-				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
-			}));
+		return this._withdrawableQueuedUserActionRecords().map((action) => ({
+			id: action.id,
+			text: queuedAgentMessagePreview(action),
+			delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+		}));
+	}
+
+	async withdrawQueuedUserActions(
+		ids: readonly string[],
+	): Promise<readonly { id: string; text: string; delivery: "steering" | "followUp" }[]> {
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			const requested = new Set(ids);
+			const candidates = this._withdrawableQueuedUserActionRecords();
+			const descriptors = candidates
+				.filter((action) => requested.has(action.id))
+				.map((action) => ({
+					id: action.id,
+					text: queuedAgentMessagePreview(action),
+					delivery: action.delivery === "next_turn_boundary" ? ("steering" as const) : ("followUp" as const),
+				}));
+			if (descriptors.length === 0) return [];
+			const descriptorIds = new Set(descriptors.map((item) => item.id));
+			const error = new Error("Queued operator message was withdrawn before delivery.");
+			const removed = this._cancelSessionActions((action) => descriptorIds.has(action.id), error, candidates);
+			const removedIds = new Set(removed.map((action) => action.id));
+			const withdrawn = descriptors.filter((item) => removedIds.has(item.id));
+			if (
+				removed.some((action) => action.payload.kind === "turn" && action.payload.captureRunMessages !== undefined)
+			) {
+				this.agent.abort();
+			}
+			if (withdrawn.length > 0) this._emitQueueUpdate();
+			return withdrawn;
+		} finally {
+			// Releasing this writer fence is sufficient. Withdrawal never owns the
+			// caller's queued-work pause and must not globally resume it.
+			fence.release();
+		}
+	}
+
+	async stopActiveOperations(operationSetToken: string): Promise<{
+		status: "stopped" | "already_stopped" | "stale";
+	}> {
+		const result = await this._ownedOperations.stop(operationSetToken);
+		this._emitQueueUpdate();
+		if (!this._ownedOperations.isStopping) this._scheduleSessionInputPump();
+		return result;
 	}
 
 	cancelQueuedAction(id: string): boolean {
@@ -6703,10 +6834,14 @@ export class AgentSession {
 				: activeState === "preparing" || activeState === "committing" || activeState === "running"
 					? activeState
 					: undefined;
+		const queuedUserActions = this.getQueuedUserActions();
+		const activeOperationSet = this._ownedOperations.activeSet();
 		return {
 			queuedCount: steering.length + followUps.length,
 			steering,
 			followUps,
+			queuedUserActions,
+			...(activeOperationSet ? { activeOperationSet } : {}),
 			...(active && phase
 				? {
 						active: {
@@ -11176,8 +11311,10 @@ export class AgentSession {
 		}
 		this._retryAbortController = undefined;
 
-		// Retry via continue() - use setTimeout to break out of event handler chain
-		setTimeout(() => {
+		// Retry via continue() - use setTimeout to break out of event handler chain.
+		// The owned handle lets exact Stop close the post-backoff/pre-dispatch gap.
+		this._retryContinuationTimer = setTimeout(() => {
+			this._retryContinuationTimer = undefined;
 			this.agent.continue().catch(() => {
 				// Retry failed - will be caught by next agent_end
 			});
@@ -11190,6 +11327,10 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
+		if (this._retryContinuationTimer !== undefined) {
+			clearTimeout(this._retryContinuationTimer);
+			this._retryContinuationTimer = undefined;
+		}
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
 			return;
@@ -11321,11 +11462,23 @@ export class AgentSession {
 		if (this.isBashRunning) {
 			throw new Error("A bash command is already running");
 		}
-		// Claim the bash slot synchronously: isBashRunning is otherwise false until
-		// executeBash installs its abort controller, which would let a second command
-		// slip through during the user_bash extension dispatch below.
+		if (this.isStreaming || this._actionStore.activeActions().length > 0 || this._ownedOperations.activeOwnerId) {
+			throw new Error("Cannot execute standalone bash while agent activity is admitted");
+		}
+		// Claim both the Bash flag and the immutable operation owner synchronously,
+		// before extension dispatch or process spawn. The input pump observes the
+		// Bash flag and cannot select a turn until this operation settles.
 		this._userBashRunning = true;
 		this._userBashAbortRequested = false;
+		let settleUserBash!: () => void;
+		const userBashCompletion = new Promise<void>((resolve) => {
+			settleUserBash = resolve;
+		});
+		const operation = this._ownedOperations.admitRoot("user_bash", {
+			interrupt: () => this.abortBash(),
+			settled: userBashCompletion,
+		});
+		this._emitQueueUpdate();
 		// Echoed on bash_start/bash_end so the requesting client can tell its own
 		// run apart from other clients' runs broadcast on the same session.
 		const identity = {
@@ -11342,6 +11495,9 @@ export class AgentSession {
 			);
 		} finally {
 			this._userBashRunning = false;
+			settleUserBash();
+			this._ownedOperations.complete(operation.id);
+			this._emitQueueUpdate();
 		}
 		// Emitted after the slot is released so clients never observe a bash_end
 		// while the session still rejects new commands as already running.

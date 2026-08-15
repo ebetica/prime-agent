@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, UserMessage } from "@earendil-works/pi-ai";
 import type { InputSource } from "./extensions/index.js";
 import type { CustomMessage } from "./messages.js";
+import type { OwnedOperationSet } from "./owned-operation-registry.js";
 import type { SessionSlashCommand } from "./slash-commands.js";
 
 export type DeliveryPolicy = "next_turn_boundary" | "when_run_idle";
@@ -19,10 +20,19 @@ export type QueuedMessageMutation =
 	| { type: "replace"; text: string; images?: ImageContent[]; lane: QueuedMessageLane };
 export type QueuedMessageMutationStatus = "applied" | "rejected" | "invalid";
 
+export interface QueuedUserActionDescriptor {
+	id: string;
+	text: string;
+	delivery: "steering" | "followUp";
+}
+
 export interface SessionActionSnapshot {
 	queuedCount: number;
 	steering: readonly string[];
 	followUps: readonly string[];
+	/** Authoritative FIFO projection for atomic ID-addressed withdrawal. */
+	queuedUserActions?: readonly QueuedUserActionDescriptor[];
+	activeOperationSet?: OwnedOperationSet;
 	active?: {
 		kind: "turn" | "session_command";
 		phase: "preparing" | "committing" | "running";
