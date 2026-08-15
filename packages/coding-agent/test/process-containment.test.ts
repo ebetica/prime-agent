@@ -54,7 +54,7 @@ describe("rootless PID namespace containment", () => {
 		expect(typeof (await probePidNamespaceContainment())).toBe("boolean");
 	});
 
-	it("resolves enforcement and init outside the target kernel environment", async () => {
+	it("isolates enforcement and init from model cwd, imports, and host controls", async () => {
 		if (!(await probePidNamespaceContainment())) return;
 		const dir = mkdtempSync(join(tmpdir(), "prime-containment-host-path-test-"));
 		tempDirs.push(dir);
@@ -72,14 +72,46 @@ exit 1
 		writeFileSync(
 			join(dir, "json.py"),
 			`open(${JSON.stringify(importMarker)}, "w").write("used")
-raise RuntimeError("target PYTHONPATH reached init")
+raise RuntimeError("model cwd or PYTHONPATH reached init")
 `,
 		);
 
-		const operation = await launchPidNamespaceOperation("/bin/sleep", ["60"], {
-			env: { ...process.env, PATH: dir, PYTHONPATH: dir },
-		});
-		await operation.killAndWaitVerified();
+		const daemonControl = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
+		const ownedControl = "PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR";
+		const previousDaemonControl = process.env[daemonControl];
+		const previousOwnedControl = process.env[ownedControl];
+		process.env[daemonControl] = "daemon-token";
+		process.env[ownedControl] = "owned-descriptor";
+		let observedArgs: string[] = [];
+		let observedEnvironment: NodeJS.ProcessEnv = {};
+		const observeSpawn: ContainmentSpawn = (command, args, options) => {
+			observedArgs = args;
+			observedEnvironment = options.env ?? {};
+			return spawn(command, args, options);
+		};
+		try {
+			const operation = await launchPidNamespaceOperation(
+				"/bin/sleep",
+				["60"],
+				{ cwd: dir, env: { ...process.env, PATH: dir, PYTHONPATH: dir } },
+				undefined,
+				{ spawn: observeSpawn },
+			);
+			await operation.killAndWaitVerified();
+		} finally {
+			if (previousDaemonControl === undefined) delete process.env[daemonControl];
+			else process.env[daemonControl] = previousDaemonControl;
+			if (previousOwnedControl === undefined) delete process.env[ownedControl];
+			else process.env[ownedControl] = previousOwnedControl;
+		}
+		expect(observedArgs).toContain("-I");
+		expect(observedEnvironment[daemonControl]).toBeUndefined();
+		expect(observedEnvironment[ownedControl]).toBeUndefined();
+		const targetEnvironment = JSON.parse(
+			observedEnvironment.PRIME_AGENT_INTERNAL_CONTAINED_KERNEL_ENV ?? "{}",
+		) as NodeJS.ProcessEnv;
+		expect(targetEnvironment[daemonControl]).toBeUndefined();
+		expect(targetEnvironment[ownedControl]).toBeUndefined();
 		expect(existsSync(unshareMarker)).toBe(false);
 		expect(existsSync(importMarker)).toBe(false);
 	});

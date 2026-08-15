@@ -79,7 +79,7 @@ describe("KernelManager startup", () => {
 		}
 	}, 10_000);
 
-	it("scrubs daemon controls from direct model kernels", async () => {
+	it("scrubs host controls from direct model kernels", async () => {
 		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		const inherited = process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET;
@@ -89,13 +89,16 @@ describe("KernelManager startup", () => {
 		const manager = new KernelManager({
 			python: "python3",
 			cwd: tempDir,
-			env: { PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "override-token" },
+			env: {
+				PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "override-token",
+				PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR: "owned-descriptor",
+			},
 		});
 		try {
 			const result = await manager.execute(
-				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"))',
+				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"), os.environ.get("PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR"))',
 			);
-			expect(result.stdout.trim()).toBe("None None");
+			expect(result.stdout.trim()).toBe("None None None");
 		} finally {
 			await manager.kill();
 			if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
@@ -107,7 +110,7 @@ describe("KernelManager startup", () => {
 		}
 	}, 20_000);
 
-	it("scrubs daemon controls from forkserver templates and children", async () => {
+	it("scrubs host controls from forkserver templates and children", async () => {
 		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		const inherited = process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN;
@@ -118,13 +121,16 @@ describe("KernelManager startup", () => {
 		const manager = new KernelManager({
 			python: "python3",
 			cwd: tempDir,
-			env: { PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET: "override-socket" },
+			env: {
+				PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET: "override-socket",
+				PRIME_AGENT_INTERNAL_OWNED_PROFILE: "owned-profile",
+			},
 		});
 		try {
 			const result = await manager.execute(
-				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"))',
+				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"), os.environ.get("PRIME_AGENT_INTERNAL_OWNED_PROFILE"))',
 			);
-			expect(result.stdout.trim()).toBe("None None");
+			expect(result.stdout.trim()).toBe("None None None");
 			expect(forkServer.forkKernel).toHaveBeenCalledOnce();
 		} finally {
 			await manager.kill();

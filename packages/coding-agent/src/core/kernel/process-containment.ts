@@ -9,6 +9,7 @@ import { accessSync, constants, realpathSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import {
 	type ActiveOrphanProcess,
 	ORPHAN_PROCESS_JOURNAL_ENV,
@@ -368,12 +369,12 @@ export async function launchPidNamespaceOperation(
 	const spawnProcess: ContainmentSpawn = launchOptions.spawn ?? spawn;
 	const unshare = trustedSystemExecutable("unshare");
 	const init = trustedInitExecutable(launchOptions.initCommand);
-	const targetEnvironment = options.env ?? process.env;
-	const initEnvironment = {
-		...process.env,
-		[CONTAINED_KERNEL_ENV]: JSON.stringify(targetEnvironment),
-	};
-	const monitor = spawnProcess(unshare, [...UNSHARE_ARGS, init, "-c", NAMESPACE_INIT, command, ...args], {
+	const targetEnvironment = modelSubprocessEnv(options.env);
+	const initEnvironment = modelSubprocessEnv();
+	// Host-only handoff to the isolated namespace init; the init removes it
+	// before spawning the already-sanitized target kernel environment.
+	initEnvironment[CONTAINED_KERNEL_ENV] = JSON.stringify(targetEnvironment);
+	const monitor = spawnProcess(unshare, [...UNSHARE_ARGS, init, "-I", "-c", NAMESPACE_INIT, command, ...args], {
 		...options,
 		env: initEnvironment,
 		stdio: ["ignore", "pipe", "pipe", "pipe"],

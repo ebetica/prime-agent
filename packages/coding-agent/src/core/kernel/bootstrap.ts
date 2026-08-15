@@ -9,6 +9,7 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
 const BOOTSTRAP_SCHEMA = 8;
@@ -374,7 +375,8 @@ async function resolveWritableKernelVenvDir(): Promise<string> {
 function run(command: string, args: string[], options: { stdio?: "ignore" | "inherit" } = {}): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
-			env: process.env,
+			cwd: path.parse(process.execPath).root,
+			env: modelSubprocessEnv(),
 			stdio: options.stdio ?? "ignore",
 		});
 		child.on("error", reject);
@@ -391,7 +393,7 @@ function run(command: string, args: string[], options: { stdio?: "ignore" | "inh
 
 async function pythonImports(python: string, moduleName: string): Promise<boolean> {
 	try {
-		await run(python, ["-c", `import ${moduleName}`], { stdio: "ignore" });
+		await run(python, ["-I", "-c", `import ${moduleName}`], { stdio: "ignore" });
 		return true;
 	} catch {
 		return false;
@@ -404,7 +406,7 @@ async function hasIpykernel(python: string): Promise<boolean> {
 
 async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
 	try {
-		await run(python, ["-c", RUNTIME_READY_CHECK], { stdio: "ignore" });
+		await run(python, ["-I", "-c", RUNTIME_READY_CHECK], { stdio: "ignore" });
 		return true;
 	} catch {
 		return false;

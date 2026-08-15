@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
@@ -85,6 +85,7 @@ function writeFakePython(filePath: string, importableModules: readonly string[])
 		filePath,
 		[
 			"#!/bin/sh",
+			'if [ "$1" = "-I" ]; then shift; fi',
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
 			cases,
@@ -119,6 +120,7 @@ function installFakeUv(): string {
 			'  mkdir -p "$venv/bin"',
 			"  cat > \"$venv/bin/python\" <<'PY'",
 			"#!/bin/sh",
+			'if [ "$1" = "-I" ]; then shift; fi',
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
 			'    "import ipykernel"|"import rlm") exit 0 ;;',
@@ -462,6 +464,7 @@ dependencies = ["httpx"]
 			python,
 			[
 				"#!/bin/sh",
+				'if [ "$1" = "-I" ]; then shift; fi',
 				'if [ "$1" = "-c" ]; then',
 				'  case "$2" in',
 				'    "import ipykernel"|"import rlm") exit 0 ;;',
@@ -500,6 +503,33 @@ dependencies = ["httpx"]
 		await expect(ensureKernelPython()).resolves.toBe(overridePython);
 	});
 
+	it("isolates bootstrap probes from model cwd and host control capabilities", async () => {
+		const overridePython = join(tempDir, "override-python");
+		const logPath = join(tempDir, "probe.log");
+		writeExecutable(
+			overridePython,
+			`#!/bin/sh
+printf '%s|%s|%s|%s\n' "$PWD" "\${PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN-unset}" "\${PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR-unset}" "$*" >> ${JSON.stringify(logPath)}
+exit 0
+`,
+		);
+		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
+		process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN = "daemon-token";
+		process.env.PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR = "owned-descriptor";
+
+		await expect(ensureKernelPython()).resolves.toBe(overridePython);
+
+		const records = readFileSync(logPath, "utf8").trim().split("\n");
+		expect(records.length).toBeGreaterThan(1);
+		for (const record of records) {
+			const [cwd, daemonControl, ownedControl, args] = record.split("|");
+			expect(cwd).toBe(parse(process.execPath).root);
+			expect(daemonControl).toBe("unset");
+			expect(ownedControl).toBe("unset");
+			expect(args).toMatch(/^-I -c /);
+		}
+	});
+
 	it("allows PRIME_AGENT_KERNEL_PYTHON missing Python skill imports", async () => {
 		const overridePython = join(tempDir, "override-python");
 		const pythonSkill = createPythonSkill();
@@ -535,6 +565,7 @@ dependencies = ["httpx"]
 			overridePython,
 			[
 				"#!/bin/sh",
+				'if [ "$1" = "-I" ]; then shift; fi',
 				'if [ "$1" = "-c" ]; then',
 				'  case "$2" in',
 				'    "import ipykernel"|"import rlm") exit 0 ;;',
