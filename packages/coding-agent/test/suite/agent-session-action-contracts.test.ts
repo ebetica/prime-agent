@@ -122,6 +122,8 @@ describe("AgentSession action contracts", () => {
 
 		await harness.session.steer("public steer");
 		await harness.session.followUp("public follow-up");
+		await harness.session.steer("scheduled steer", undefined, { source: "internal" });
+		await harness.session.followUp("scheduled follow-up", undefined, { source: "internal" });
 		await harness.session.restoreSteeringMessage("recovered steer");
 		await harness.session.restoreFollowUpMessage("recovered follow-up");
 		await harness.session.restoreSteeringMessage("rpc restored steer", undefined, { source: "rpc" });

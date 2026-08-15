@@ -8792,7 +8792,7 @@ describe("daemon mode helpers", () => {
 
 		await fixture.runCronJob(makeCronJob({ ...job, activeSessionId: fixture.activeSessionId }));
 
-		const expectedOptions = expect.objectContaining({ streamingBehavior, source: "rpc" });
+		const expectedOptions = expect.objectContaining({ streamingBehavior, source: "internal" });
 		if (method === "promptHeartbeat") {
 			expect(fixture.promptHeartbeat).toHaveBeenCalledWith(
 				expect.objectContaining({ id: job.id, prompt: "heartbeat prompt" }),

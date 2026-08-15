@@ -576,8 +576,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Coalesce follow-up queueing so only one pending follow-up exists for this key. */
 	followUpQueueKey?: string;
-	/** Source of input for extension input event handlers. Defaults to "interactive". */
-	source?: InputSource;
+	/** Source of input for extension input event handlers and queued-action provenance. Defaults to "interactive". */
+	source?: InputSource | "internal";
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean, queued?: boolean) => void;
 	/** Queue instead of starting immediately when the session is idle but already has queued work. */
@@ -4796,7 +4796,9 @@ export class AgentSession {
 					parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
 					extensionCommands: expandPromptTemplates ? "execute" : "ignore",
 					inputSource:
-						!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
+						!isInternalPrompt && !options?.skipInputHandlers && options?.source !== "internal"
+							? (options?.source ?? "interactive")
+							: undefined,
 					expandSkills: expandPromptTemplates,
 					expandPromptTemplates,
 				});

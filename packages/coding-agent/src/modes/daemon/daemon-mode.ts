@@ -1690,7 +1690,7 @@ export class AgentDaemon {
 				{
 					streamingBehavior,
 					followUpQueueKey: `heartbeat:${runnableJob.id}`,
-					source: "rpc",
+					source: "internal",
 				},
 				getRunnableJob,
 			);
@@ -1702,7 +1702,7 @@ export class AgentDaemon {
 			runnableJob.prompt,
 			{
 				streamingBehavior: "followUp",
-				source: "rpc",
+				source: "internal",
 			},
 			canPrompt,
 			false,
