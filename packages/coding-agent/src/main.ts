@@ -1260,6 +1260,9 @@ export async function main(args: string[], options?: MainOptions) {
 	// daemon fallback must not seed that goal into unrelated future sessions.
 	const daemonDefaultSessionConfig = daemonServerDefaultSessionConfig(defaultSessionConfig);
 	const runtimeDefaultSessionConfig = appMode === "daemon" ? daemonDefaultSessionConfig : defaultSessionConfig;
+	// Capture the host mode before any model-controlled runtime or extension starts.
+	// Daemon and owned-worker sessions must never downgrade to unmanaged kernels.
+	const kernelContainment = appMode === "daemon" || isOwnedSessionWorkerProcess() ? "required" : "best-effort";
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -1285,6 +1288,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager,
 			sessionStartEvent,
 			...resolvedSessionOptions,
+			kernelContainment,
 			// Main agents boot their kernel in the background at session creation;
 			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
 			prewarmIpythonKernel: true,

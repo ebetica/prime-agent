@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { waitForChildProcess } from "../utils/child-process.js";
+import { modelSubprocessEnv } from "./model-subprocess-env.js";
 
 /**
  * Options for executing shell commands.
@@ -32,21 +33,6 @@ export interface ExecResult {
 	killed: boolean;
 }
 
-function mergeExecEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv | undefined {
-	if (!env) {
-		return undefined;
-	}
-	const merged: NodeJS.ProcessEnv = { ...process.env };
-	for (const [key, value] of Object.entries(env)) {
-		if (value === undefined) {
-			delete merged[key];
-		} else {
-			merged[key] = value;
-		}
-	}
-	return merged;
-}
-
 /**
  * Execute a shell command and return stdout/stderr/code.
  * Supports timeout and abort signal.
@@ -64,7 +50,7 @@ export async function execCommand(
 			stdio: ["ignore", "pipe", "pipe"],
 			// Merge per-call env over the parent env so callers can scope vars
 			// (e.g. herdr pane identity) without mutating the shared process.env.
-			env: mergeExecEnv(options?.env),
+			env: modelSubprocessEnv(options?.env),
 		});
 
 		let stdout = "";

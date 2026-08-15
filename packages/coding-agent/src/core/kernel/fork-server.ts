@@ -12,6 +12,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import { FORK_SERVER_SCRIPT } from "./fork-server-script.js";
 
 const READY_TIMEOUT_MS = 30_000;
@@ -94,7 +95,7 @@ class ForkServer {
 		this.params = params;
 		// Snapshot now and launch the template with this same object, so the guard's
 		// comparison uses exactly the env the interpreter imported with.
-		this.launchEnv = { ...process.env };
+		this.launchEnv = modelSubprocessEnv();
 	}
 
 	get isDead(): boolean {
@@ -335,6 +336,7 @@ function registerForkServerCleanupOnce(): void {
 export async function forkKernel(python: string, spawn: SpawnParams): Promise<number> {
 	if (!isForkServerEnabled()) throw new ForkServerUnavailable("forkserver disabled");
 	registerForkServerCleanupOnce();
+	const sanitizedSpawn: SpawnParams = { ...spawn, env: modelSubprocessEnv(spawn.env) };
 	const key = keyFor({ python });
 	let server = servers.get(key);
 	if (!server || server.isDead) {
@@ -344,11 +346,11 @@ export async function forkKernel(python: string, spawn: SpawnParams): Promise<nu
 	// Compare against the template's own launch env (not live process.env): a kernel
 	// overriding an interpreter-startup var to a value the template didn't import
 	// with can't be forked — defer to direct spawn rather than boot with wrong sys.path.
-	if (server.needsStartupEnvNotInTemplate(spawn.env)) {
+	if (server.needsStartupEnvNotInTemplate(sanitizedSpawn.env)) {
 		throw new ForkServerUnavailable("kernel overrides interpreter-startup env; using direct spawn");
 	}
 	try {
-		return await server.spawnKernel(spawn);
+		return await server.spawnKernel(sanitizedSpawn);
 	} catch (err) {
 		// Only evict if the map still points at this dead instance: a concurrent
 		// caller may have already replaced it with a fresh live server under this key.

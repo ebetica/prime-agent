@@ -506,6 +506,8 @@ export interface AgentSessionConfig {
 	 * Only applies to main agents (rlmDepth 0); subagent kernels stay lazy. Default: false.
 	 */
 	prewarmIpythonKernel?: boolean;
+	/** Host-owned kernel containment policy. Default: best-effort. */
+	kernelContainment?: "best-effort" | "required";
 	/** Test/extension hook for automatic refine review decisions. Defaults to the model-backed review gate. */
 	autoRefineReviewer?: AutoRefineReviewer;
 	/**
@@ -1268,6 +1270,7 @@ export class AgentSession {
 	/** True once the runtime has been built once; later builds are in-process rebuilds (/reload). */
 	private _ipythonRuntimeBuilt = false;
 	private readonly _prewarmIpythonKernel: boolean;
+	private readonly _kernelContainment: "best-effort" | "required";
 	private _rlmDepth: number;
 	private readonly _configuredRlmMaxDepth: number | undefined;
 	private _rlmMaxDepth: number;
@@ -1394,6 +1397,7 @@ export class AgentSession {
 		this._rlmMaxDepth = resolvedRlmMaxDepth.maxDepth;
 		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
+		this._kernelContainment = config.kernelContainment ?? "best-effort";
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
 		this._rlmSessionDir = config.rlmSessionDir;
@@ -9190,6 +9194,7 @@ export class AgentSession {
 				hostHandlers: this._createKernelHostHandlers(this._kernelHostRequestAbortController.signal),
 				pythonSkills,
 				snapshotDir: this._ipythonKernelSnapshotDir,
+				kernelContainment: this._kernelContainment,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
 			});
@@ -9952,6 +9957,7 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			kernelContainment: this._kernelContainment,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {

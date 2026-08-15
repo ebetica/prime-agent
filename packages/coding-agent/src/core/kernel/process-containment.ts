@@ -11,6 +11,7 @@ import type { Readable } from "node:stream";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import {
 	type ActiveOrphanProcess,
+	ORPHAN_PROCESS_JOURNAL_ENV,
 	registerOrphanProcessDurably,
 	unregisterOrphanProcessDurably,
 } from "../orphan-process-journal.js";
@@ -361,6 +362,9 @@ export async function launchPidNamespaceOperation(
 ): Promise<PidNamespaceOperation> {
 	const generationId = randomUUID();
 	if (process.platform !== "linux") throw new ContainmentUnavailableError("PID namespace containment requires Linux");
+	if (!process.env[ORPHAN_PROCESS_JOURNAL_ENV]) {
+		throw new ContainmentUnavailableError("Durable containment journal is not configured for this session");
+	}
 	const spawnProcess: ContainmentSpawn = launchOptions.spawn ?? spawn;
 	const unshare = trustedSystemExecutable("unshare");
 	const init = trustedInitExecutable(launchOptions.initCommand);

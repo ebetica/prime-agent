@@ -15,6 +15,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import { previewBashCommand } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
@@ -75,7 +76,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				const child = spawn(shell, [...args, command], {
 					cwd,
 					detached: process.platform !== "win32",
-					env: env ?? getShellEnv(),
+					env: modelSubprocessEnv(env ?? getShellEnv()),
 					stdio: ["ignore", "pipe", "pipe"],
 				});
 				if (child.pid) trackDetachedChildPid(child.pid);

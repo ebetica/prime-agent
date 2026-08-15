@@ -79,20 +79,110 @@ describe("KernelManager startup", () => {
 		}
 	}, 10_000);
 
-	it("fails closed when durable containment registration is unavailable", async () => {
+	it("scrubs daemon controls from direct model kernels", async () => {
+		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		const inherited = process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
+		process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET = "inherited-socket";
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		const manager = new KernelManager({
+			python: "python3",
+			cwd: tempDir,
+			env: { PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN: "override-token" },
+		});
+		try {
+			const result = await manager.execute(
+				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"))',
+			);
+			expect(result.stdout.trim()).toBe("None None");
+		} finally {
+			await manager.kill();
+			if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
+			if (inherited === undefined) delete process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET;
+			else process.env.PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET = inherited;
+			if (previousFork === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousFork;
+		}
+	}, 20_000);
+
+	it("scrubs daemon controls from forkserver templates and children", async () => {
+		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		const inherited = process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "1";
+		process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN = "inherited-token";
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		vi.mocked(forkServer.forkKernel).mockClear();
+		const manager = new KernelManager({
+			python: "python3",
+			cwd: tempDir,
+			env: { PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET: "override-socket" },
+		});
+		try {
+			const result = await manager.execute(
+				'import os; print(os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN"), os.environ.get("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET"))',
+			);
+			expect(result.stdout.trim()).toBe("None None");
+			expect(forkServer.forkKernel).toHaveBeenCalledOnce();
+		} finally {
+			await manager.kill();
+			if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
+			if (inherited === undefined) delete process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN;
+			else process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN = inherited;
+			if (previousFork === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousFork;
+		}
+	}, 20_000);
+
+	it("fails closed when a required host is missing its containment journal", async () => {
+		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		const journal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "1";
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		vi.mocked(forkServer.forkKernel).mockClear();
+		try {
+			const manager = new KernelManager({
+				python: "python3",
+				cwd: tempDir,
+				kernelContainment: "required",
+			});
+			await expect(manager.execute("print('must not launch')")).rejects.toThrow(
+				"Durable containment journal is not configured",
+			);
+			expect(manager.containedGenerationId).toBeUndefined();
+			expect(forkServer.forkKernel).not.toHaveBeenCalled();
+		} finally {
+			if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
+			if (previousFork === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousFork;
+		}
+	}, 10_000);
+
+	it("keeps unmanaged IPython available without containment capability but fails closed on storage faults", async () => {
 		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 		const configuredJournal = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
 		try {
-			for (const journal of [undefined, join(tempDir, "missing-directory", "orphans.jsonl")]) {
-				if (journal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
-				else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
-				const manager = new KernelManager({ python: "python3", cwd: tempDir });
-				await expect(manager.execute("print('must not launch')")).rejects.toThrow(
-					"Durable containment monitor registration failed",
-				);
-				expect(manager.containedGenerationId).toBeUndefined();
+			delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+			const unmanaged = new KernelManager({ python: "python3", cwd: tempDir });
+			try {
+				const result = await unmanaged.execute("print('ordinary')");
+				expect(result.stdout.trim()).toBe("ordinary");
+				expect(unmanaged.containedGenerationId).toBeUndefined();
+			} finally {
+				await unmanaged.kill();
 			}
+
+			process.env[ORPHAN_PROCESS_JOURNAL_ENV] = join(tempDir, "missing-directory", "orphans.jsonl");
+			const storageFault = new KernelManager({ python: "python3", cwd: tempDir });
+			await expect(storageFault.execute("print('must not launch')")).rejects.toThrow(
+				"Durable containment monitor registration failed",
+			);
+			expect(storageFault.containedGenerationId).toBeUndefined();
 		} finally {
 			if (configuredJournal === undefined) delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 			else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = configuredJournal;

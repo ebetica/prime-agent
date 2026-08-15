@@ -276,6 +276,8 @@ export interface IpythonToolOptions {
 	/** Optional explicit shell path for bare %%bash cells. */
 	shellPath?: string;
 	sessionId?: string;
+	/** Host-owned containment policy. Required mode never launches unmanaged. */
+	kernelContainment?: "best-effort" | "required";
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
@@ -483,6 +485,7 @@ export class IpythonKernelProvisioner {
 				cwd: this.cwd,
 				env: this.options?.env,
 				sessionId: this.options?.sessionId,
+				kernelContainment: this.options?.kernelContainment,
 				hostHandlers: this.options?.hostHandlers,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.

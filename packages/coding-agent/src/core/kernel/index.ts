@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
 import {
@@ -88,6 +89,8 @@ export interface KernelManagerOptions {
 	cwd?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
+	/** Required mode fails instead of falling back to an unmanaged kernel. */
+	kernelContainment?: "best-effort" | "required";
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
@@ -519,7 +522,15 @@ function installSignalHandlersOnce(): void {
 export class KernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills" | "snapshot" | "containmentLauncher"
+		| "python"
+		| "cwd"
+		| "env"
+		| "sessionId"
+		| "kernelContainment"
+		| "hostHandlers"
+		| "pythonSkills"
+		| "snapshot"
+		| "containmentLauncher"
 	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
@@ -563,6 +574,7 @@ export class KernelManager {
 			cwd: options.cwd,
 			env: options.env,
 			sessionId: options.sessionId,
+			kernelContainment: options.kernelContainment,
 			hostHandlers: options.hostHandlers,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
@@ -629,7 +641,7 @@ export class KernelManager {
 
 		const spawnOptions: SpawnOptions = {
 			cwd: this.options.cwd,
-			env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
+			env: modelSubprocessEnv(this.options.env),
 			stdio: ["ignore", "pipe", "pipe"],
 		};
 		const kernelArgs = ["-m", "ipykernel_launcher", "-f", connection.path];
@@ -641,6 +653,7 @@ export class KernelManager {
 			this.kernelStderr += operation.stderrTail;
 		} catch (error) {
 			if (!(error instanceof ContainmentUnavailableError)) throw error;
+			if (this.options.kernelContainment === "required") throw error;
 			this.appendKernelDiagnostic(`PID namespace unavailable, using unmanaged kernel: ${error.message}`);
 			this.kernelGenerationId = undefined;
 		}
@@ -655,7 +668,7 @@ export class KernelManager {
 					// Match the direct-spawn env exactly: merge the current host env with
 					// the per-kernel overrides, applied fresh in the child (the template's
 					// inherited env snapshot may be stale by fork time).
-					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
+					env: spawnOptions.env,
 				});
 				forked = true;
 			} catch (err) {

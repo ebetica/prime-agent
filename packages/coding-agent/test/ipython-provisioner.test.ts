@@ -87,6 +87,21 @@ describe("IpythonKernelProvisioner", () => {
 		}
 	});
 
+	it("propagates required containment and never starts without a journal", async () => {
+		delete process.env[ORPHAN_PROCESS_JOURNAL_ENV];
+		const { python, countRuns } = writeFakePython();
+		const provisioner = new IpythonKernelProvisioner(tempDir, {
+			python,
+			kernelContainment: "required",
+		});
+		try {
+			await expect(provisioner.ensure()).rejects.toThrow("Durable containment journal is not configured");
+			expect(countRuns()).toBe(0);
+		} finally {
+			await provisioner.dispose();
+		}
+	});
+
 	it("memoizes concurrent ensure() calls into one startup", async () => {
 		const { python, countRuns } = writeFakePython();
 		const provisioner = new IpythonKernelProvisioner(tempDir, { python });
