@@ -71,7 +71,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 25 adds durable idempotent agent-message send and acknowledgement commands.
 // Revision 26 adds ownership-fenced operation stop and ID-addressed queue withdrawal.
 export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-pending";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-41ac5136a6cd";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

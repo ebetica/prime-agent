@@ -1,8 +1,10 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { Type } from "typebox";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionAction, transitionSessionAction } from "../../src/core/session-action-store.js";
 import { createHarness, getUserTexts, type Harness } from "./harness.js";
-import { createWaitingHarness, withStreaming } from "./scheduling.js";
+import { createDeferred, createWaitingHarness, withStreaming } from "./scheduling.js";
 
 describe("AgentSession action contracts", () => {
 	const harnesses: Harness[] = [];
@@ -175,38 +177,105 @@ describe("AgentSession action contracts", () => {
 		expect(getUserTexts(harness)).toEqual(["start", "same"]);
 	});
 
-	it("makes matched stop retryable without aborting a replacement owner", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		let interrupted = 0;
-		const registry = (
-			harness.session as unknown as {
-				_ownedOperations: {
-					admitRoot(kind: "agent_run", hooks: { interrupt(): void; settled: Promise<void> }): unknown;
-				};
-			}
-		)._ownedOperations;
-		registry.admitRoot("agent_run", {
-			interrupt() {
-				interrupted++;
+	it("kills only a kernel generation owned by an active IPython tool", async () => {
+		const started = createDeferred();
+		const release = createDeferred();
+		const ipython: AgentTool = {
+			name: "ipython",
+			label: "IPython",
+			description: "Active kernel cell fixture",
+			parameters: Type.Object({}),
+			execute: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: [{ type: "text", text: "done" }], details: {} };
 			},
-			settled: Promise.resolve(),
-		});
+		};
+		const harness = await createHarness({ tools: [ipython] });
+		harnesses.push(harness);
+		const kill = vi.fn(async () => {});
+		(
+			harness.session as unknown as { _ipythonKernelProvisioner: { kill(): Promise<void> } }
+		)._ipythonKernelProvisioner = {
+			kill,
+		};
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" })]);
+		const prompt = harness.session.prompt("run cell");
+		await started.promise;
 		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
 		expect(token).toBeDefined();
-		expect(await harness.session.stopActiveOperations(token!)).toEqual({ status: "stopped", kernelRestarted: false });
+		const stopping = harness.session.stopActiveOperations(token!);
+		release.resolve();
+		expect(await stopping).toEqual({ status: "stopped" });
+		await prompt;
+		expect(kill).toHaveBeenCalledOnce();
+	});
 
-		registry.admitRoot("agent_run", {
-			interrupt() {
-				interrupted++;
+	it("preserves an idle persistent kernel when stopping a non-IPython run", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		const kill = vi.fn(async () => {});
+		(
+			harness.session as unknown as { _ipythonKernelProvisioner: { kill(): Promise<void> } }
+		)._ipythonKernelProvisioner = {
+			kill,
+		};
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+		await waitForToolStart;
+		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		const stopping = harness.session.stopActiveOperations(token!);
+		releaseToolExecution();
+		expect(await stopping).toEqual({ status: "stopped" });
+		await promptPromise;
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	it("keeps an identical queued successor fenced until exact stop settles", async () => {
+		const successorStarted = createDeferred();
+		const successorRelease = createDeferred();
+		const holdSuccessor: AgentTool = {
+			name: "hold_successor",
+			label: "Hold successor",
+			description: "Keep the replacement run active",
+			parameters: Type.Object({}),
+			execute: async () => {
+				successorStarted.resolve();
+				await successorRelease.promise;
+				return { content: [{ type: "text", text: "released" }], details: {} };
 			},
-			settled: Promise.resolve(),
+		};
+		const waiting = await createWaitingHarness({ tools: [holdSuccessor] });
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("hold_successor", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("successor done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("same", { streamingBehavior: "followUp" });
+		const predecessor = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(predecessor).toBeDefined();
+
+		let stopSettled = false;
+		const stopping = harness.session.stopActiveOperations(predecessor!).finally(() => {
+			stopSettled = true;
 		});
-		expect(await harness.session.stopActiveOperations(token!)).toEqual({
-			status: "already_stopped",
-			kernelRestarted: false,
-		});
-		expect(interrupted).toBe(1);
-		expect(await harness.session.stopActiveOperations("not-the-run")).toEqual({ status: "stale" });
+		await Promise.resolve();
+		expect(harness.session.getSessionActionSnapshot().queuedUserActions).toHaveLength(1);
+		expect(stopSettled).toBe(false);
+		releaseToolExecution();
+		expect(await stopping).toEqual({ status: "stopped" });
+		await promptPromise;
+
+		await successorStarted.promise;
+		const replacement = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(replacement).toBeDefined();
+		expect(replacement).not.toBe(predecessor);
+		expect(await harness.session.stopActiveOperations(predecessor!)).toEqual({ status: "already_stopped" });
+		expect(harness.session.getSessionActionSnapshot().activeOperationSet?.token).toBe(replacement);
+		successorRelease.resolve();
+		await harness.session.waitForIdle();
 	});
 });

@@ -114,6 +114,7 @@ interface InspectableRlmRun {
 	abort: () => void;
 	status: string;
 	settled: boolean;
+	completion: Promise<void>;
 	error?: string;
 	detachedDeletion?: Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number];
 	session?: AgentSession;
@@ -2306,6 +2307,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(run.status).toBe("cancelled");
 		expect(run.error).toBe("Parent session aborted");
 		releaseChild();
+		await run.completion;
+		expect(run.settled).toBe(true);
+		expect(runs.has(spawned.rlm_child_id)).toBe(false);
 		expect(spawned.rlm_child_id).toBe(run.id);
 	});
 

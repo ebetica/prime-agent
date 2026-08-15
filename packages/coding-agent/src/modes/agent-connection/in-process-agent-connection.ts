@@ -214,9 +214,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.withdrawQueuedUserActions(ids);
 	}
 
-	async stopActiveOperations(
-		operationSetToken: string,
-	): Promise<{ status: "stopped" | "already_stopped" | "stale"; kernelRestarted?: boolean }> {
+	async stopActiveOperations(operationSetToken: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
 		return this.session.stopActiveOperations(operationSetToken);
 	}
 

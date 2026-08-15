@@ -684,9 +684,7 @@ export interface AgentConnection {
 	getQueuedUserActions(): Promise<readonly AgentConnectionQueuedUserAction[]>;
 	cancelQueuedAction(id: string): Promise<boolean>;
 	withdrawQueuedActions(ids: readonly string[]): Promise<readonly AgentConnectionQueuedUserAction[]>;
-	stopActiveOperations(
-		operationSetToken: string,
-	): Promise<{ status: "stopped" | "already_stopped" | "stale"; kernelRestarted?: boolean }>;
+	stopActiveOperations(operationSetToken: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }>;
 
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;

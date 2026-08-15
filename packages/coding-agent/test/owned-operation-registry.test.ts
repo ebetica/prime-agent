@@ -10,55 +10,22 @@ function deferred() {
 }
 
 describe("OwnedOperationRegistry", () => {
-	it("publishes an immutable, single-owner operation set and invalidates changed sets", () => {
-		const settled = Promise.resolve();
+	it("publishes one immutable root set with a stable token", () => {
 		const registry = new OwnedOperationRegistry();
-		const root = registry.admitRoot("agent_run", { interrupt() {}, settled });
+		const root = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });
 		const first = registry.activeSet()!;
 		expect(Object.isFrozen(first)).toBe(true);
 		expect(Object.isFrozen(first.operations)).toBe(true);
+		expect(first.operations).toEqual([{ id: root.id, kind: "agent_run" }]);
 		expect(registry.activeSet()).toBe(first);
-
-		const child = registry.admitChild(root.id, "subprocess", { interrupt() {}, settled });
-		const second = registry.activeSet()!;
-		expect(second.token).not.toBe(first.token);
-		expect(second.operations).toEqual([
-			{ id: root.id, kind: "agent_run" },
-			{ id: child.id, kind: "subprocess" },
-		]);
-		expect(() => registry.admitChild("another-owner", "subprocess", { interrupt() {}, settled })).toThrow(
-			"admission is closed",
-		);
 	});
 
-	it("keeps explicit children owned after the root settles and closes late admission", () => {
-		const registry = new OwnedOperationRegistry();
-		const root = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });
-		const child = registry.admitChild(root.id, "kernel_cell", { interrupt() {}, settled: Promise.resolve() });
-		registry.complete(root.id);
-		expect(registry.activeSet()?.operations).toEqual([{ id: child.id, kind: "kernel_cell" }]);
-		expect(() => registry.admitChild(root.id, "subprocess", { interrupt() {}, settled: Promise.resolve() })).toThrow(
-			"admission is closed",
-		);
-		registry.complete(child.id);
-		expect(registry.activeSet()).toBeUndefined();
-	});
-
-	it("closes admission and returns stopped only after durable intent, settlement, cleanup, and terminal receipt", async () => {
+	it("returns stopped only after interrupt, settlement, and broad cleanup", async () => {
 		const task = deferred();
 		const cleanup = deferred();
 		const order: string[] = [];
-		const registry = new OwnedOperationRegistry({
-			persistence: {
-				async writeStopIntent() {
-					order.push("intent");
-				},
-				async writeStopped() {
-					order.push("terminal");
-				},
-			},
-		});
-		const root = registry.admitRoot("kernel_cell", {
+		const registry = new OwnedOperationRegistry();
+		registry.admitRoot("agent_run", {
 			interrupt() {
 				order.push("interrupt");
 			},
@@ -74,59 +41,41 @@ describe("OwnedOperationRegistry", () => {
 		const stopping = registry.stop(token);
 		await Promise.resolve();
 		expect(registry.isStopping).toBe(true);
-		expect(() => registry.admitChild(root.id, "subprocess", { interrupt() {}, settled: Promise.resolve() })).toThrow(
-			"admission is closed",
-		);
-		expect(order).toEqual(["intent", "interrupt"]);
+		expect(order).toEqual(["interrupt"]);
 		task.resolve();
 		await Promise.resolve();
 		cleanup.resolve();
-		expect(await stopping).toEqual({ status: "stopped", kernelRestarted: true });
-		expect(order).toEqual(["intent", "interrupt", "settled", "cleanup", "terminal"]);
-		expect(await registry.stop(token)).toEqual({ status: "already_stopped", kernelRestarted: true });
+		expect(await stopping).toEqual({ status: "stopped" });
+		expect(order).toEqual(["interrupt", "settled", "cleanup"]);
+		expect(await registry.stop(token)).toEqual({ status: "already_stopped" });
 		expect(registry.activeSet()).toBeUndefined();
 	});
 
-	it("attempts every interrupt and cleanup before fencing a failed stop", async () => {
-		const calls: string[] = [];
+	it("retains the exact owner fence when cleanup cannot be verified", async () => {
 		const registry = new OwnedOperationRegistry();
-		const root = registry.admitRoot("agent_run", {
+		registry.admitRoot("agent_run", {
 			interrupt() {
-				calls.push("root interrupt");
-				throw new Error("root interrupt failed");
+				throw new Error("interrupt failed");
 			},
 			settled: Promise.resolve(),
-			cleanup() {
-				calls.push("root cleanup");
-			},
-		});
-		registry.admitChild(root.id, "subprocess", {
-			interrupt() {
-				calls.push("child interrupt");
-			},
-			settled: Promise.reject(new Error("child settlement failed")),
-			cleanup() {
-				calls.push("child cleanup");
-			},
+			cleanup() {},
 		});
 		const token = registry.activeSet()!.token;
 		await expect(registry.stop(token)).rejects.toThrow("did not settle safely");
-		expect(calls).toEqual(["root interrupt", "child interrupt", "root cleanup", "child cleanup"]);
 		expect(registry.isStopping).toBe(true);
 		expect(registry.activeSet()?.token).toBe(token);
+		expect(() => registry.admitRoot("user_bash", { interrupt() {}, settled: Promise.resolve() })).toThrow(
+			"already admitted",
+		);
 	});
 
-	it("never lets a frozen stale token stop a changed or replacement owner", async () => {
+	it("never lets a predecessor token affect its replacement owner", async () => {
 		const registry = new OwnedOperationRegistry();
-		const root = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });
-		const stale = registry.activeSet()!.token;
-		registry.admitChild(root.id, "subprocess", { interrupt() {}, settled: Promise.resolve() });
-		expect(await registry.stop(stale)).toEqual({ status: "stale" });
-		const current = registry.activeSet()!.token;
-		expect(await registry.stop(current)).toEqual({ status: "stopped", kernelRestarted: false });
-
+		const first = registry.admitRoot("agent_run", { interrupt() {}, settled: Promise.resolve() });
+		const predecessor = registry.activeSet()!.token;
+		registry.complete(first.id);
 		registry.admitRoot("user_bash", { interrupt() {}, settled: Promise.resolve() });
-		expect(await registry.stop(current)).toEqual({ status: "already_stopped", kernelRestarted: false });
+		expect(await registry.stop(predecessor)).toEqual({ status: "stale" });
 		expect(registry.activeSet()?.operations[0]?.kind).toBe("user_bash");
 	});
 });

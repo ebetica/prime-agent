@@ -585,9 +585,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.withdrawn;
 	}
 
-	async stopActiveOperations(
-		operationSetToken: string,
-	): Promise<{ status: "stopped" | "already_stopped" | "stale"; kernelRestarted?: boolean }> {
+	async stopActiveOperations(operationSetToken: string): Promise<{ status: "stopped" | "already_stopped" | "stale" }> {
 		if (!this.client.supportsServerCapability("atomic_stop_v2")) {
 			throw new DaemonCapabilityUnavailableError("stop_active_operations", "atomic_stop_v2");
 		}

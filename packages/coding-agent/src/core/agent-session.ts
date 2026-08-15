@@ -992,6 +992,8 @@ interface RlmChildRun {
 	session?: AgentSession;
 	/** True once the detached run task has finished its catch and cleanup paths. */
 	settled: boolean;
+	completion: Promise<void>;
+	resolveCompletion(): void;
 	/** Selector snapshot for a delete admitted while runtime startup was still pending. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Re-emits the run's rlm_child_update snapshot with its current status. */
@@ -1164,6 +1166,7 @@ export class AgentSession {
 	};
 	private readonly _ownedOperations = new OwnedOperationRegistry();
 	private _activeAgentOperation?: { id: string; settle(): void };
+	private readonly _activeIpythonToolCalls = new Set<string>();
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -3417,17 +3420,28 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
+		if (event.type === "tool_execution_start" && event.toolName === "ipython") {
+			this._activeIpythonToolCalls.add(event.toolCallId);
+		} else if (event.type === "tool_execution_end" && event.toolName === "ipython") {
+			this._activeIpythonToolCalls.delete(event.toolCallId);
+		}
 		if (event.type === "agent_start" && !this._activeAgentOperation) {
 			let settle!: () => void;
 			const settled = new Promise<void>((resolve) => {
 				settle = resolve;
 			});
+			let killActiveKernelGeneration = false;
 			const operation = this._ownedOperations.admitRoot("agent_run", {
-				interrupt: () => this.requestAbort(),
+				interrupt: async () => {
+					killActiveKernelGeneration = this._activeIpythonToolCalls.size > 0;
+					await this.abort();
+				},
 				settled,
 				cleanup: async () => {
 					await this.agent.waitForIdle();
 					await this._agentEventQueue;
+					await Promise.all([...this._activeRlmChildRuns.values()].map((run) => run.completion));
+					if (killActiveKernelGeneration) await this._ipythonKernelProvisioner?.kill();
 				},
 			});
 			this._activeAgentOperation = { id: operation.id, settle };
@@ -5833,7 +5847,8 @@ export class AgentSession {
 	}
 
 	private _scheduleSessionInputPump(): void {
-		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
+		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0 || this._ownedOperations.isStopping)
+			return;
 		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
 			return;
 		}
@@ -6061,7 +6076,8 @@ export class AgentSession {
 	}
 
 	private _isBusyForSessionInput(point: "preflight" | "pump"): boolean {
-		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
+		const externalBusy =
+			this.isCompacting || this.isRetrying || this.isBashRunning || this._ownedOperations.isStopping;
 		if (point === "pump") {
 			return (
 				externalBusy ||
@@ -6648,10 +6664,10 @@ export class AgentSession {
 
 	async stopActiveOperations(operationSetToken: string): Promise<{
 		status: "stopped" | "already_stopped" | "stale";
-		kernelRestarted?: boolean;
 	}> {
 		const result = await this._ownedOperations.stop(operationSetToken);
 		this._emitQueueUpdate();
+		if (!this._ownedOperations.isStopping) this._scheduleSessionInputPump();
 		return result;
 	}
 
@@ -10670,6 +10686,10 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
+		let resolveRunCompletion!: () => void;
+		const runCompletion = new Promise<void>((resolve) => {
+			resolveRunCompletion = resolve;
+		});
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -10677,6 +10697,8 @@ export class AgentSession {
 			sessionDir: childSessionDir,
 			status: "queued",
 			settled: false,
+			completion: runCompletion,
+			resolveCompletion: resolveRunCompletion,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
 		};
@@ -10948,32 +10970,36 @@ export class AgentSession {
 				activity = undefined;
 				emitChildUpdate();
 			} finally {
-				if (run.detachedDeletion && childRuntime) {
-					try {
-						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
-					} catch {
-						if (!this._disposed && !this._disposing) {
-							this._rlmChildSessions.set(run.id, childRuntime.session);
-							this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
+				try {
+					if (run.detachedDeletion && childRuntime) {
+						try {
+							await this._deleteRlmSubagentSession(run.id, childRuntime.session);
+						} catch {
+							if (!this._disposed && !this._disposing) {
+								this._rlmChildSessions.set(run.id, childRuntime.session);
+								this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
+							}
 						}
 					}
-				}
-				if (this._activeRlmChildRuns.get(run.id) === run) {
-					if (this._rlmChildSessions.has(run.id)) {
-						this._activeRlmChildRuns.delete(run.id);
-						if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
-						run.abort = noopRlmChildAbort;
-						run.unsubscribe = undefined;
-						run.session = undefined;
-					} else if (run.status !== "error" || run.detachedDeletion) {
-						this._removeRlmSubagentTracking(run.id, run);
-					} else {
-						run.unsubscribe?.();
-						run.abort = noopRlmChildAbort;
-						run.unsubscribe = undefined;
+					if (this._activeRlmChildRuns.get(run.id) === run) {
+						if (this._rlmChildSessions.has(run.id)) {
+							this._activeRlmChildRuns.delete(run.id);
+							if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
+							run.abort = noopRlmChildAbort;
+							run.unsubscribe = undefined;
+							run.session = undefined;
+						} else if (run.status !== "error" || run.detachedDeletion) {
+							this._removeRlmSubagentTracking(run.id, run);
+						} else {
+							run.unsubscribe?.();
+							run.abort = noopRlmChildAbort;
+							run.unsubscribe = undefined;
+						}
 					}
+				} finally {
+					run.settled = true;
+					run.resolveCompletion();
 				}
-				run.settled = true;
 			}
 		})().catch(() => undefined);
 
