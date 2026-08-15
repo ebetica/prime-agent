@@ -992,8 +992,6 @@ interface RlmChildRun {
 	session?: AgentSession;
 	/** True once the detached run task has finished its catch and cleanup paths. */
 	settled: boolean;
-	completion: Promise<void>;
-	resolveCompletion(): void;
 	/** Selector snapshot for a delete admitted while runtime startup was still pending. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Re-emits the run's rlm_child_update snapshot with its current status. */
@@ -1165,8 +1163,12 @@ export class AgentSession {
 		queuedUserActions: [],
 	};
 	private readonly _ownedOperations = new OwnedOperationRegistry();
-	private _activeAgentOperation?: { id: string; settle(): void };
-	private readonly _activeIpythonToolCalls = new Set<string>();
+	private _activeAgentOperation?: {
+		id: string;
+		settle(): void;
+		touchedIpythonGeneration: boolean;
+		retrySettlementScheduled: boolean;
+	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -3417,13 +3419,20 @@ export class AgentSession {
 			);
 	}
 
+	private _completeActiveAgentOperation(expectedId: string): void {
+		const operation = this._activeAgentOperation;
+		if (!operation || operation.id !== expectedId) return;
+		operation.settle();
+		this._ownedOperations.complete(operation.id);
+		this._activeAgentOperation = undefined;
+		this._emitQueueUpdate();
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
-		if (event.type === "tool_execution_start" && event.toolName === "ipython") {
-			this._activeIpythonToolCalls.add(event.toolCallId);
-		} else if (event.type === "tool_execution_end" && event.toolName === "ipython") {
-			this._activeIpythonToolCalls.delete(event.toolCallId);
+		if (event.type === "tool_execution_start" && event.toolName === "ipython" && this._activeAgentOperation) {
+			this._activeAgentOperation.touchedIpythonGeneration = true;
 		}
 		if (event.type === "agent_start" && !this._activeAgentOperation) {
 			let settle!: () => void;
@@ -3432,19 +3441,26 @@ export class AgentSession {
 			});
 			let killActiveKernelGeneration = false;
 			const operation = this._ownedOperations.admitRoot("agent_run", {
-				interrupt: async () => {
-					killActiveKernelGeneration = this._activeIpythonToolCalls.size > 0;
-					await this.abort();
+				interrupt: () => {
+					killActiveKernelGeneration =
+						this._activeAgentOperation?.id === operation.id
+							? this._activeAgentOperation.touchedIpythonGeneration
+							: false;
+					this.requestAbort();
 				},
 				settled,
 				cleanup: async () => {
 					await this.agent.waitForIdle();
 					await this._agentEventQueue;
-					await Promise.all([...this._activeRlmChildRuns.values()].map((run) => run.completion));
 					if (killActiveKernelGeneration) await this._ipythonKernelProvisioner?.kill();
 				},
 			});
-			this._activeAgentOperation = { id: operation.id, settle };
+			this._activeAgentOperation = {
+				id: operation.id,
+				settle,
+				touchedIpythonGeneration: false,
+				retrySettlementScheduled: false,
+			};
 			this._emitQueueUpdate();
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
@@ -3463,11 +3479,16 @@ export class AgentSession {
 			}
 		} else if (event.type === "agent_end") {
 			const operation = this._activeAgentOperation;
-			if (operation) {
-				operation.settle();
-				this._ownedOperations.complete(operation.id);
-				this._activeAgentOperation = undefined;
-				this._emitQueueUpdate();
+			const retry = this._retryPromise;
+			if (operation && retry && !operation.retrySettlementScheduled) {
+				operation.retrySettlementScheduled = true;
+				void retry.then(async () => {
+					await this.agent.waitForIdle();
+					await this._agentEventQueue;
+					this._completeActiveAgentOperation(operation.id);
+				});
+			} else if (operation && !retry) {
+				this._completeActiveAgentOperation(operation.id);
 			}
 			const captured = new Set<AgentMessage>();
 			for (const action of this._actionStore.ownedActions()) {
@@ -5891,10 +5912,9 @@ export class AgentSession {
 					this._notifySessionInputCheckpointChange();
 					return;
 				}
-				// Selection and queued-only withdrawal are writers on the same fence. Once
-				// this block changes an action to selected/preparing, withdrawal must report
-				// it as not queued; if withdrawal acquired the fence first, selection cannot
-				// observe the removed action.
+				// Selection and exact withdrawal are writers on the same fence. The stable
+				// action ID remains withdrawable through preparation and until primary
+				// dispatch starts; then agent_start publishes the replacement Stop token.
 				const selectionFence = await this._acquireSessionActionCommitFence();
 				let first: QueuedSessionAction | undefined;
 				const actions: QueuedSessionAction[] = [];
@@ -6628,16 +6648,27 @@ export class AgentSession {
 		return "applied";
 	}
 
+	private _withdrawableQueuedUserActionRecords(): readonly QueuedSessionAction[] {
+		return this._actionStore.ownedActions().filter((action) => {
+			if (action.payload.kind !== "turn" || (action.source !== "interactive" && action.source !== "rpc")) {
+				return false;
+			}
+			const state = action.lifecycle.state;
+			return (
+				state === "queued" ||
+				state === "selected" ||
+				state === "preparing" ||
+				(state === "committing" && !primaryDeliveryRecord(action).started)
+			);
+		});
+	}
+
 	getQueuedUserActions(): readonly { id: string; text: string; delivery: "steering" | "followUp" }[] {
-		return visibleSessionActionProjection(this._actionStore.queuedActions())
-			.filter(
-				(action) => action.payload.kind === "turn" && (action.source === "interactive" || action.source === "rpc"),
-			)
-			.map((action) => ({
-				id: action.id,
-				text: queuedAgentMessagePreview(action),
-				delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
-			}));
+		return this._withdrawableQueuedUserActionRecords().map((action) => ({
+			id: action.id,
+			text: queuedAgentMessagePreview(action),
+			delivery: action.delivery === "next_turn_boundary" ? "steering" : "followUp",
+		}));
 	}
 
 	async withdrawQueuedUserActions(
@@ -6646,13 +6677,25 @@ export class AgentSession {
 		const fence = await this._acquireSessionActionCommitFence();
 		try {
 			const requested = new Set(ids);
-			const descriptors = this.getQueuedUserActions().filter((item) => requested.has(item.id));
+			const candidates = this._withdrawableQueuedUserActionRecords();
+			const descriptors = candidates
+				.filter((action) => requested.has(action.id))
+				.map((action) => ({
+					id: action.id,
+					text: queuedAgentMessagePreview(action),
+					delivery: action.delivery === "next_turn_boundary" ? ("steering" as const) : ("followUp" as const),
+				}));
 			if (descriptors.length === 0) return [];
 			const descriptorIds = new Set(descriptors.map((item) => item.id));
 			const error = new Error("Queued operator message was withdrawn before delivery.");
-			const removed = this._cancelSessionActions((action) => descriptorIds.has(action.id), error);
+			const removed = this._cancelSessionActions((action) => descriptorIds.has(action.id), error, candidates);
 			const removedIds = new Set(removed.map((action) => action.id));
 			const withdrawn = descriptors.filter((item) => removedIds.has(item.id));
+			if (
+				removed.some((action) => action.payload.kind === "turn" && action.payload.captureRunMessages !== undefined)
+			) {
+				this.agent.abort();
+			}
 			if (withdrawn.length > 0) this._emitQueueUpdate();
 			return withdrawn;
 		} finally {
@@ -10686,10 +10729,6 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
-		let resolveRunCompletion!: () => void;
-		const runCompletion = new Promise<void>((resolve) => {
-			resolveRunCompletion = resolve;
-		});
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -10697,8 +10736,6 @@ export class AgentSession {
 			sessionDir: childSessionDir,
 			status: "queued",
 			settled: false,
-			completion: runCompletion,
-			resolveCompletion: resolveRunCompletion,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
 		};
@@ -10970,36 +11007,32 @@ export class AgentSession {
 				activity = undefined;
 				emitChildUpdate();
 			} finally {
-				try {
-					if (run.detachedDeletion && childRuntime) {
-						try {
-							await this._deleteRlmSubagentSession(run.id, childRuntime.session);
-						} catch {
-							if (!this._disposed && !this._disposing) {
-								this._rlmChildSessions.set(run.id, childRuntime.session);
-								this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
-							}
+				if (run.detachedDeletion && childRuntime) {
+					try {
+						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
+					} catch {
+						if (!this._disposed && !this._disposing) {
+							this._rlmChildSessions.set(run.id, childRuntime.session);
+							this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
 						}
 					}
-					if (this._activeRlmChildRuns.get(run.id) === run) {
-						if (this._rlmChildSessions.has(run.id)) {
-							this._activeRlmChildRuns.delete(run.id);
-							if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
-							run.session = undefined;
-						} else if (run.status !== "error" || run.detachedDeletion) {
-							this._removeRlmSubagentTracking(run.id, run);
-						} else {
-							run.unsubscribe?.();
-							run.abort = noopRlmChildAbort;
-							run.unsubscribe = undefined;
-						}
-					}
-				} finally {
-					run.settled = true;
-					run.resolveCompletion();
 				}
+				if (this._activeRlmChildRuns.get(run.id) === run) {
+					if (this._rlmChildSessions.has(run.id)) {
+						this._activeRlmChildRuns.delete(run.id);
+						if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
+						run.abort = noopRlmChildAbort;
+						run.unsubscribe = undefined;
+						run.session = undefined;
+					} else if (run.status !== "error" || run.detachedDeletion) {
+						this._removeRlmSubagentTracking(run.id, run);
+					} else {
+						run.unsubscribe?.();
+						run.abort = noopRlmChildAbort;
+						run.unsubscribe = undefined;
+					}
+				}
+				run.settled = true;
 			}
 		})().catch(() => undefined);
 

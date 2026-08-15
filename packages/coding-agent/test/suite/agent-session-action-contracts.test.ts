@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type SessionAction, transitionSessionAction } from "../../src/core/session-action-store.js";
 import { createHarness, getUserTexts, type Harness } from "./harness.js";
-import { createDeferred, createWaitingHarness, withStreaming } from "./scheduling.js";
+import { createDeferred, createWaitingHarness, gatedHook, withStreaming } from "./scheduling.js";
 
 describe("AgentSession action contracts", () => {
 	const harnesses: Harness[] = [];
@@ -131,12 +131,12 @@ describe("AgentSession action contracts", () => {
 		expect(await harness.session.withdrawQueuedUserActions([queued[1].id])).toEqual([]);
 	});
 
-	it("linearizes selection before withdrawal at the selected and preparing boundaries", async () => {
-		for (const prepare of [false, true]) {
+	it("keeps exact IDs withdrawable through selected, preparing, and pre-start committing", async () => {
+		for (const state of ["selected", "preparing", "committing"] as const) {
 			const harness = await createHarness();
 			harnesses.push(harness);
 			withStreaming(harness, true);
-			await harness.session.prompt(`target-${prepare}`, { streamingBehavior: "followUp" });
+			await harness.session.prompt(`target-${state}`, { streamingBehavior: "followUp" });
 			const target = harness.session.getSessionActionSnapshot().queuedUserActions![0];
 			const internals = harness.session as unknown as {
 				_acquireSessionActionCommitFence(): Promise<{ release(): void }>;
@@ -146,14 +146,64 @@ describe("AgentSession action contracts", () => {
 			try {
 				const action = internals._actionStore.selectFirst();
 				expect(action?.id).toBe(target.id);
-				if (prepare && action) transitionSessionAction(action, { state: "preparing" });
+				if (action && state !== "selected") transitionSessionAction(action, { state: "preparing" });
+				if (action && state === "committing") transitionSessionAction(action, { state: "committing" });
 			} finally {
 				fence.release();
 			}
-			expect(await harness.session.withdrawQueuedUserActions([target.id])).toEqual([]);
-			harness.session.clearQueue();
+			expect(harness.session.getSessionActionSnapshot().queuedUserActions).toEqual([target]);
+			expect(await harness.session.withdrawQueuedUserActions([target.id])).toEqual([target]);
 			withStreaming(harness, false);
 		}
+	});
+
+	it("publishes an exact ID until agent_start replaces it with a Stop token", async () => {
+		const gate = gatedHook({ prompt: "handoff" });
+		const holdStarted = createDeferred();
+		const holdRelease = createDeferred();
+		const hold: AgentTool = {
+			name: "hold",
+			label: "Hold",
+			description: "Keep the admitted run observable",
+			parameters: Type.Object({}),
+			execute: async () => {
+				holdStarted.resolve();
+				await holdRelease.promise;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ extensionFactories: [gate.factory], tools: [hold] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("hold", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		const prompt = harness.session.prompt("handoff");
+		await gate.reached;
+		const handoff = harness.session.getSessionActionSnapshot();
+		expect(handoff.activeOperationSet).toBeUndefined();
+		expect(handoff.queuedUserActions).toHaveLength(1);
+		const stableId = handoff.queuedUserActions![0].id;
+		const observed: ReturnType<typeof harness.session.getSessionActionSnapshot>[] = [handoff];
+		const unsubscribe = harness.session.subscribe(() => {
+			observed.push(harness.session.getSessionActionSnapshot());
+		});
+
+		gate.release();
+		await holdStarted.promise;
+		unsubscribe();
+		const running = harness.session.getSessionActionSnapshot();
+		expect(running.activeOperationSet).toBeDefined();
+		expect(running.queuedUserActions?.some((action) => action.id === stableId)).toBe(false);
+		expect(
+			observed.every(
+				(snapshot) =>
+					snapshot.activeOperationSet !== undefined ||
+					snapshot.queuedUserActions?.some((action) => action.id === stableId) === true,
+			),
+		).toBe(true);
+		holdRelease.resolve();
+		await prompt;
 	});
 
 	it("lets queued-only withdrawal win without stranding remaining FIFO work", async () => {
@@ -175,6 +225,49 @@ describe("AgentSession action contracts", () => {
 		await promptPromise;
 		await harness.session.waitForIdle();
 		expect(getUserTexts(harness)).toEqual(["start", "same"]);
+	});
+
+	it("kills a current root-touched kernel after IPython ends at the background boundary", async () => {
+		const waitStarted = createDeferred();
+		const waitRelease = createDeferred();
+		const ipython: AgentTool = {
+			name: "ipython",
+			label: "IPython",
+			description: "Completed kernel cell fixture",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "cell done" }], details: {} }),
+		};
+		const wait: AgentTool = {
+			name: "wait_after_cell",
+			label: "Wait",
+			description: "Keep the same root active",
+			parameters: Type.Object({}),
+			execute: async () => {
+				waitStarted.resolve();
+				await waitRelease.promise;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [ipython, wait] });
+		harnesses.push(harness);
+		const kill = vi.fn(async () => {});
+		(
+			harness.session as unknown as { _ipythonKernelProvisioner: { kill(): Promise<void> } }
+		)._ipythonKernelProvisioner = {
+			kill,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall("wait_after_cell", {}), { stopReason: "toolUse" }),
+		]);
+		const prompt = harness.session.prompt("run then wait");
+		await waitStarted.promise;
+		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		const stopping = harness.session.stopActiveOperations(token!);
+		waitRelease.resolve();
+		expect(await stopping).toEqual({ status: "stopped" });
+		await prompt;
+		expect(kill).toHaveBeenCalledOnce();
 	});
 
 	it("kills only a kernel generation owned by an active IPython tool", async () => {
@@ -211,9 +304,28 @@ describe("AgentSession action contracts", () => {
 		expect(kill).toHaveBeenCalledOnce();
 	});
 
-	it("preserves an idle persistent kernel when stopping a non-IPython run", async () => {
-		const waiting = await createWaitingHarness();
-		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+	it("preserves an idle kernel touched only by a prior root", async () => {
+		const waitStarted = createDeferred();
+		const waitRelease = createDeferred();
+		const ipython: AgentTool = {
+			name: "ipython",
+			label: "IPython",
+			description: "Prior root kernel fixture",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "idle now" }], details: {} }),
+		};
+		const wait: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Current non-IPython root",
+			parameters: Type.Object({}),
+			execute: async () => {
+				waitStarted.resolve();
+				await waitRelease.promise;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [ipython, wait] });
 		harnesses.push(harness);
 		const kill = vi.fn(async () => {});
 		(
@@ -221,13 +333,21 @@ describe("AgentSession action contracts", () => {
 		)._ipythonKernelProvisioner = {
 			kill,
 		};
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("prior root done"),
+		]);
+		await harness.session.prompt("touch kernel first");
+		expect(kill).not.toHaveBeenCalled();
+
 		harness.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
-		await waitForToolStart;
+		const prompt = harness.session.prompt("current root");
+		await waitStarted.promise;
 		const token = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
 		const stopping = harness.session.stopActiveOperations(token!);
-		releaseToolExecution();
+		waitRelease.resolve();
 		expect(await stopping).toEqual({ status: "stopped" });
-		await promptPromise;
+		await prompt;
 		expect(kill).not.toHaveBeenCalled();
 	});
 

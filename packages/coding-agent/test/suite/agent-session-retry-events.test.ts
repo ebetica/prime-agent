@@ -13,7 +13,10 @@ function normalizeEventOrder(events: Harness["events"]): string[] {
 				: event.type === "tool_execution_start" || event.type === "tool_execution_end"
 					? `${event.type}:${event.toolName}`
 					: event.type;
-		if (label === "message_update" && normalized[normalized.length - 1] === "message_update") {
+		if (
+			(label === "message_update" && normalized[normalized.length - 1] === "message_update") ||
+			(label === "session_action_update" && normalized[normalized.length - 1] === "session_action_update")
+		) {
 			continue;
 		}
 		normalized.push(label);
@@ -172,6 +175,36 @@ describe("AgentSession retry and event characterization", () => {
 			harness.session.prompt("second", { queueIfBusy: true, streamingBehavior: "followUp" }),
 		).resolves.toBeUndefined();
 		expect(harness.session.queuedActionCount).toBe(1);
+	});
+
+	it("keeps one Stop token through retry backoff and lets Stop cancel that retry", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 30_000 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not run"),
+		]);
+		const retryStarted = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const prompt = harness.session.prompt("retry me");
+		await retryStarted;
+		const before = harness.session.getSessionActionSnapshot().activeOperationSet?.token;
+		expect(before).toBeDefined();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(harness.session.getSessionActionSnapshot().activeOperationSet?.token).toBe(before);
+
+		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "stopped" });
+		await prompt;
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(await harness.session.stopActiveOperations(before!)).toEqual({ status: "already_stopped" });
 	});
 
 	it("does not retry when retry is disabled", async () => {
@@ -444,7 +477,9 @@ describe("AgentSession retry and event characterization", () => {
 		await harness.session.prompt("hi");
 
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"session_action_update",
 			"agent_start",
+			"session_action_update",
 			"turn_start",
 			"message_start:user",
 			"message_end:user",
@@ -452,6 +487,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_update",
 			"message_end:assistant",
 			"turn_end",
+			"session_action_update",
 			"agent_end",
 		]);
 	});
@@ -480,7 +516,9 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(toolRuns).toEqual(["hello"]);
 		expect(normalizeEventOrder(harness.events)).toEqual([
+			"session_action_update",
 			"agent_start",
+			"session_action_update",
 			"turn_start",
 			"message_start:user",
 			"message_end:user",
@@ -497,6 +535,7 @@ describe("AgentSession retry and event characterization", () => {
 			"message_update",
 			"message_end:assistant",
 			"turn_end",
+			"session_action_update",
 			"agent_end",
 		]);
 	});
