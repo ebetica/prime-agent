@@ -1014,17 +1014,36 @@ describe("ENG-4603 worker recovery convergence", () => {
 		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pn -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
 			mode: 0o700,
 		});
+		const ssPath = join(paths.agentDir, "ss");
+		writeFileSync(ssPath, "#!/bin/sh\nexit 127\n", { mode: 0o700 });
 		const lsofEnvironment = {
 			ENG_4603_LSOF_PIDS: `${predecessor.child.pid},${successor.child.pid},${workerPid}`,
 			ENG_4603_SYSTEM_LSOF: systemLsofPath,
 			PATH: `${paths.agentDir}:${process.env.PATH ?? ""}`,
 		};
+		const discoveryEnv = { ...process.env, ...lsofEnvironment };
+		const resolvedSs = spawnSync("which", ["ss"], { encoding: "utf8", env: discoveryEnv });
+		expect(resolvedSs.status).toBe(0);
+		expect(resolvedSs.stdout.trim()).toBe(ssPath);
+		const disabledSs = spawnSync("ss", ["-lxp"], { encoding: "utf8", env: discoveryEnv });
+		expect(disabledSs.status).not.toBe(0);
+		expect(disabledSs.stdout).toBe("");
+
 		const listenersBeforeShutdown = spawnSync(lsofPath, [], {
 			encoding: "utf8",
-			env: { ...process.env, ...lsofEnvironment },
+			env: discoveryEnv,
 		}).stdout;
 		expect(listenersBeforeShutdown).toContain(`p${predecessor.child.pid}`);
 		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
+		const fixturePids = new Set([predecessor.child.pid!, successor.child.pid!, workerPid]);
+		for (const line of listenersBeforeShutdown.split("\n")) {
+			if (line.startsWith("p")) expect(fixturePids.has(Number(line.slice(1)))).toBe(true);
+			if (line.startsWith("n/")) {
+				expect(
+					line.slice(1).startsWith(`${paths.agentDir}/`) || line.slice(1).startsWith(`${paths.socketTmpDir}/`),
+				).toBe(true);
+			}
+		}
 
 		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
 		expect(shutdown.code).toBe(0);
