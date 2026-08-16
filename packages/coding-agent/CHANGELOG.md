@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added durable child-to-parent automatic report muting while preserving explicit agent messages.
+- Fixed retained RLM children being unable to explicitly message their parent during heartbeat and follow-up turns.
 
 ## [0.7.2] - 2026-08-11
 

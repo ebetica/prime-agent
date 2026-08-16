@@ -1292,8 +1292,10 @@ export class AgentSession {
 	private _parentReplyCount = 0;
 	/**
 	 * Child-to-parent sends linearize here before touching the daemon. Closing this
-	 * gate after the child turn settles prevents a late background cell from racing
-	 * the single terminal outcome. The set contains only currently admitted sends.
+	 * gate after the initial child turn settles prevents a late background cell from
+	 * racing the single terminal outcome. A later retained-session turn may admit an
+	 * explicit send only while that turn owns an active agent operation. The set
+	 * contains only currently admitted sends.
 	 */
 	private _parentSendAdmissionOpen = true;
 	private readonly _admittedParentSends = new Set<Promise<void>>();
@@ -9860,7 +9862,8 @@ export class AgentSession {
 
 	/** Admit a parent reply synchronously, before selector resolution or transport awaits. */
 	private _admitParentAgentMessageSend(): AgentSessionMessageSendAdmission {
-		if (!this._parentSendAdmissionOpen) {
+		const retainedTurnIsRunning = !this._parentSendAdmissionOpen && this._activeAgentOperation !== undefined;
+		if (this._disposed || this._disposing || (!this._parentSendAdmissionOpen && !retainedTurnIsRunning)) {
 			throw new Error("Child-to-parent send rejected: child execution has closed send admission");
 		}
 		const id = createAgentSessionMessageId();
