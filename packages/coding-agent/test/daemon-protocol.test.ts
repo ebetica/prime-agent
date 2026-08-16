@@ -95,6 +95,12 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("atomic_resource_reload");
 	});
 
+	it("capability-gates conditional platform wake admission", () => {
+		const compatibility = { minProtocol: 7, minSchemaRevision: 27, capability: "conditional_platform_wake" };
+		expect(DAEMON_COMMAND_COMPATIBILITY.admit_platform_wake).toEqual(compatibility);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_platform_wake");
+	});
+
 	it("capability-gates durable planned restart handoffs", () => {
 		const compatibility = { minProtocol: 7, minSchemaRevision: 17, capability: "planned_restart_handoff" };
 		expect(DAEMON_COMMAND_COMPATIBILITY.register_planned_restart_handoff).toEqual(compatibility);

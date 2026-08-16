@@ -190,10 +190,15 @@ import {
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	isPlatformWakeDetails,
 	isSessionSlashCommandMessage,
 	isWorkerRecoveryDetails,
 	PLANNED_RESTART_HANDOFF_CUSTOM_TYPE,
 	PLANNED_RESTART_INTENT_CUSTOM_TYPE,
+	PLATFORM_WAKE_CUSTOM_TYPE,
+	PLATFORM_WAKE_INTENT_CUSTOM_TYPE,
+	PLATFORM_WAKE_MESSAGE,
+	platformWakeDetails,
 	type RlmAutomaticParentReportMessage,
 	WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE,
 	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
@@ -1179,6 +1184,8 @@ export class AgentSession {
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
 	private _sessionInputPumpEpoch = 0;
 	private _sessionInputArrivalEpoch = 0;
+	// Opaque ABA-safe token for a quiescent platform-wake admission snapshot.
+	private _platformWakeGeneration = randomUUID();
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
 	private _idleQueuePromotionGeneration = 0;
@@ -1462,7 +1469,12 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (this._recoverPlannedRestartContinuationIntents() + this._recoverWorkerRecoveryContinuationIntents() > 0) {
+		if (
+			this._recoverPlannedRestartContinuationIntents() +
+				this._recoverWorkerRecoveryContinuationIntents() +
+				this._recoverPlatformWakeIntents() >
+			0
+		) {
 			// A prior successor may have acknowledged resume and crashed before the
 			// queued continuation reached the transcript. The durable intent is
 			// successor-claim proof, so a later session load may safely finish it.
@@ -1606,6 +1618,9 @@ export class AgentSession {
 	}
 
 	private _emitQueueUpdate(): void {
+		// Queue/lifecycle transitions invalidate idle admission snapshots even when
+		// the visible queue projection happens to remain equal (idle -> run -> idle).
+		this._platformWakeGeneration = randomUUID();
 		const actions = this.getSessionActionSnapshot();
 		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
 		this._lastSessionActionSnapshot = actions;
@@ -5092,6 +5107,108 @@ export class AgentSession {
 		});
 	}
 
+	private _platformWakeMarker(entry: SessionEntry): { wakeId: string; completed: boolean } | undefined {
+		let customType: string;
+		let content: unknown;
+		let display = false;
+		let details: unknown;
+		if (entry.type === "custom_message") {
+			customType = entry.customType;
+			content = entry.content;
+			display = entry.display;
+			details = entry.details;
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			customType = entry.message.customType;
+			content = entry.message.content;
+			display = entry.message.display;
+			details = entry.message.details;
+		} else {
+			return undefined;
+		}
+		if (!isPlatformWakeDetails(details)) return undefined;
+		if (customType === PLATFORM_WAKE_INTENT_CUSTOM_TYPE && !display) {
+			return { wakeId: details.id, completed: false };
+		}
+		if (customType === PLATFORM_WAKE_CUSTOM_TYPE && display && content === PLATFORM_WAKE_MESSAGE) {
+			return { wakeId: details.id, completed: true };
+		}
+		return undefined;
+	}
+
+	private _admitPlatformWakeAction(wakeId: string): void {
+		const actionId = `platform-wake:${wakeId}`;
+		const details = platformWakeDetails(wakeId);
+		const message: CustomMessage = {
+			role: "custom",
+			customType: PLATFORM_WAKE_CUSTOM_TYPE,
+			content: PLATFORM_WAKE_MESSAGE,
+			display: true,
+			timestamp: Date.now(),
+			details,
+		};
+		const action = this._createPreparedTurnAction("followUp", PLATFORM_WAKE_MESSAGE, undefined, {
+			actionId,
+			agentMessageId: actionId,
+			message,
+			source: "internal",
+			queueVisible: false,
+		});
+		this._admitSessionInput(action, { restore: true });
+	}
+
+	private _recoverPlatformWakeIntents(): number {
+		const completed = new Set<string>();
+		const pending = new Set<string>();
+		for (const entry of this.sessionManager.getEntries()) {
+			const marker = this._platformWakeMarker(entry);
+			if (!marker) continue;
+			(marker.completed ? completed : pending).add(marker.wakeId);
+		}
+		let recovered = 0;
+		for (const wakeId of pending) {
+			const actionId = `platform-wake:${wakeId}`;
+			if (completed.has(wakeId) || this._actionStore.ownedActions().some((action) => action.id === actionId))
+				continue;
+			this._admitPlatformWakeAction(wakeId);
+			recovered++;
+		}
+		return recovered;
+	}
+
+	async admitPlatformWake(
+		wakeId: string,
+		expectedGeneration: string,
+	): Promise<"admitted" | "already_admitted" | "already_completed" | "generation_stale"> {
+		platformWakeDetails(wakeId);
+		if (!expectedGeneration) throw new Error("Platform wake expected generation is required");
+		const actionId = `platform-wake:${wakeId}`;
+		const fence = await this._acquireSessionActionCommitFence();
+		try {
+			const markers = this.sessionManager
+				.getEntries()
+				.map((entry) => this._platformWakeMarker(entry))
+				.filter((marker) => marker?.wakeId === wakeId);
+			if (markers.some((marker) => marker?.completed)) return "already_completed";
+			if (this._actionStore.ownedActions().some((action) => action.id === actionId)) return "already_admitted";
+			if (!this._isPlatformWakeEligible() || this._platformWakeGeneration !== expectedGeneration) {
+				return "generation_stale";
+			}
+			if (markers.length === 0) {
+				this.sessionManager.appendCustomMessageEntryWithRollback(
+					PLATFORM_WAKE_INTENT_CUSTOM_TYPE,
+					"Platform wake pending",
+					false,
+					platformWakeDetails(wakeId),
+				);
+			}
+			this._admitPlatformWakeAction(wakeId);
+			this.resumeQueuedWork();
+			return "admitted";
+		} finally {
+			fence.release();
+		}
+	}
+
 	private _workerRecoveryMarker(
 		entry: SessionEntry,
 	): { actionId: string; details: WorkerRecoveryDetails; completed: boolean } | undefined {
@@ -6763,6 +6880,22 @@ export class AgentSession {
 
 	get unfinishedActionCount(): number {
 		return this._actionStore.unfinishedActions().length;
+	}
+
+	private _isPlatformWakeEligible(): boolean {
+		return (
+			this._activeAgentOperation === undefined &&
+			!this.isStreaming &&
+			!this.isCompacting &&
+			!this.isBashRunning &&
+			!this.isRetrying &&
+			this.unfinishedActionCount === 0
+		);
+	}
+
+	/** Opaque token present only while a conditional platform wake may be admitted. */
+	get platformWakeGeneration(): string | undefined {
+		return this._isPlatformWakeEligible() ? this._platformWakeGeneration : undefined;
 	}
 
 	/**

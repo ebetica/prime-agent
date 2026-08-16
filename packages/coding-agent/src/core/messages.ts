@@ -32,6 +32,37 @@ export const PLANNED_RESTART_INTENT_CUSTOM_TYPE = "prime-agent.planned_restart_i
 export const PLANNED_RESTART_HANDOFF_CUSTOM_TYPE = "prime-agent.planned_restart_handoff";
 export const WORKER_RECOVERY_INTENT_CUSTOM_TYPE = "prime-agent.worker_recovery_intent";
 export const WORKER_RECOVERY_HANDOFF_CUSTOM_TYPE = "prime-agent.worker_recovery";
+export const PLATFORM_WAKE_INTENT_CUSTOM_TYPE = "prime-agent.platform_wake_intent";
+export const PLATFORM_WAKE_CUSTOM_TYPE = "prime-agent.platform_wake";
+export const PLATFORM_WAKE_MESSAGE =
+	"The prior hosting platform process ended while this agent was working. Inspect durable state and continue safely. Do not replay the previous prompt or assume that an uncertain tool action did or did not complete.";
+
+export interface PlatformWakeDetails {
+	version: 1;
+	id: string;
+	source: "platform";
+}
+
+export function platformWakeDetails(id: string): PlatformWakeDetails {
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+		throw new Error("Platform wake id must be a UUID");
+	}
+	return { version: 1, id, source: "platform" };
+}
+
+export function isPlatformWakeDetails(value: unknown): value is PlatformWakeDetails {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Partial<PlatformWakeDetails>;
+	try {
+		return (
+			platformWakeDetails(candidate.id ?? "").id === candidate.id &&
+			candidate.version === 1 &&
+			candidate.source === "platform"
+		);
+	} catch {
+		return false;
+	}
+}
 
 export const WORKER_RECOVERY_ACTIVITY_LABELS = [
 	"model response",

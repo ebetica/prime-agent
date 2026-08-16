@@ -9,6 +9,8 @@ import type { AgentCronJob, AgentCronJobStore, AgentCronScheduler } from "../../
 import {
 	type CustomMessage,
 	createSessionSlashCommandMessage,
+	PLATFORM_WAKE_CUSTOM_TYPE,
+	PLATFORM_WAKE_MESSAGE,
 	type WorkerRecoveryDetails,
 } from "../../../src/core/messages.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
@@ -234,6 +236,60 @@ describe("issue #4257 update restart resume", () => {
 		);
 	});
 
+	it("linearizes competing platform wake hosts at one admission generation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one recovery won")]);
+		const generation = harness.session.platformWakeGeneration;
+		expect(generation).toBeTypeOf("string");
+		const statuses = await Promise.all([
+			harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000010", generation!),
+			harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000011", generation!),
+		]);
+		expect([...statuses].sort()).toEqual(["admitted", "generation_stale"]);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+			),
+		).toHaveLength(1);
+	});
+
+	it("conditionally admits one durable platform wake and rejects an ABA-stale idle generation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("continued after platform restart")]);
+		const stale = harness.session.platformWakeGeneration;
+		expect(stale).toBeTypeOf("string");
+
+		expect(harness.session.admitPlannedRestartContinuation("newer-action", "newer work")).toBe("admitted");
+		expect(await harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000001", stale!)).toBe(
+			"generation_stale",
+		);
+		harness.session.clearQueuedUserMessagesMatching(() => true);
+		const current = harness.session.platformWakeGeneration;
+		expect(current).toBeTypeOf("string");
+		expect(current).not.toBe(stale);
+
+		const wakeId = "00000000-0000-4000-8000-000000000002";
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("admitted");
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("already_admitted");
+		expect(getUserTexts(harness)).toEqual([]);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+		const wakes = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+		);
+		expect(wakes).toEqual([
+			expect.objectContaining({
+				content: PLATFORM_WAKE_MESSAGE,
+				display: true,
+				details: { version: 1, id: wakeId, source: "platform" },
+			}),
+		]);
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("already_completed");
+	});
+
 	it("admits one trusted worker recovery continuation without replaying the interrupted input", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
@@ -330,6 +386,29 @@ describe("issue #4257 update restart resume", () => {
 				(message) => message.role === "custom" && message.customType === "prime-agent.worker_recovery",
 			),
 		).toHaveLength(1);
+	});
+
+	it("recovers a durable platform wake intent once after worker restart", async () => {
+		const wakeId = "00000000-0000-4000-8000-000000000003";
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered platform wake")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.platform_wake_intent",
+					"Platform wake pending",
+					false,
+					{ version: 1, id: wakeId, source: "platform" },
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+			),
+		).toEqual([expect.objectContaining({ details: { version: 1, id: wakeId, source: "platform" } })]);
 	});
 
 	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {

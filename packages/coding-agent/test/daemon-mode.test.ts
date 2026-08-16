@@ -9299,6 +9299,35 @@ describe("daemon mode helpers", () => {
 		expect(continueAgent).not.toHaveBeenCalled();
 	});
 
+	it("routes generation-checked platform wakes as one worker operation", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const admitPlatformWake = vi.fn(async () => "generation_stale" as const);
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & { session: { admitPlatformWake: typeof admitPlatformWake } };
+		};
+		state.runtime.session = { admitPlatformWake } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const wakeId = "00000000-0000-4000-8000-000000000001";
+		await expect(
+			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				type: "admit_platform_wake",
+				activeSessionId: state.activeSessionId,
+				wakeId,
+				expectedGeneration: "generation-1",
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "generation_stale" } });
+		expect(admitPlatformWake).toHaveBeenCalledWith(wakeId, "generation-1");
+	});
+
 	it.each(["steer", "follow_up"] as const)("routes correlated daemon %s commands", async (type) => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
