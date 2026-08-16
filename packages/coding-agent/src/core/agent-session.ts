@@ -780,6 +780,16 @@ function cloneCustomMessage(message: CustomMessage): CustomMessage {
 	};
 }
 
+function assertNotReservedPlatformMessage(message: Pick<CustomMessage, "customType"> | undefined): void {
+	if (message?.customType === PLATFORM_WAKE_CUSTOM_TYPE || message?.customType === PLATFORM_WAKE_INTENT_CUSTOM_TYPE) {
+		throw new Error(`Custom message type is reserved for daemon platform wakes: ${message.customType}`);
+	}
+}
+
+function assertNotReservedPlatformMessages(messages: readonly CustomMessage[] | undefined): void {
+	for (const message of messages ?? []) assertNotReservedPlatformMessage(message);
+}
+
 function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessage {
 	if (message.role === "custom") return cloneCustomMessage(message);
 	return {
@@ -1479,6 +1489,7 @@ export class AgentSession {
 			// queued continuation reached the transcript. The durable intent is
 			// successor-claim proof, so a later session load may safely finish it.
 			this._sessionInputPumpSuspended = false;
+			this._invalidatePlatformWakeGeneration();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -4731,6 +4742,7 @@ export class AgentSession {
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
+		this._invalidatePlatformWakeGeneration();
 		const admissionFence = await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
 			throwIfPromptAdmissionCancelled(options?.signal);
 			throw error;
@@ -4798,8 +4810,10 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		assertNotReservedPlatformMessage(options?.customMessage);
 		if (!this.isStreaming) {
 			this._sessionInputPumpSuspended = false;
+			this._invalidatePlatformWakeGeneration();
 			this._assertSessionActionAdmissionAvailable();
 		}
 		const commitFence = this.isStreaming
@@ -5454,6 +5468,13 @@ export class AgentSession {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
 		}
+		for (const recovered of snapshot.actions) {
+			if (recovered.payload.kind !== "turn") continue;
+			assertNotReservedPlatformMessage(recovered.payload.customMessage);
+			for (const record of recovered.payload.records) {
+				if (record.message.role === "custom") assertNotReservedPlatformMessage(record.message);
+			}
+		}
 		const actionIds = new Set(this._actionStore.ownedActions().map((action) => action.id));
 		const actions = snapshot.actions.map((recovered): QueuedSessionAction => {
 			if (actionIds.has(recovered.id)) throw new Error(`Duplicate session action id: ${recovered.id}`);
@@ -5582,6 +5603,8 @@ export class AgentSession {
 			source?: InputSource | "internal";
 		} = {},
 	): Promise<void> {
+		assertNotReservedPlatformMessage(options.customMessage);
+		assertNotReservedPlatformMessages(options.prefixMessages);
 		if (
 			this._restoreSessionCommand(
 				text,
@@ -5621,6 +5644,8 @@ export class AgentSession {
 			source?: InputSource | "internal";
 		} = {},
 	): Promise<boolean> {
+		assertNotReservedPlatformMessage(options.customMessage);
+		assertNotReservedPlatformMessages(options.prefixMessages);
 		const restoredCommand = this._restoreSessionCommand(
 			text,
 			options.customMessage,
@@ -5957,6 +5982,7 @@ export class AgentSession {
 				action.wake === "immediate")
 		) {
 			if (action.payload.kind === "turn" && action.wake === "immediate") this._sessionInputPumpSuspended = false;
+			this._invalidatePlatformWakeGeneration();
 			this._scheduleSessionInputPump();
 		}
 		return { accepted: true, disposition, ticket: controller.ticket };
@@ -6543,9 +6569,7 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 		},
 	): Promise<void> {
-		if (message.customType === PLATFORM_WAKE_INTENT_CUSTOM_TYPE || message.customType === PLATFORM_WAKE_CUSTOM_TYPE) {
-			throw new Error(`Custom message type is reserved for daemon platform wakes: ${message.customType}`);
-		}
+		assertNotReservedPlatformMessage(message);
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -6901,10 +6925,8 @@ export class AgentSession {
 	private _isPlatformWakeEligible(): boolean {
 		return (
 			this._activeAgentOperation === undefined &&
-			!this.isStreaming &&
-			!this.isCompacting &&
-			!this.isBashRunning &&
-			!this.isRetrying &&
+			this._canStartSessionActionImmediately() &&
+			!this._ownedOperations.isStopping &&
 			!this._resourceReloadInProgress &&
 			this._resourceMutationAdmissions === 0 &&
 			!this._disposing &&
@@ -7203,6 +7225,7 @@ export class AgentSession {
 	acquireQueuedWorkPause(): { release(): void } {
 		const token = Symbol("queued-work-pause");
 		this._queuedWorkPauses.add(token);
+		this._invalidatePlatformWakeGeneration();
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		let released = false;
@@ -7211,6 +7234,7 @@ export class AgentSession {
 				if (released) return;
 				released = true;
 				this._queuedWorkPauses.delete(token);
+				this._invalidatePlatformWakeGeneration();
 				this._notifySessionInputCheckpointChange();
 				this._scheduleSessionInputPump();
 			},
@@ -7301,6 +7325,7 @@ export class AgentSession {
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
 		this._sessionInputPumpSuspended = false;
+		this._invalidatePlatformWakeGeneration();
 		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
 		return this._hasSelectableSessionInput();
@@ -7365,6 +7390,7 @@ export class AgentSession {
 	}
 
 	restorePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
+		assertNotReservedPlatformMessages(messages);
 		this._pendingNextTurnMessages.push(...messages.map((message) => cloneCustomMessage(message)));
 	}
 
@@ -7395,6 +7421,7 @@ export class AgentSession {
 					return;
 				}
 				this._sessionInputPumpSuspended = false;
+				this._invalidatePlatformWakeGeneration();
 				this._notifySessionInputCheckpointChange();
 				this._scheduleSessionInputPump();
 			})
@@ -7406,6 +7433,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._invalidatePlatformWakeGeneration();
 		this._cancelSessionActions(
 			(action) => action.payload.kind === "turn" && !action.payload.queueVisible,
 			new Error("Prompt aborted before delivery."),
@@ -7451,6 +7479,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._invalidatePlatformWakeGeneration();
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
