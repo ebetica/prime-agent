@@ -21,6 +21,7 @@ import {
 } from "../src/core/agent-messages.js";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, KernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
@@ -91,6 +92,25 @@ function streamAnswer(text: string): ReturnType<typeof createAssistantMessageEve
 	return stream;
 }
 
+function retainedChildHeartbeat(prompt: string): AgentCronJob {
+	const now = new Date().toISOString();
+	return {
+		id: "retained-child-heartbeat",
+		status: "active",
+		source: "rlm_heartbeat",
+		runtimeKind: "subagent",
+		activeSessionId: "child-active",
+		sessionId: "child-session",
+		sessionFile: "child.jsonl",
+		cwd: "/tmp",
+		prompt,
+		schedule: { kind: "interval", expression: "1h", intervalMs: 3_600_000 },
+		createdAt: now,
+		updatedAt: now,
+		runCount: 0,
+	};
+}
+
 interface TestCommMessage {
 	header: { msg_type: string };
 	parent_header: Record<string, unknown>;
@@ -121,6 +141,8 @@ interface InspectableRlmRun {
 
 interface InspectableRlmSession {
 	_activeRlmChildRuns: Map<string, InspectableRlmRun>;
+	_parentMessageOutbox?: { pending(): Array<{ id: string; message: string; state?: string }> };
+	_closeParentSendAdmissionAndWait(): Promise<void>;
 	_deletingRlmChildren: Map<
 		string,
 		{
@@ -1312,6 +1334,224 @@ describe("AgentSession rlm recursion", () => {
 				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
 			),
 		).toHaveLength(0);
+	});
+
+	it("allows retained children to message their parent while idle and during later turns", async () => {
+		let heartbeatStarted = false;
+		let releaseHeartbeat: () => void = () => {};
+		const heartbeatGate = new Promise<void>((resolve) => {
+			releaseHeartbeat = resolve;
+		});
+		let followUpStarted = false;
+		let releaseFollowUp: () => void = () => {};
+		const followUpGate = new Promise<void>((resolve) => {
+			releaseFollowUp = resolve;
+		});
+		const sentIds: string[] = [];
+		let parentAvailable = true;
+		const child = createSession({
+			depth: 1,
+			rlmSessionDir: join(tempDir, "retained-heartbeat-child"),
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "retained-heartbeat-sessions")),
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				if (text.includes("continue retained work")) {
+					const stream = createAssistantMessageEventStream();
+					followUpStarted = true;
+					void followUpGate.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("follow-up complete") });
+					});
+					return stream;
+				}
+				if (text !== "wake retained child") return streamAnswer("initial complete");
+				const stream = createAssistantMessageEventStream();
+				heartbeatStarted = true;
+				void heartbeatGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("heartbeat complete") });
+				});
+				return stream;
+			},
+			agentMessageController: {
+				listAgents: () => ({ agents: [] }),
+				roster: () => ({
+					current: { name: "retained-worker", id: child.sessionId, depth: 1 },
+					entries: parentAvailable
+						? [
+								{
+									relationship: "parent" as const,
+									name: "parent",
+									id: "parent-session",
+									depth: 0,
+									status: "idle" as const,
+								},
+							]
+						: [],
+				}),
+				sendAgentMessage: async (input) => {
+					sentIds.push(input.id!);
+					return {
+						id: input.id!,
+						source: "agent_message",
+						target: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						message: input.message,
+						deliveryStatus: "delivered",
+					};
+				},
+				acknowledgeAgentMessage: () => {},
+			},
+		});
+		child.setAutomaticParentReportsMuted(true);
+		const root = createSession({
+			depth: 0,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async (_id, retained) => retained?.disposeAsync(),
+			},
+		});
+		const spawned = await root.runRlmChild("finish initial task", { name: "retained-worker" });
+		await vi.waitFor(async () => {
+			expect((await root.listRlmSubagents()).subagents).toContainEqual(
+				expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "completed" }),
+			);
+		});
+
+		const send = (child as unknown as InspectableRlmSession)._createKernelHostHandlers()["agent_message.send"]!;
+		await expect(send({ message: "idle completion result", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "idle completion result",
+		});
+
+		const heartbeat = child.promptHeartbeat(retainedChildHeartbeat("wake retained child"));
+		await waitFor(() => heartbeatStarted);
+		const receipt = await send({ message: "heartbeat result", receiver_role: "parent" });
+		expect(receipt).toMatchObject({ id: sentIds[1], message: "heartbeat result" });
+		expect(sentIds).toHaveLength(2);
+		expect(new Set(sentIds).size).toBe(2);
+		expect(sentIds.every((id) => /^agentmsg_/.test(id))).toBe(true);
+		const outboxBeforeOrphanedSend = (child as unknown as InspectableRlmSession)._parentMessageOutbox?.pending();
+		parentAvailable = false;
+		await expect(send({ message: "orphaned result", receiver_role: "parent" })).rejects.toThrow("No parent matches");
+		expect(sentIds).toHaveLength(2);
+		expect((child as unknown as InspectableRlmSession)._parentMessageOutbox?.pending()).toEqual(
+			outboxBeforeOrphanedSend,
+		);
+		releaseHeartbeat();
+		await heartbeat;
+		parentAvailable = true;
+		await expect(send({ message: "after heartbeat", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "after heartbeat",
+		});
+
+		const followUp = createAgentSessionMessage({
+			id: "agentmsg-retained-follow-up",
+			source: "agent_message",
+			message: "continue retained work",
+			fromRelationship: "parent",
+			target: { activeSessionId: "child-active", sessionId: child.sessionId },
+		});
+		await child.acceptAgentMessagePrompt(followUp.content, { customMessage: followUp });
+		await waitFor(() => followUpStarted);
+		await expect(send({ message: "follow-up result", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "follow-up result",
+		});
+		expect(sentIds).toHaveLength(4);
+		releaseFollowUp();
+		await child.agent.waitForIdle();
+		await expect(send({ message: "after follow-up", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "after follow-up",
+		});
+		expect(sentIds).toHaveLength(5);
+		expect(child.automaticParentReportsMuteState.muted).toBe(true);
+		expect(
+			root.messages.filter(
+				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+			),
+		).toHaveLength(0);
+
+		await root.deleteRlmSubagent(spawned.rlm_child_id);
+		await expect(send({ message: "after deletion", receiver_role: "parent" })).rejects.toThrow(
+			"child session is disposed",
+		);
+	});
+
+	it("replays an idle retained-child message once across restart", async () => {
+		const childDir = join(tempDir, "restarted-retained-child");
+		const ambiguousIds: string[] = [];
+		const first = createSession({
+			depth: 1,
+			rlmSessionDir: childDir,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "restart-sessions-first")),
+			agentMessageController: {
+				listAgents: () => ({ agents: [] }),
+				roster: () => ({
+					current: { name: "restart-worker", id: first.sessionId, depth: 1 },
+					entries: [{ relationship: "parent", name: "parent", id: "parent-session", depth: 0, status: "idle" }],
+				}),
+				sendAgentMessage: async (input) => {
+					ambiguousIds.push(input.id!);
+					throw new Error("connection closed after write");
+				},
+			},
+		});
+		const firstInternals = first as unknown as InspectableRlmSession;
+		await firstInternals._closeParentSendAdmissionAndWait();
+		const firstSend = firstInternals._createKernelHostHandlers()["agent_message.send"]!;
+		await expect(firstSend({ message: "durable idle result", receiver_role: "parent" })).rejects.toThrow(
+			"connection closed after write",
+		);
+		expect(firstInternals._parentMessageOutbox?.pending()).toMatchObject([
+			{ id: ambiguousIds[0], message: "durable idle result", state: "pending" },
+		]);
+		await first.disposeAsync();
+
+		const replayedIds: string[] = [];
+		const replayController: AgentSessionMessageController = {
+			listAgents: () => ({ agents: [] }),
+			roster: () => ({
+				current: { name: "restart-worker", id: "restarted-child", depth: 1 },
+				entries: [{ relationship: "parent", name: "parent", id: "parent-session", depth: 0, status: "idle" }],
+			}),
+			sendAgentMessage: async (input) => {
+				replayedIds.push(input.id!);
+				return {
+					id: input.id!,
+					source: "agent_message",
+					target: { activeSessionId: "parent-active", sessionId: "parent-session" },
+					message: input.message,
+					deliveryStatus: "delivered",
+				};
+			},
+			acknowledgeAgentMessage: () => {},
+		};
+		const second = createSession({
+			depth: 1,
+			rlmSessionDir: childDir,
+			agentMessageController: replayController,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "restart-sessions-second")),
+		});
+		const secondInternals = second as unknown as InspectableRlmSession;
+		await vi.waitFor(() => expect(replayedIds).toEqual([ambiguousIds[0]]));
+		expect(secondInternals._parentMessageOutbox?.pending()).toMatchObject([
+			{ id: ambiguousIds[0], state: "acknowledged" },
+		]);
+		await expect(
+			secondInternals._createKernelHostHandlers()["agent_message.send"]!({
+				message: "new idle result after restart",
+				receiver_role: "parent",
+			}),
+		).resolves.toMatchObject({ message: "new idle result after restart" });
+		expect(replayedIds).toHaveLength(2);
+		expect(new Set(replayedIds).size).toBe(2);
+		await second.disposeAsync();
+
+		const third = createSession({
+			depth: 1,
+			rlmSessionDir: childDir,
+			agentMessageController: replayController,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "restart-sessions-third")),
+		});
+		const thirdInternals = third as unknown as InspectableRlmSession;
+		await vi.waitFor(() => expect(thirdInternals._parentMessageOutbox?.pending()).toEqual([]));
+		expect(replayedIds).toHaveLength(2);
 	});
 
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {

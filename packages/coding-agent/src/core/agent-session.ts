@@ -1291,11 +1291,11 @@ export class AgentSession {
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	/**
-	 * Child-to-parent sends linearize here before touching the daemon. Closing this
-	 * gate after the child turn settles prevents a late background cell from racing
-	 * the single terminal outcome. The set contains only currently admitted sends.
+	 * Child-to-parent sends linearize here before touching the daemon. The set
+	 * contains only currently admitted sends. Initial execution drains its admitted
+	 * sends before the automatic terminal outcome; retained sessions may explicitly
+	 * send later without reopening automatic terminal-report admission.
 	 */
-	private _parentSendAdmissionOpen = true;
 	private readonly _admittedParentSends = new Set<Promise<void>>();
 	private _parentMessageOutbox?: ParentAgentMessageOutbox;
 	private _acceptedAgentMessageIndex?: AcceptedAgentMessageIndex;
@@ -1426,7 +1426,6 @@ export class AgentSession {
 		}
 		if (this._rlmDepth > 0 && this._rlmSessionDir) {
 			this._parentMessageOutbox = new ParentAgentMessageOutbox(this._rlmSessionDir);
-			this._parentSendAdmissionOpen = !this._parentMessageOutbox.isClosed();
 			if (this._parentMessageOutbox.pending().length > 0) {
 				setTimeout(() => void this._recoverPendingParentAgentMessages(), 0);
 			}
@@ -9860,8 +9859,8 @@ export class AgentSession {
 
 	/** Admit a parent reply synchronously, before selector resolution or transport awaits. */
 	private _admitParentAgentMessageSend(): AgentSessionMessageSendAdmission {
-		if (!this._parentSendAdmissionOpen) {
-			throw new Error("Child-to-parent send rejected: child execution has closed send admission");
+		if (this._disposed || this._disposing) {
+			throw new Error("Child-to-parent send rejected: child session is disposed");
 		}
 		const id = createAgentSessionMessageId();
 		let settle!: () => void;
@@ -10012,10 +10011,9 @@ export class AgentSession {
 		}
 	}
 
-	/** Close child-to-parent admission at the terminal linearization point and drain admitted sends. */
+	/** Mark initial execution admission closed and drain its sends before the automatic terminal outcome. */
 	private async _closeParentSendAdmissionAndWait(): Promise<void> {
 		this._parentMessageOutbox?.closeAdmission();
-		this._parentSendAdmissionOpen = false;
 		await Promise.all([...this._admittedParentSends]);
 	}
 

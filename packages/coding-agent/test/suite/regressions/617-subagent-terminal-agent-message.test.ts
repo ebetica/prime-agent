@@ -92,7 +92,7 @@ describe("#617 subagent terminal agent messages", () => {
 		expect(terminalMessage(parent.session.messages)?.content).toContain(spawned.rlm_child_id);
 	});
 
-	it("closes admission after execution and drains an already admitted parent reply", async () => {
+	it("drains initial sends before completion without blocking later explicit sends", async () => {
 		child = await createHarness();
 		parent = await createHarness({
 			subagentRuntimeHost: {
@@ -109,6 +109,7 @@ describe("#617 subagent terminal agent messages", () => {
 			_admitParentAgentMessageSend(): {
 				id: string;
 				resolve(receipt: unknown): void;
+				reject(error: unknown): void;
 			};
 		};
 		const admission = gate._admitParentAgentMessageSend();
@@ -129,7 +130,9 @@ describe("#617 subagent terminal agent messages", () => {
 				(message) => "content" in message && String(message.content).includes("completed without sending"),
 			),
 		).toBe(false);
-		expect(() => gate._admitParentAgentMessageSend()).toThrow("closed send admission");
+		const retainedAdmission = gate._admitParentAgentMessageSend();
+		expect(retainedAdmission.id).toMatch(/^agentmsg_/);
+		retainedAdmission.reject(new Error("test cleanup"));
 	});
 
 	it("uses truthful fallback after an admitted parent reply durably fails", async () => {
