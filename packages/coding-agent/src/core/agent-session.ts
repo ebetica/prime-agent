@@ -10011,7 +10011,7 @@ export class AgentSession {
 		}
 	}
 
-	/** Close child-to-parent admission at the terminal linearization point and drain admitted sends. */
+	/** Mark initial execution admission closed and drain its sends before the automatic terminal outcome. */
 	private async _closeParentSendAdmissionAndWait(): Promise<void> {
 		this._parentMessageOutbox?.closeAdmission();
 		await Promise.all([...this._admittedParentSends]);
