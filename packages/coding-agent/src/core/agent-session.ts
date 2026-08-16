@@ -1617,10 +1617,14 @@ export class AgentSession {
 		}
 	}
 
+	private _invalidatePlatformWakeGeneration(): void {
+		this._platformWakeGeneration = randomUUID();
+	}
+
 	private _emitQueueUpdate(): void {
 		// Queue/lifecycle transitions invalidate idle admission snapshots even when
 		// the visible queue projection happens to remain equal (idle -> run -> idle).
-		this._platformWakeGeneration = randomUUID();
+		this._invalidatePlatformWakeGeneration();
 		const actions = this.getSessionActionSnapshot();
 		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
 		this._lastSessionActionSnapshot = actions;
@@ -3577,6 +3581,7 @@ export class AgentSession {
 		this._retryPromise = new Promise((resolve) => {
 			this._retryResolve = resolve;
 		});
+		this._invalidatePlatformWakeGeneration();
 	}
 
 	private _findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
@@ -3794,6 +3799,7 @@ export class AgentSession {
 			this._retryResolve();
 			this._retryResolve = undefined;
 			this._retryPromise = undefined;
+			this._invalidatePlatformWakeGeneration();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -3970,6 +3976,7 @@ export class AgentSession {
 				return this._disposeCallbacksPromise;
 			}
 			this._disposing = true;
+			this._invalidatePlatformWakeGeneration();
 			this._sessionActionCommitDisposeAbortController.abort();
 			await this._disposeAsyncOnce();
 		})();
@@ -4159,6 +4166,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._invalidatePlatformWakeGeneration();
 		this._kernelHostRequestAbortController?.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
@@ -5179,29 +5187,32 @@ export class AgentSession {
 		wakeId: string,
 		expectedGeneration: string,
 	): Promise<"admitted" | "already_admitted" | "already_completed" | "generation_stale"> {
-		platformWakeDetails(wakeId);
+		const canonicalWakeId = platformWakeDetails(wakeId).id;
 		if (!expectedGeneration) throw new Error("Platform wake expected generation is required");
-		const actionId = `platform-wake:${wakeId}`;
+		const actionId = `platform-wake:${canonicalWakeId}`;
 		const fence = await this._acquireSessionActionCommitFence();
 		try {
 			const markers = this.sessionManager
 				.getEntries()
 				.map((entry) => this._platformWakeMarker(entry))
-				.filter((marker) => marker?.wakeId === wakeId);
+				.filter((marker) => marker?.wakeId === canonicalWakeId);
 			if (markers.some((marker) => marker?.completed)) return "already_completed";
 			if (this._actionStore.ownedActions().some((action) => action.id === actionId)) return "already_admitted";
 			if (!this._isPlatformWakeEligible() || this._platformWakeGeneration !== expectedGeneration) {
 				return "generation_stale";
 			}
+			// Recheck every admission guard before writing the durable intent. No await
+			// occurs between this point and action ownership.
+			this._assertSessionActionAdmissionOpen();
 			if (markers.length === 0) {
 				this.sessionManager.appendCustomMessageEntryWithRollback(
 					PLATFORM_WAKE_INTENT_CUSTOM_TYPE,
 					"Platform wake pending",
 					false,
-					platformWakeDetails(wakeId),
+					platformWakeDetails(canonicalWakeId),
 				);
 			}
-			this._admitPlatformWakeAction(wakeId);
+			this._admitPlatformWakeAction(canonicalWakeId);
 			this.resumeQueuedWork();
 			return "admitted";
 		} finally {
@@ -5860,12 +5871,14 @@ export class AgentSession {
 			throw new Error(`Cannot ${operation} while resources are reloading.`);
 		}
 		this._resourceMutationAdmissions++;
+		this._invalidatePlatformWakeGeneration();
 		let released = false;
 		return {
 			release: () => {
 				if (released) return;
 				released = true;
 				this._resourceMutationAdmissions--;
+				this._invalidatePlatformWakeGeneration();
 			},
 		};
 	}
@@ -6530,6 +6543,9 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 		},
 	): Promise<void> {
+		if (message.customType === PLATFORM_WAKE_INTENT_CUSTOM_TYPE || message.customType === PLATFORM_WAKE_CUSTOM_TYPE) {
+			throw new Error(`Custom message type is reserved for daemon platform wakes: ${message.customType}`);
+		}
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -6889,6 +6905,10 @@ export class AgentSession {
 			!this.isCompacting &&
 			!this.isBashRunning &&
 			!this.isRetrying &&
+			!this._resourceReloadInProgress &&
+			this._resourceMutationAdmissions === 0 &&
+			!this._disposing &&
+			!this._disposed &&
 			this.unfinishedActionCount === 0
 		);
 	}
@@ -7906,6 +7926,7 @@ export class AgentSession {
 			this._disconnectFromAgent();
 			if (!options.skipAbort) await this.abort();
 			this._compactionAbortController = new AbortController();
+			this._invalidatePlatformWakeGeneration();
 			compactionOperation = new Promise<void>((resolve) => {
 				resolveCompactionOperation = resolve;
 			});
@@ -7963,6 +7984,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			this._invalidatePlatformWakeGeneration();
 			this._reconnectToAgent();
 			if (this._compactionOperation === compactionOperation) {
 				this._compactionOperation = undefined;
@@ -9021,6 +9043,7 @@ export class AgentSession {
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
+		this._invalidatePlatformWakeGeneration();
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
@@ -9122,6 +9145,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			this._invalidatePlatformWakeGeneration();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -9752,6 +9776,7 @@ export class AgentSession {
 		const releaseClaim = (): void => {
 			if (claimedReload) {
 				this._resourceReloadInProgress = false;
+				this._invalidatePlatformWakeGeneration();
 				this._notifySessionInputCheckpointChange();
 				this._scheduleSessionInputPump();
 				claimedReload = false;
@@ -9823,6 +9848,7 @@ export class AgentSession {
 					throw new SessionReloadBusyError();
 				}
 				this._resourceReloadInProgress = true;
+				this._invalidatePlatformWakeGeneration();
 				claimedReload = true;
 			} finally {
 				fence.release();
@@ -11415,6 +11441,7 @@ export class AgentSession {
 			this._retryPromise = new Promise((resolve) => {
 				this._retryResolve = resolve;
 			});
+			this._invalidatePlatformWakeGeneration();
 		}
 
 		this._retryAttempt++;
@@ -11576,6 +11603,7 @@ export class AgentSession {
 	): Promise<BashResult> {
 		if (this._resourceReloadInProgress) throw new Error("Cannot execute bash while resources are reloading.");
 		this._bashAbortController = new AbortController();
+		this._invalidatePlatformWakeGeneration();
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -11599,6 +11627,7 @@ export class AgentSession {
 			return result;
 		} finally {
 			this._bashAbortController = undefined;
+			this._invalidatePlatformWakeGeneration();
 		}
 	}
 
@@ -12010,6 +12039,7 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		this._invalidatePlatformWakeGeneration();
 		let resolveBranchSummaryOperation: () => void = () => {};
 		const branchSummaryOperation = new Promise<void>((resolve) => {
 			resolveBranchSummaryOperation = resolve;
@@ -12157,6 +12187,7 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			this._invalidatePlatformWakeGeneration();
 			if (this._branchSummaryOperation === branchSummaryOperation) {
 				this._branchSummaryOperation = undefined;
 			}

@@ -10,6 +10,7 @@ import {
 	type CustomMessage,
 	createSessionSlashCommandMessage,
 	PLATFORM_WAKE_CUSTOM_TYPE,
+	PLATFORM_WAKE_INTENT_CUSTOM_TYPE,
 	PLATFORM_WAKE_MESSAGE,
 	type WorkerRecoveryDetails,
 } from "../../../src/core/messages.js";
@@ -253,6 +254,48 @@ describe("issue #4257 update restart resume", () => {
 				(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
 			),
 		).toHaveLength(1);
+	});
+
+	it("invalidates platform wake snapshots across standalone bash and compaction ABA", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const wakeId = "00000000-0000-4000-8000-000000000020";
+
+		const beforeBash = harness.session.platformWakeGeneration;
+		expect(beforeBash).toBeTypeOf("string");
+		await harness.session.executeBash("printf wake-generation");
+		expect(harness.session.platformWakeGeneration).not.toBe(beforeBash);
+		expect(await harness.session.admitPlatformWake(wakeId, beforeBash!)).toBe("generation_stale");
+
+		const beforeCompaction = harness.session.platformWakeGeneration;
+		expect(beforeCompaction).toBeTypeOf("string");
+		await harness.session.compact().catch(() => undefined);
+		expect(harness.session.platformWakeGeneration).not.toBe(beforeCompaction);
+		expect(await harness.session.admitPlatformWake(wakeId, beforeCompaction!)).toBe("generation_stale");
+	});
+
+	it("canonicalizes platform wake ids and reserves their transcript provenance", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("canonical wake handled")]);
+		const lower = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+		const upper = lower.toUpperCase();
+		const generation = harness.session.platformWakeGeneration;
+		expect(await harness.session.admitPlatformWake(lower, generation!)).toBe("admitted");
+		await harness.session.waitForIdle();
+		expect(await harness.session.admitPlatformWake(upper, harness.session.platformWakeGeneration!)).toBe(
+			"already_completed",
+		);
+		for (const customType of [PLATFORM_WAKE_INTENT_CUSTOM_TYPE, PLATFORM_WAKE_CUSTOM_TYPE]) {
+			await expect(
+				harness.session.sendCustomMessage({
+					customType,
+					content: PLATFORM_WAKE_MESSAGE,
+					display: true,
+					details: { version: 1, id: lower, source: "platform" },
+				}),
+			).rejects.toThrow("reserved for daemon platform wakes");
+		}
 	});
 
 	it("conditionally admits one durable platform wake and rejects an ABA-stale idle generation", async () => {

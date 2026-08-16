@@ -47,7 +47,7 @@ export function platformWakeDetails(id: string): PlatformWakeDetails {
 	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
 		throw new Error("Platform wake id must be a UUID");
 	}
-	return { version: 1, id, source: "platform" };
+	return { version: 1, id: id.toLowerCase(), source: "platform" };
 }
 
 export function isPlatformWakeDetails(value: unknown): value is PlatformWakeDetails {
