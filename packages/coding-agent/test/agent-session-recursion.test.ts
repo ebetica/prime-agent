@@ -1336,7 +1336,7 @@ describe("AgentSession rlm recursion", () => {
 		).toHaveLength(0);
 	});
 
-	it("allows explicit parent messages only during retained heartbeat turns", async () => {
+	it("allows retained children to message their parent while idle and during later turns", async () => {
 		let heartbeatStarted = false;
 		let releaseHeartbeat: () => void = () => {};
 		const heartbeatGate = new Promise<void>((resolve) => {
@@ -1416,28 +1416,31 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		const send = (child as unknown as InspectableRlmSession)._createKernelHostHandlers()["agent_message.send"]!;
-		await expect(send({ message: "too late", receiver_role: "parent" })).rejects.toThrow("closed send admission");
+		await expect(send({ message: "idle completion result", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "idle completion result",
+		});
 
 		const heartbeat = child.promptHeartbeat(retainedChildHeartbeat("wake retained child"));
 		await waitFor(() => heartbeatStarted);
 		const receipt = await send({ message: "heartbeat result", receiver_role: "parent" });
-		expect(receipt).toMatchObject({ id: sentIds[0], message: "heartbeat result" });
-		expect(sentIds).toHaveLength(1);
-		expect(sentIds[0]).toMatch(/^agentmsg_/);
+		expect(receipt).toMatchObject({ id: sentIds[1], message: "heartbeat result" });
+		expect(sentIds).toHaveLength(2);
+		expect(new Set(sentIds).size).toBe(2);
+		expect(sentIds.every((id) => /^agentmsg_/.test(id))).toBe(true);
 		const outboxBeforeOrphanedSend = (child as unknown as InspectableRlmSession)._parentMessageOutbox?.pending();
 		parentAvailable = false;
 		await expect(send({ message: "orphaned result", receiver_role: "parent" })).rejects.toThrow("No parent matches");
-		expect(sentIds).toHaveLength(1);
+		expect(sentIds).toHaveLength(2);
 		expect((child as unknown as InspectableRlmSession)._parentMessageOutbox?.pending()).toEqual(
 			outboxBeforeOrphanedSend,
 		);
 		releaseHeartbeat();
 		await heartbeat;
-		await expect(send({ message: "after heartbeat", receiver_role: "parent" })).rejects.toThrow(
-			"closed send admission",
-		);
-
 		parentAvailable = true;
+		await expect(send({ message: "after heartbeat", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "after heartbeat",
+		});
+
 		const followUp = createAgentSessionMessage({
 			id: "agentmsg-retained-follow-up",
 			source: "agent_message",
@@ -1450,12 +1453,13 @@ describe("AgentSession rlm recursion", () => {
 		await expect(send({ message: "follow-up result", receiver_role: "parent" })).resolves.toMatchObject({
 			message: "follow-up result",
 		});
-		expect(sentIds).toHaveLength(2);
+		expect(sentIds).toHaveLength(4);
 		releaseFollowUp();
 		await child.agent.waitForIdle();
-		await expect(send({ message: "after follow-up", receiver_role: "parent" })).rejects.toThrow(
-			"closed send admission",
-		);
+		await expect(send({ message: "after follow-up", receiver_role: "parent" })).resolves.toMatchObject({
+			message: "after follow-up",
+		});
+		expect(sentIds).toHaveLength(5);
 		expect(child.automaticParentReportsMuteState.muted).toBe(true);
 		expect(
 			root.messages.filter(
@@ -1465,30 +1469,17 @@ describe("AgentSession rlm recursion", () => {
 
 		await root.deleteRlmSubagent(spawned.rlm_child_id);
 		await expect(send({ message: "after deletion", receiver_role: "parent" })).rejects.toThrow(
-			"closed send admission",
+			"child session is disposed",
 		);
 	});
 
-	it("replays one stable retained-turn message across restart without reopening idle admission", async () => {
+	it("replays an idle retained-child message once across restart", async () => {
 		const childDir = join(tempDir, "restarted-retained-child");
-		let heartbeatStarted = false;
-		let releaseHeartbeat: () => void = () => {};
-		const heartbeatGate = new Promise<void>((resolve) => {
-			releaseHeartbeat = resolve;
-		});
 		const ambiguousIds: string[] = [];
 		const first = createSession({
 			depth: 1,
 			rlmSessionDir: childDir,
 			sessionManager: SessionManager.create(tempDir, join(tempDir, "restart-sessions-first")),
-			streamFn: () => {
-				const stream = createAssistantMessageEventStream();
-				heartbeatStarted = true;
-				void heartbeatGate.then(() => {
-					stream.push({ type: "done", reason: "stop", message: assistantMessage("first heartbeat done") });
-				});
-				return stream;
-			},
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
 				roster: () => ({
@@ -1504,17 +1495,12 @@ describe("AgentSession rlm recursion", () => {
 		const firstInternals = first as unknown as InspectableRlmSession;
 		await firstInternals._closeParentSendAdmissionAndWait();
 		const firstSend = firstInternals._createKernelHostHandlers()["agent_message.send"]!;
-		await expect(firstSend({ message: "idle", receiver_role: "parent" })).rejects.toThrow("closed send admission");
-		const firstHeartbeat = first.promptHeartbeat(retainedChildHeartbeat("retry after restart"));
-		await waitFor(() => heartbeatStarted);
-		await expect(firstSend({ message: "durable heartbeat result", receiver_role: "parent" })).rejects.toThrow(
+		await expect(firstSend({ message: "durable idle result", receiver_role: "parent" })).rejects.toThrow(
 			"connection closed after write",
 		);
 		expect(firstInternals._parentMessageOutbox?.pending()).toMatchObject([
-			{ id: ambiguousIds[0], message: "durable heartbeat result", state: "pending" },
+			{ id: ambiguousIds[0], message: "durable idle result", state: "pending" },
 		]);
-		releaseHeartbeat();
-		await firstHeartbeat;
 		await first.disposeAsync();
 
 		const replayedIds: string[] = [];
@@ -1549,10 +1535,12 @@ describe("AgentSession rlm recursion", () => {
 		]);
 		await expect(
 			secondInternals._createKernelHostHandlers()["agent_message.send"]!({
-				message: "still idle",
+				message: "new idle result after restart",
 				receiver_role: "parent",
 			}),
-		).rejects.toThrow("closed send admission");
+		).resolves.toMatchObject({ message: "new idle result after restart" });
+		expect(replayedIds).toHaveLength(2);
+		expect(new Set(replayedIds).size).toBe(2);
 		await second.disposeAsync();
 
 		const third = createSession({
@@ -1563,7 +1551,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 		const thirdInternals = third as unknown as InspectableRlmSession;
 		await vi.waitFor(() => expect(thirdInternals._parentMessageOutbox?.pending()).toEqual([]));
-		expect(replayedIds).toEqual([ambiguousIds[0]]);
+		expect(replayedIds).toHaveLength(2);
 	});
 
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {
