@@ -2602,12 +2602,14 @@ export class AgentSession {
 			resolveApplySettled = resolve;
 		});
 		this._refineInFlight = applySettled;
+		this._invalidatePlatformWakeGeneration();
 		try {
 			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
+				this._invalidatePlatformWakeGeneration();
 			}
 			this._scheduleSessionInputPump();
 		}
@@ -2804,12 +2806,14 @@ export class AgentSession {
 			resolveApplySettled = resolve;
 		});
 		this._refineInFlight = applySettled;
+		this._invalidatePlatformWakeGeneration();
 		try {
 			await this._applyRefine(plan, options, refineAbort);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
+				this._invalidatePlatformWakeGeneration();
 			}
 			this._scheduleSessionInputPump();
 		}
@@ -6925,6 +6929,7 @@ export class AgentSession {
 	private _isPlatformWakeEligible(): boolean {
 		return (
 			this._activeAgentOperation === undefined &&
+			this._refineInFlight === undefined &&
 			this._canStartSessionActionImmediately() &&
 			!this._ownedOperations.isStopping &&
 			!this._resourceReloadInProgress &&
@@ -8622,6 +8627,7 @@ export class AgentSession {
 			resolveApplySettled = resolve;
 		});
 		this._refineInFlight = applySettled;
+		this._invalidatePlatformWakeGeneration();
 		try {
 			// Wait for the session to become quiescent before applying. Planning is
 			// allowed to overlap active user work, but application must not disconnect
@@ -8652,6 +8658,7 @@ export class AgentSession {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
+				this._invalidatePlatformWakeGeneration();
 			}
 			this._scheduleSessionInputPump();
 		}
