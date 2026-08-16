@@ -283,6 +283,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
+	"admit_platform_wake",
 	"send_message",
 	"agent_messages_status",
 	"agent_messages_pause",
@@ -4085,6 +4086,13 @@ export class AgentDaemon {
 					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
 				}
 				return success(command.id, "resume_queue");
+			}
+
+			case "admit_platform_wake": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				const status = await state.runtime.session.admitPlatformWake(command.wakeId, command.expectedGeneration);
+				if (status === "admitted") this.recordWorkerRecoveryState(state, "follow_up_queued", true);
+				return success(command.id, command.type, { status });
 			}
 
 			case "acknowledge_message": {

@@ -70,8 +70,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 24 carries confirmed background-process cleanup counts in worker recovery handoffs.
 // Revision 25 adds durable idempotent agent-message send and acknowledgement commands.
 // Revision 26 adds ownership-fenced operation stop and ID-addressed queue withdrawal.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-41ac5136a6cd";
+// Revision 27 adds generation-checked, durable platform-wake admission.
+export const DAEMON_SCHEMA_REVISION = 27;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-be5df71f7730";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -118,7 +119,8 @@ export type DaemonServerCapability =
 	| "planned_restart_handoff_lifecycle"
 	| "automatic_parent_report_mute"
 	| "atomic_stop_v2"
-	| "queued_withdrawal_v2";
+	| "queued_withdrawal_v2"
+	| "conditional_platform_wake";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -176,6 +178,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"automatic_parent_report_mute",
 	"atomic_stop_v2",
 	"queued_withdrawal_v2",
+	"conditional_platform_wake",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -605,6 +608,13 @@ export type DaemonCommand =
 	| { id?: string; type: "resume_queue"; activeSessionId: string }
 	| {
 			id?: string;
+			type: "admit_platform_wake";
+			activeSessionId: string;
+			wakeId: string;
+			expectedGeneration: string;
+	  }
+	| {
+			id?: string;
 			type: "send_message";
 			targetActiveSessionId: string;
 			message: string;
@@ -892,6 +902,11 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	restore_planned_restart_handoff: PLANNED_RESTART_HANDOFF_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
+	admit_platform_wake: {
+		minProtocol: 7,
+		minSchemaRevision: 27,
+		capability: "conditional_platform_wake",
+	},
 	send_message: LEGACY_DAEMON_COMMAND,
 	send_idempotent_message: IDEMPOTENT_AGENT_MESSAGE_COMMAND,
 	acknowledge_message: IDEMPOTENT_AGENT_MESSAGE_COMMAND,

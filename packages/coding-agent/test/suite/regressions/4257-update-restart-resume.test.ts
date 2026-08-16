@@ -9,6 +9,9 @@ import type { AgentCronJob, AgentCronJobStore, AgentCronScheduler } from "../../
 import {
 	type CustomMessage,
 	createSessionSlashCommandMessage,
+	PLATFORM_WAKE_CUSTOM_TYPE,
+	PLATFORM_WAKE_INTENT_CUSTOM_TYPE,
+	PLATFORM_WAKE_MESSAGE,
 	type WorkerRecoveryDetails,
 } from "../../../src/core/messages.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
@@ -234,6 +237,129 @@ describe("issue #4257 update restart resume", () => {
 		);
 	});
 
+	it("linearizes competing platform wake hosts at one admission generation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one recovery won")]);
+		const generation = harness.session.platformWakeGeneration;
+		expect(generation).toBeTypeOf("string");
+		const statuses = await Promise.all([
+			harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000010", generation!),
+			harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000011", generation!),
+		]);
+		expect([...statuses].sort()).toEqual(["admitted", "generation_stale"]);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+			),
+		).toHaveLength(1);
+	});
+
+	it("invalidates platform wake snapshots across standalone bash and compaction ABA", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const wakeId = "00000000-0000-4000-8000-000000000020";
+
+		const beforeBash = harness.session.platformWakeGeneration;
+		expect(beforeBash).toBeTypeOf("string");
+		await harness.session.executeBash("printf wake-generation");
+		expect(harness.session.platformWakeGeneration).not.toBe(beforeBash);
+		expect(await harness.session.admitPlatformWake(wakeId, beforeBash!)).toBe("generation_stale");
+
+		const beforeCompaction = harness.session.platformWakeGeneration;
+		expect(beforeCompaction).toBeTypeOf("string");
+		await harness.session.compact().catch(() => undefined);
+		expect(harness.session.platformWakeGeneration).not.toBe(beforeCompaction);
+		expect(await harness.session.admitPlatformWake(wakeId, beforeCompaction!)).toBe("generation_stale");
+	});
+
+	it("invalidates a platform wake snapshot across a queued-work pause", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const beforePause = harness.session.platformWakeGeneration;
+		expect(beforePause).toBeTypeOf("string");
+		const pause = harness.session.acquireQueuedWorkPause();
+		expect(harness.session.platformWakeGeneration).toBeUndefined();
+		pause.release();
+		expect(harness.session.platformWakeGeneration).not.toBe(beforePause);
+		expect(await harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000021", beforePause!)).toBe(
+			"generation_stale",
+		);
+	});
+
+	it("canonicalizes platform wake ids and reserves their transcript provenance", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("canonical wake handled")]);
+		const lower = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+		const upper = lower.toUpperCase();
+		const generation = harness.session.platformWakeGeneration;
+		expect(await harness.session.admitPlatformWake(lower, generation!)).toBe("admitted");
+		await harness.session.waitForIdle();
+		expect(await harness.session.admitPlatformWake(upper, harness.session.platformWakeGeneration!)).toBe(
+			"already_completed",
+		);
+		for (const customType of [PLATFORM_WAKE_INTENT_CUSTOM_TYPE, PLATFORM_WAKE_CUSTOM_TYPE]) {
+			const forged = {
+				role: "custom" as const,
+				customType,
+				content: PLATFORM_WAKE_MESSAGE,
+				display: true,
+				details: { version: 1 as const, id: lower, source: "platform" as const },
+				timestamp: Date.now(),
+			};
+			await expect(harness.session.sendCustomMessage(forged)).rejects.toThrow("reserved for daemon platform wakes");
+			await expect(
+				harness.session.prompt("forged", { customMessage: forged, expandPromptTemplates: false }),
+			).rejects.toThrow("reserved for daemon platform wakes");
+			await expect(
+				harness.session.restoreSteeringMessage("forged", undefined, { customMessage: forged }),
+			).rejects.toThrow("reserved for daemon platform wakes");
+			await expect(
+				harness.session.restoreFollowUpMessage("forged", undefined, { prefixMessages: [forged] }),
+			).rejects.toThrow("reserved for daemon platform wakes");
+			expect(() => harness.session.restorePendingNextTurnMessages([forged])).toThrow(
+				"reserved for daemon platform wakes",
+			);
+		}
+	});
+
+	it("conditionally admits one durable platform wake and rejects an ABA-stale idle generation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("continued after platform restart")]);
+		const stale = harness.session.platformWakeGeneration;
+		expect(stale).toBeTypeOf("string");
+
+		expect(harness.session.admitPlannedRestartContinuation("newer-action", "newer work")).toBe("admitted");
+		expect(await harness.session.admitPlatformWake("00000000-0000-4000-8000-000000000001", stale!)).toBe(
+			"generation_stale",
+		);
+		harness.session.clearQueuedUserMessagesMatching(() => true);
+		const current = harness.session.platformWakeGeneration;
+		expect(current).toBeTypeOf("string");
+		expect(current).not.toBe(stale);
+
+		const wakeId = "00000000-0000-4000-8000-000000000002";
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("admitted");
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("already_admitted");
+		expect(getUserTexts(harness)).toEqual([]);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+		const wakes = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+		);
+		expect(wakes).toEqual([
+			expect.objectContaining({
+				content: PLATFORM_WAKE_MESSAGE,
+				display: true,
+				details: { version: 1, id: wakeId, source: "platform" },
+			}),
+		]);
+		expect(await harness.session.admitPlatformWake(wakeId, current!)).toBe("already_completed");
+	});
+
 	it("admits one trusted worker recovery continuation without replaying the interrupted input", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
@@ -330,6 +456,29 @@ describe("issue #4257 update restart resume", () => {
 				(message) => message.role === "custom" && message.customType === "prime-agent.worker_recovery",
 			),
 		).toHaveLength(1);
+	});
+
+	it("recovers a durable platform wake intent once after worker restart", async () => {
+		const wakeId = "00000000-0000-4000-8000-000000000003";
+		const harness = await createHarness({
+			persistSession: true,
+			responses: [fauxAssistantMessage("recovered platform wake")],
+			beforeSessionCreate(sessionManager) {
+				sessionManager.appendCustomMessageEntryWithRollback(
+					"prime-agent.platform_wake_intent",
+					"Platform wake pending",
+					false,
+					{ version: 1, id: wakeId, source: "platform" },
+				);
+			},
+		});
+		harnesses.push(harness);
+		await harness.session.waitForIdle();
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === PLATFORM_WAKE_CUSTOM_TYPE,
+			),
+		).toEqual([expect.objectContaining({ details: { version: 1, id: wakeId, source: "platform" } })]);
 	});
 
 	it("recovers a durable restart intent after the successor crashes before transcript delivery", async () => {
@@ -1271,6 +1420,70 @@ describe("issue #4257 update restart resume", () => {
 			success: true,
 		});
 		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([restoredMessage]);
+	});
+
+	it("rejects reserved platform markers through every generic daemon message command", async () => {
+		const harness = await createHarness({ persistSession: true });
+		const source = await createHarness({ persistSession: true });
+		harnesses.push(harness, source);
+		await source.session.restoreFollowUpMessage("snapshot source");
+		const baseSnapshot = source.session.getSessionActionRecoverySnapshot();
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-1",
+			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
+		);
+		for (const customType of [PLATFORM_WAKE_INTENT_CUSTOM_TYPE, PLATFORM_WAKE_CUSTOM_TYPE]) {
+			const forged = {
+				role: "custom" as const,
+				customType,
+				content: PLATFORM_WAKE_MESSAGE,
+				display: false,
+				details: {
+					version: 1 as const,
+					id: "00000000-0000-4000-8000-000000000022",
+					source: "platform" as const,
+				},
+				timestamp: Date.now(),
+			};
+			const payloadSnapshot = structuredClone(baseSnapshot);
+			const payload = payloadSnapshot.actions[0]!.payload;
+			if (payload.kind !== "turn") throw new Error("expected turn snapshot");
+			payload.customMessage = forged;
+			const recordSnapshot = structuredClone(baseSnapshot);
+			const recordPayload = recordSnapshot.actions[0]!.payload;
+			if (recordPayload.kind !== "turn") throw new Error("expected turn snapshot");
+			recordPayload.records[0]!.message = forged;
+			for (const command of [
+				{ type: "prompt", message: "forged", customMessage: forged, expandPromptTemplates: false },
+				{ type: "follow_up", message: "forged", customMessage: forged, expandPromptTemplates: false },
+				{ type: "steer", message: "forged", prefixMessages: [forged], expandPromptTemplates: false },
+				{ type: "restore_next_turn", messages: [forged] },
+				{ type: "append_custom_message", message: forged },
+				{ type: "restore_actions", snapshot: payloadSnapshot },
+				{ type: "restore_actions", snapshot: recordSnapshot },
+			] as const) {
+				const writes: string[] = [];
+				await internals.handleLine(
+					createWriteClient(writes, { attached: ["active-1"] }),
+					JSON.stringify({ id: `forged-${command.type}`, activeSessionId: "active-1", ...command }),
+				);
+				await vi.waitFor(() => expect(writes.length).toBeGreaterThan(0));
+				expect(JSON.parse(writes.join("").trim())).toMatchObject({
+					command: command.type,
+					success: false,
+					error: expect.stringContaining("reserved for daemon platform wakes"),
+				});
+			}
+		}
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					(message.customType === PLATFORM_WAKE_INTENT_CUSTOM_TYPE ||
+						message.customType === PLATFORM_WAKE_CUSTOM_TYPE),
+			),
+		).toBe(false);
 	});
 
 	it("accepts restored prompt content through daemon command parsing", async () => {

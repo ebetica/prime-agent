@@ -248,6 +248,26 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send a conditional platform wake to an old daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({
+				type: "admit_platform_wake",
+				activeSessionId: "active-1",
+				wakeId: "00000000-0000-4000-8000-000000000001",
+				expectedGeneration: "generation-1",
+			}),
+		).rejects.toThrow("does not support conditional_platform_wake");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

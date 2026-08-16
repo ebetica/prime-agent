@@ -60,6 +60,8 @@ export interface SessionSummary {
 	attachedClients: number;
 	messageCount: number;
 	unfinishedActionCount?: number;
+	/** Opaque, ABA-safe token present only while a platform wake may be conditionally admitted. */
+	platformWakeGeneration?: string;
 	sessionActions: SessionActionSnapshot;
 	streamingMessage?: AgentMessage;
 	created?: string;
@@ -241,6 +243,7 @@ export function summaryForActiveSession(
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		unfinishedActionCount: session.unfinishedActionCount,
+		platformWakeGeneration: session.platformWakeGeneration,
 		sessionActions: session.getSessionActionSnapshot(),
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString() ?? session.sessionManager.getHeader?.()?.timestamp,

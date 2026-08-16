@@ -207,6 +207,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"restore_planned_restart_handoff",
 	"append_custom_message",
 	"resume_queue",
+	"admit_platform_wake",
 	"send_message",
 	"send_idempotent_message",
 	"acknowledge_message",
