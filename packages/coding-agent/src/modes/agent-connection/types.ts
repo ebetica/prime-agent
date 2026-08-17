@@ -730,8 +730,8 @@ export interface AgentConnection {
 	promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	startSideQuestion(id: string, question: string, previousTurns?: AgentConnectionSideQuestionTurn[]): Promise<void>;
 	abortSideQuestion(id: string): Promise<boolean>;
-	steer(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void>;
-	followUp(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void>;
+	steer(message: string, imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions): Promise<void>;
+	followUp(message: string, imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;

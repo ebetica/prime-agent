@@ -791,15 +791,19 @@ describe("DaemonAgentConnection", () => {
 		await connection.prompt("operator prompt", { operatorInput });
 		await connection.steer("operator steer", { operatorInput });
 		await connection.followUp("operator follow-up", { operatorInput });
+		const legacyImages = [{ type: "image" as const, data: "abc", mimeType: "image/png" }];
+		await connection.steer("legacy image steer", legacyImages);
 		expect(
 			fakeClient.requests.map((request) => ({
 				type: request.type,
 				operatorInput: "operatorInput" in request ? request.operatorInput : undefined,
+				images: "images" in request ? request.images : undefined,
 			})),
 		).toEqual([
-			{ type: "prompt", operatorInput },
-			{ type: "steer", operatorInput },
-			{ type: "follow_up", operatorInput },
+			{ type: "prompt", operatorInput, images: undefined },
+			{ type: "steer", operatorInput, images: undefined },
+			{ type: "follow_up", operatorInput, images: undefined },
+			{ type: "steer", operatorInput: undefined, images: legacyImages },
 		]);
 	});
 

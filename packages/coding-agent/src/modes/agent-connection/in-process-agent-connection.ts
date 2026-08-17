@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
@@ -400,7 +400,8 @@ export class InProcessAgentConnection implements AgentConnection {
 		return true;
 	}
 
-	async steer(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+	async steer(message: string, imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
 		await this.session.steer(message, options?.images, {
 			resumeIfIdle: true,
 			source: "interactive",
@@ -410,7 +411,11 @@ export class InProcessAgentConnection implements AgentConnection {
 		});
 	}
 
-	async followUp(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+	async followUp(
+		message: string,
+		imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions,
+	): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
 		await this.session.followUp(message, options?.images, {
 			resumeIfIdle: true,
 			source: "interactive",

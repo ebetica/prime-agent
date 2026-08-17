@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
@@ -948,7 +948,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.aborted;
 	}
 
-	async steer(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+	async steer(message: string, imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
 		this.assertOperatorInputProvenance(options);
 		await this.requestOk({
 			type: "steer",
@@ -959,7 +960,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	async followUp(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+	async followUp(
+		message: string,
+		imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions,
+	): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
 		this.assertOperatorInputProvenance(options);
 		await this.requestOk({
 			type: "follow_up",
