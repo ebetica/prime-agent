@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
+import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
@@ -14,6 +14,7 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
+import { inputProvenanceTime } from "../../core/messages.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -46,6 +47,7 @@ import type {
 	AgentConnectionQueuedMessageLane,
 	AgentConnectionQueuedMessageMutation,
 	AgentConnectionQueuedMessageMutationStatus,
+	AgentConnectionQueuedPromptOptions,
 	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
@@ -333,6 +335,12 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 				...(options?.source ? { source: options.source } : {}),
+				...(options?.operatorInput
+					? {
+							hostInputRole: "User" as const,
+							hostInputTime: inputProvenanceTime(options.operatorInput.receivedAt),
+						}
+					: {}),
 				...(options?.signal ? { signal: options.signal } : {}),
 				preflightResult: (success) => {
 					if (success) {
@@ -354,6 +362,9 @@ export class InProcessAgentConnection implements AgentConnection {
 			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 			...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 			...(options?.source ? { source: options.source } : {}),
+			...(options?.operatorInput
+				? { hostInputRole: "User" as const, hostInputTime: inputProvenanceTime(options.operatorInput.receivedAt) }
+				: {}),
 			...(options?.signal ? { signal: options.signal } : {}),
 		});
 	}
@@ -389,12 +400,24 @@ export class InProcessAgentConnection implements AgentConnection {
 		return true;
 	}
 
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.session.steer(message, images, { resumeIfIdle: true, source: "interactive" });
+	async steer(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+		await this.session.steer(message, options?.images, {
+			resumeIfIdle: true,
+			source: "interactive",
+			...(options?.operatorInput
+				? { hostInputRole: "User" as const, hostInputTime: inputProvenanceTime(options.operatorInput.receivedAt) }
+				: {}),
+		});
 	}
 
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.session.followUp(message, images, { resumeIfIdle: true, source: "interactive" });
+	async followUp(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void> {
+		await this.session.followUp(message, options?.images, {
+			resumeIfIdle: true,
+			source: "interactive",
+			...(options?.operatorInput
+				? { hostInputRole: "User" as const, hostInputTime: inputProvenanceTime(options.operatorInput.receivedAt) }
+				: {}),
+		});
 	}
 
 	async abort(): Promise<void> {

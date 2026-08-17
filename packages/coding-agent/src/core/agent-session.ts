@@ -186,10 +186,13 @@ import {
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	createTrustedInputMessage,
 	createWorkerRecoveryMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
+	type InputProvenanceRole,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	inputProvenanceTime,
 	isPlatformWakeDetails,
 	isSessionSlashCommandMessage,
 	isWorkerRecoveryDetails,
@@ -602,6 +605,9 @@ export interface PromptOptions {
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
+	/** Trusted host classification. Ingress adapters assign this; it is never accepted from wire input. */
+	hostInputRole?: InputProvenanceRole;
+	hostInputTime?: string;
 }
 
 interface InternalPromptOptions extends PromptOptions {
@@ -3693,6 +3699,8 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message.inputProvenance,
+					event.message.modelInputBody,
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -4907,15 +4915,22 @@ export class AgentSession {
 					? options.content.map((block) => ({ ...block }))
 					: this._buildPromptContent(normalized.text, normalized.images);
 				const suppliedMessage = options?.customMessage;
+				const timestamp = Date.now();
 				const primaryMessage = suppliedMessage
 					? visibleQueued
 						? suppliedMessage
 						: cloneCustomMessage(suppliedMessage)
-					: ({
-							role: "user",
-							content: content.map((block) => ({ ...block })),
-							timestamp: Date.now(),
-						} satisfies UserMessage);
+					: createTrustedInputMessage(
+							normalized.text,
+							content.map((block) => ({ ...block })),
+							{
+								role:
+									options?.hostInputRole ??
+									((options?.source ?? "interactive") === "interactive" ? "User" : "Platform"),
+								time: options?.hostInputTime ?? inputProvenanceTime(timestamp),
+							},
+							timestamp,
+						);
 				const acceptedAgentMessage = options?.skipPrePromptWork === true && options.returnAfterAccepted === true;
 				const action = this._createPreparedTurnAction(schedule, normalized.text, normalized.images, {
 					agentMessageId: options?.agentMessageId,
@@ -4929,6 +4944,8 @@ export class AgentSession {
 						options?.resumeIfIdle ||
 						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
 					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+					hostInputRole: options?.hostInputRole,
+					hostInputTime: options?.hostInputTime,
 					executionPolicy: visibleQueued
 						? this._turnExecutionPolicy("queued")
 						: this._turnExecutionPolicy("directPrompt", {
@@ -5078,6 +5095,8 @@ export class AgentSession {
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			hostInputRole?: InputProvenanceRole;
+			hostInputTime?: string;
 		} = {},
 	): Promise<void> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5095,6 +5114,8 @@ export class AgentSession {
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
 			source: options.source ?? "interactive",
+			hostInputRole: options.hostInputRole,
+			hostInputTime: options.hostInputTime,
 		});
 	}
 
@@ -5113,6 +5134,8 @@ export class AgentSession {
 			agentMessageId?: string;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			hostInputRole?: InputProvenanceRole;
+			hostInputTime?: string;
 		} = {},
 	): Promise<boolean> {
 		const normalized = this._normalizeSubmission(text, images, {
@@ -5130,6 +5153,8 @@ export class AgentSession {
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
 			source: options.source ?? "interactive",
+			hostInputRole: options.hostInputRole,
+			hostInputTime: options.hostInputTime,
 		});
 	}
 
@@ -5793,6 +5818,8 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			hostInputRole?: InputProvenanceRole;
+			hostInputTime?: string;
 			executionPolicy?: TurnExecutionPolicy;
 			queueVisible?: boolean;
 			acceptedAgentMessage?: boolean;
@@ -5801,14 +5828,36 @@ export class AgentSession {
 	): QueuedSessionAction {
 		const id = options.actionId ?? randomUUID();
 		const content = options.content ?? this._buildPromptContent(text, images);
-		const message =
-			options.message ??
-			({
-				role: "user",
-				content: content.map((block) => ({ ...block })),
-				timestamp: Date.now(),
-			} satisfies UserMessage);
-		const prefixMessages = options.prefixMessages?.map((prefix) => cloneCustomMessage(prefix)) ?? [];
+		const timestamp = Date.now();
+		const suppliedMessage = options.message;
+		const message = suppliedMessage
+			? suppliedMessage.role === "custom" && !suppliedMessage.inputProvenance
+				? {
+						...cloneCustomMessage(suppliedMessage),
+						inputProvenance: { role: "Platform" as const, time: inputProvenanceTime(timestamp) },
+						modelInputBody: text,
+					}
+				: suppliedMessage
+			: createTrustedInputMessage(
+					text,
+					content.map((block) => ({ ...block })),
+					{
+						role: options.hostInputRole ?? (options.source === "interactive" ? "User" : "Platform"),
+						time: options.hostInputTime ?? inputProvenanceTime(timestamp),
+					},
+					timestamp,
+				);
+		const prefixMessages =
+			options.prefixMessages?.map((prefix) => {
+				const cloned = cloneCustomMessage(prefix);
+				return cloned.inputProvenance
+					? cloned
+					: {
+							...cloned,
+							inputProvenance: { role: "Platform" as const, time: inputProvenanceTime(cloned.timestamp) },
+							modelInputBody: typeof cloned.content === "string" ? cloned.content : undefined,
+						};
+			}) ?? [];
 		const preview = options.previewLabel ? `${options.previewLabel}: ${text}` : undefined;
 		const payload: PreparedTurnPayload = {
 			kind: "turn",
@@ -5820,7 +5869,7 @@ export class AgentSession {
 			preview,
 			images: images?.map((image) => ({ ...image })),
 			content: content.map((block) => ({ ...block })),
-			customMessage: options.message?.role === "custom" ? cloneCustomMessage(options.message) : undefined,
+			customMessage: message.role === "custom" ? cloneCustomMessage(message) : undefined,
 			executionPolicy: options.executionPolicy ?? this._turnExecutionPolicy("queued"),
 			queueVisible: options.queueVisible ?? true,
 			acceptedAgentMessage: options.acceptedAgentMessage ?? false,
@@ -6006,6 +6055,8 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			hostInputRole?: InputProvenanceRole;
+			hostInputTime?: string;
 		} = {},
 	): Promise<boolean> {
 		const action = this._createPreparedTurnAction(schedule, text, images, options);
@@ -6534,6 +6585,8 @@ export class AgentSession {
 			message.content,
 			message.display,
 			message.details,
+			message.inputProvenance,
+			message.modelInputBody,
 		);
 		this.agent.state.messages.push(message);
 		this._emit({ type: "message_start", message });
@@ -11111,12 +11164,14 @@ export class AgentSession {
 					}
 				});
 				run.unsubscribe = unsubscribeChildEvents;
-				const content = `[task from parent]\n\n${prompt}`;
+				const content = prompt;
 				const spawnMessage: AgentSessionMessage = {
 					role: "custom",
 					customType: AGENT_MESSAGE_CUSTOM_TYPE,
 					content,
 					display: true,
+					inputProvenance: { role: "Parent agent", time: inputProvenanceTime() },
+					modelInputBody: content,
 					details: {
 						id: `spawn:${run.id}`,
 						message: prompt,

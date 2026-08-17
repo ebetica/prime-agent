@@ -27,6 +27,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	type InputProvenance,
 } from "./messages.js";
 import { cloneUsage } from "./usage.js";
 
@@ -245,6 +246,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	inputProvenance?: InputProvenance;
+	modelInputBody?: string;
 }
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
@@ -549,7 +552,15 @@ export function buildSessionContext(
 			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
 			target.push(
-				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+				createCustomMessage(
+					entry.customType,
+					entry.content,
+					entry.display,
+					entry.details,
+					entry.timestamp,
+					entry.inputProvenance,
+					entry.modelInputBody,
+				),
 			);
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			target.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
@@ -1814,6 +1825,8 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		inputProvenance?: InputProvenance,
+		modelInputBody?: string,
 	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
@@ -1821,6 +1834,8 @@ export class SessionManager {
 			content,
 			display,
 			details,
+			inputProvenance,
+			modelInputBody,
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1838,8 +1853,12 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		inputProvenance?: InputProvenance,
+		modelInputBody?: string,
 	): string {
-		return this._appendEntryWithRollback(() => this.appendCustomMessageEntry(customType, content, display, details));
+		return this._appendEntryWithRollback(() =>
+			this.appendCustomMessageEntry(customType, content, display, details, inputProvenance, modelInputBody),
+		);
 	}
 
 	private _appendEntryWithRollback(append: () => string): string {

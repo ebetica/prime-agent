@@ -110,6 +110,7 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import {
+	inputProvenanceTime,
 	WORKER_RECOVERY_INTENT_CUSTOM_TYPE,
 	type WorkerRecoveryActivity,
 	type WorkerRecoveryDetails,
@@ -3942,6 +3943,10 @@ export class AgentDaemon {
 					expandPromptTemplates: command.expandPromptTemplates,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,
+					// Daemon prompt commands are the authenticated platform ingress. The wire
+					// cannot choose or spoof this model-visible provenance classification.
+					hostInputRole: command.operatorInput ? "User" : "Platform",
+					hostInputTime: command.operatorInput ? inputProvenanceTime(command.operatorInput.receivedAt) : undefined,
 					...(admission?.controller
 						? {
 								signal: admission.controller.signal,
@@ -4025,6 +4030,10 @@ export class AgentDaemon {
 						agentMessageId: command.agentMessageId,
 						resumeIfIdle: true,
 						source: "rpc",
+						hostInputRole: command.operatorInput ? "User" : "Platform",
+						hostInputTime: command.operatorInput
+							? inputProvenanceTime(command.operatorInput.receivedAt)
+							: undefined,
 					});
 				}
 				this.recordWorkerRecoveryState(state, "steer_queued", true);
@@ -4051,6 +4060,10 @@ export class AgentDaemon {
 						agentMessageId: command.agentMessageId,
 						resumeIfIdle: true,
 						source: "rpc",
+						hostInputRole: command.operatorInput ? "User" : "Platform",
+						hostInputTime: command.operatorInput
+							? inputProvenanceTime(command.operatorInput.receivedAt)
+							: undefined,
 					});
 					admitted = queued;
 				}

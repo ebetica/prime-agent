@@ -466,8 +466,17 @@ export interface AgentConnectionSetModelOptions {
 	ifIdle?: boolean;
 }
 
-export interface AgentConnectionPromptOptions {
+export interface AgentConnectionOperatorInput {
+	/** Platform-authenticated arrival time; callers cannot choose the provenance role. */
+	receivedAt: string;
+}
+
+export interface AgentConnectionQueuedPromptOptions {
 	images?: ImageContent[];
+	operatorInput?: AgentConnectionOperatorInput;
+}
+
+export interface AgentConnectionPromptOptions extends AgentConnectionQueuedPromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	queueIfBusy?: boolean;
 	source?: InputSource;
@@ -721,8 +730,8 @@ export interface AgentConnection {
 	promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	startSideQuestion(id: string, question: string, previousTurns?: AgentConnectionSideQuestionTurn[]): Promise<void>;
 	abortSideQuestion(id: string): Promise<boolean>;
-	steer(message: string, images?: ImageContent[]): Promise<void>;
-	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	steer(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void>;
+	followUp(message: string, options?: AgentConnectionQueuedPromptOptions): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
