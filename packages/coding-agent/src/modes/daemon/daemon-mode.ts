@@ -1677,6 +1677,7 @@ export class AgentDaemon {
 			await session.followUp(runnableJob.prompt, undefined, {
 				resumeIfIdle: true,
 				source: "internal",
+				hostInputRole: "Scheduled",
 			});
 			return;
 		}
@@ -1705,6 +1706,7 @@ export class AgentDaemon {
 			{
 				streamingBehavior: "followUp",
 				source: "internal",
+				hostInputRole: "Scheduled",
 			},
 			canPrompt,
 			false,

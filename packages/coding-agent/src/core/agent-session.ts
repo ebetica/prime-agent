@@ -6627,13 +6627,17 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		assertNotReservedPlatformMessage(message);
+		const timestamp = Date.now();
+		const normalizedContent = normalizeMessageContent(message.content);
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
 			content: message.content,
 			display: message.display,
 			details: message.details,
-			timestamp: Date.now(),
+			inputProvenance: { role: "Platform" as const, time: inputProvenanceTime(timestamp) },
+			modelInputBody: normalizedContent.text,
+			timestamp,
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
@@ -6675,6 +6679,8 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				appMessage.inputProvenance,
+				appMessage.modelInputBody,
 			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
