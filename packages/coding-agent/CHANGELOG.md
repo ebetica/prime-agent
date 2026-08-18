@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `rlm.interrupt_subagent()` to stop a direct child’s current execution while retaining its session for follow-up.
 - Added durable child-to-parent automatic report muting while preserving explicit agent messages.
 - Fixed retained RLM children being unable to explicitly message their parent after their original task completed.
 

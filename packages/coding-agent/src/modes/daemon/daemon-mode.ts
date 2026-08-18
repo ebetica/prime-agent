@@ -2353,6 +2353,15 @@ export class AgentDaemon {
 				}
 				if (deletionError !== undefined) throw deletionError;
 			},
+			interruptRlmSubagentRuntime: async (childId, session) => {
+				const state = [...this.sessions.values()].find(
+					(candidate) =>
+						candidate.runtime.metadata.kind === "subagent" &&
+						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+						candidate.runtime.metadata.rlmChildId === childId,
+				);
+				return (await (state?.runtime.session ?? session)?.interruptCurrentExecution()) ?? false;
+			},
 			deleteRlmSubagentRuntime: async (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>

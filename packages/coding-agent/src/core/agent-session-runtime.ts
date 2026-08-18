@@ -411,6 +411,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return runtime;
 	}
 
+	async interruptRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<boolean> {
+		const runtime = this.subagentRuntimes.get(childId);
+		return (await (runtime?.session ?? session)?.interruptCurrentExecution()) ?? false;
+	}
+
 	async deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void> {
 		const runtime = this.subagentRuntimes.get(childId);
 		if (!runtime) {
