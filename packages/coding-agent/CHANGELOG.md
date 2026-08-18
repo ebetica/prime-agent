@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Prefixed kernel subprocess PATH with the selected Python environment so shell cells resolve its installed CLI commands.
 - Refreshed configured AGENTS/CLAUDE context files before model turns and compaction so live sessions and new RLM children see on-disk changes.
 - Changed managed kernel environments to immutable content-addressed directories so live kernels are never rewritten by another Prime Agent version.
 - Added `rlm.interrupt_subagent()` to stop a direct child’s current execution while retaining its session for follow-up.

@@ -3,7 +3,7 @@ import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process"
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
@@ -639,9 +639,23 @@ export class KernelManager {
 		this.tempDir = connection.tempDir;
 		this.kernelOperation = undefined;
 
+		const kernelEnv = modelSubprocessEnv(this.options.env);
+		const kernelBinDir = dirname(python);
+		let existingPath = kernelEnv.PATH;
+		if (process.platform === "win32") {
+			const configuredPathKey = Object.keys(this.options.env ?? {})
+				.filter((key) => key.toUpperCase() === "PATH")
+				.at(-1);
+			const inheritedPathKey = Object.keys(kernelEnv).find((key) => key.toUpperCase() === "PATH");
+			existingPath = kernelEnv[configuredPathKey ?? inheritedPathKey ?? "PATH"];
+			for (const key of Object.keys(kernelEnv)) {
+				if (key.toUpperCase() === "PATH") delete kernelEnv[key];
+			}
+		}
+		kernelEnv.PATH = existingPath ? `${kernelBinDir}${delimiter}${existingPath}` : kernelBinDir;
 		const spawnOptions: SpawnOptions = {
 			cwd: this.options.cwd,
-			env: modelSubprocessEnv(this.options.env),
+			env: kernelEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 		};
 		const kernelArgs = ["-m", "ipykernel_launcher", "-f", connection.path];
