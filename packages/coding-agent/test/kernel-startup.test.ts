@@ -1,8 +1,8 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as forkServer from "../src/core/kernel/fork-server.js";
 import { KernelManager } from "../src/core/kernel/index.js";
@@ -138,6 +138,86 @@ describe("KernelManager startup", () => {
 			else process.env[ORPHAN_PROCESS_JOURNAL_ENV] = journal;
 			if (inherited === undefined) delete process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN;
 			else process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN = inherited;
+			if (previousFork === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousFork;
+		}
+	}, 20_000);
+
+	it("prefixes the selected kernel bin for contained and forkserver launches", async () => {
+		const previousFork = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "1";
+		try {
+			const selectedBin = join(tempDir, "kernel-venvs", "selected-py3.11", "bin");
+			const selectedPython = join(selectedBin, "python");
+			const inheritedBin = join(tempDir, "existing-bin");
+			mkdirSync(selectedBin, { recursive: true });
+			mkdirSync(inheritedBin);
+			const realPython = execFileSync("python3", ["-c", "import sys; print(sys.executable)"], {
+				encoding: "utf8",
+			}).trim();
+			writeExecutable(selectedPython, `#!/bin/sh\nexec ${JSON.stringify(realPython)} "$@"\n`);
+			writeExecutable(join(selectedBin, "selected-kernel-cli"), "#!/bin/sh\nprintf 'selected-cli-ok\n'\n");
+			const inheritedPath = `${inheritedBin}${delimiter}${process.env.PATH ?? ""}`;
+			let containedEnv: NodeJS.ProcessEnv | undefined;
+			const containedLauncher: ContainmentLauncher = async (command, args, options) => {
+				containedEnv = { ...options.env };
+				const monitor = spawn(command, args, options);
+				const generationId = randomUUID();
+				const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+					monitor.once("exit", (code, signal) => resolve({ code, signal }));
+				});
+				return {
+					generationId,
+					stderrTail: "",
+					monitor,
+					sealGeneration: () => {},
+					killSync: () => monitor.kill("SIGKILL"),
+					killBestEffort: () => monitor.kill("SIGKILL"),
+					waitForReapAndTransportClose: async () => {
+						await exited;
+					},
+					killAndWaitVerified: async () => {
+						if (monitor.exitCode === null && monitor.signalCode === null) monitor.kill("SIGKILL");
+						const result = await exited;
+						return { generationId, exitCode: result.code, signal: result.signal };
+					},
+				} as unknown as PidNamespaceOperation;
+			};
+			const contained = new KernelManager({
+				python: selectedPython,
+				cwd: tempDir,
+				env: { Path: "posix-decoy", PATH: inheritedPath },
+				containmentLauncher: containedLauncher,
+			});
+			try {
+				const result = await contained.execute("%%bash\nselected-kernel-cli");
+				expect(result.stdout.trim()).toBe("selected-cli-ok");
+				expect(containedEnv?.PATH).toBe(`${dirname(selectedPython)}${delimiter}${inheritedPath}`);
+			} finally {
+				await contained.kill();
+			}
+
+			vi.mocked(forkServer.forkKernel).mockClear();
+			let forkAttemptEnv: NodeJS.ProcessEnv | undefined;
+			const forked = new KernelManager({
+				python: selectedPython,
+				cwd: tempDir,
+				env: { Path: "posix-decoy", PATH: inheritedPath },
+				containmentLauncher: async (_command, _args, options) => {
+					forkAttemptEnv = { ...options.env };
+					throw new ContainmentUnavailableError("force forkserver");
+				},
+			});
+			try {
+				const result = await forked.execute("%%bash\nselected-kernel-cli");
+				expect(result.stdout.trim()).toBe("selected-cli-ok");
+				const forkOptions = vi.mocked(forkServer.forkKernel).mock.calls.at(-1)?.[1];
+				expect(forkOptions?.env).toEqual(forkAttemptEnv);
+				expect(forkOptions?.env?.PATH).toBe(`${dirname(selectedPython)}${delimiter}${inheritedPath}`);
+			} finally {
+				await forked.kill();
+			}
+		} finally {
 			if (previousFork === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
 			else process.env.PRIME_AGENT_KERNEL_FORKSERVER = previousFork;
 		}
