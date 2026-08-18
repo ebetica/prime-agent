@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { access, cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -12,7 +12,7 @@ import { getPackageDir } from "../../config.js";
 import { modelSubprocessEnv } from "../model-subprocess-env.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 8;
+const BOOTSTRAP_SCHEMA = 9;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
@@ -58,7 +58,7 @@ const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
-let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
+const inFlightEnsureKernelPython = new Map<string, Promise<string>>();
 
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
 export type KernelBootstrapProgressHandler = (message: string) => void;
@@ -73,6 +73,7 @@ interface BootstrapPythonSkill {
 	packagePath: string;
 	pyprojectPath: string;
 	pyprojectHash: string;
+	packageHash: string;
 }
 
 interface BootstrapVersion {
@@ -128,6 +129,43 @@ function fileContentHash(filePath: string): string {
 	}
 }
 
+const PYTHON_SKILL_HASH_IGNORED_DIRS = new Set([".pytest_cache", ".venv", "__pycache__"]);
+
+function pythonSkillPackageHash(packagePath: string): string {
+	const hash = createHash("sha256");
+	const collect = (dir: string, ancestors: Set<string>): void => {
+		const realDir = realpathSync(dir);
+		if (ancestors.has(realDir)) throw new Error(`cyclic Python skill package directory: ${dir}`);
+		const nextAncestors = new Set(ancestors).add(realDir);
+		for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+			if (PYTHON_SKILL_HASH_IGNORED_DIRS.has(entry.name)) continue;
+			const fullPath = path.join(dir, entry.name);
+			const relativePath = path.relative(packagePath, fullPath);
+			const entryStat = statSync(fullPath);
+			if (entryStat.isDirectory()) collect(fullPath, nextAncestors);
+			else if (entryStat.isFile()) {
+				hash.update(relativePath);
+				hash.update("\0");
+				hash.update(readFileSync(fullPath));
+				hash.update("\0");
+			}
+		}
+	};
+	try {
+		collect(packagePath, new Set());
+		return `sha256:${hash.digest("hex")}`;
+	} catch {
+		return "unreadable";
+	}
+}
+
+function packagedSourceCopyFilter(sourceRoot: string): (source: string) => boolean {
+	return (source) => {
+		const relativePath = path.relative(sourceRoot, source);
+		return !relativePath.split(path.sep).some((part) => PYTHON_SKILL_HASH_IGNORED_DIRS.has(part));
+	};
+}
+
 function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
 	const byKey = new Map<string, BootstrapPythonSkill>();
 	const addSkill = (skill: Pick<KernelPythonSkill, "importName" | "packagePath" | "pyprojectPath">): void => {
@@ -142,6 +180,7 @@ function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | unde
 			packagePath,
 			pyprojectPath,
 			pyprojectHash: fileContentHash(pyprojectPath),
+			packageHash: pythonSkillPackageHash(packagePath),
 		};
 		byKey.set(key, bootstrapSkill);
 		for (const dependencyName of readPythonSkillDependencyNames(bootstrapSkill)) {
@@ -271,6 +310,7 @@ function resolveSiblingPythonSkillDependency(
 			packagePath,
 			pyprojectPath,
 			pyprojectHash: fileContentHash(pyprojectPath),
+			packageHash: pythonSkillPackageHash(packagePath),
 		};
 		if (readPythonSkillProjectName(dependency).replaceAll("_", "-").toLowerCase() === dependencyName) {
 			return dependency;
@@ -323,50 +363,89 @@ function sortPythonSkillsForInstall(pythonSkills: readonly BootstrapPythonSkill[
 	return sorted;
 }
 
-function formatPythonSkillInstallArgs(skill: BootstrapPythonSkill): string[] {
-	return ["--editable", skill.packagePath];
+function formatPythonSkillInstallArgs(skill: BootstrapPythonSkill, packagePath = skill.packagePath): string[] {
+	return [packagePath];
 }
 
-function ensureKernelPythonKey(pythonSkills: readonly BootstrapPythonSkill[]): string {
+function kernelEnvironmentHash(
+	runtimeIdentity: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+	pythonVersion = PYTHON_VERSION,
+): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				schema: BOOTSTRAP_SCHEMA,
+				pythonVersion,
+				ipykernel: IPYKERNEL_REQUIREMENT,
+				runtime: runtimeIdentity,
+				snapshot: STATE_SNAPSHOT_REQUIREMENT,
+				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+				pythonSkills,
+			}),
+		)
+		.digest("hex");
+}
+
+/** Stable immutable environment name for one complete runtime and Python minor. */
+export function kernelEnvironmentName(
+	runtimeIdentity: string,
+	pythonSkills: readonly KernelPythonSkill[] = [],
+	pythonVersion = PYTHON_VERSION,
+): string {
+	const normalizedSkills = normalizePythonSkills(pythonSkills);
+	return `${kernelEnvironmentHash(runtimeIdentity, normalizedSkills, pythonVersion)}-py${pythonVersion}`;
+}
+
+function ensureKernelPythonKey(runtimeIdentity: string, pythonSkills: readonly BootstrapPythonSkill[]): string {
 	return [
 		process.env.PRIME_AGENT_KERNEL_PYTHON ?? "",
 		process.env.PRIME_AGENT_KERNEL_VENV ?? "",
 		process.env.HOME ?? "",
 		process.env.XDG_DATA_HOME ?? "",
-		JSON.stringify(pythonSkills),
+		runtimeIdentity,
+		kernelEnvironmentHash(runtimeIdentity, pythonSkills),
 	].join("\0");
 }
 
+/** Root containing immutable content-addressed kernel environments. */
 export function getKernelVenvDir(): string {
 	const override = process.env.PRIME_AGENT_KERNEL_VENV;
 	if (override) return path.resolve(expandHome(override));
-	return path.join(os.homedir(), ".prime", "agent", "kernel-venv");
+	return path.join(os.homedir(), ".prime", "agent", "kernel-venvs");
 }
 
 function getXdgKernelVenvDir(): string {
 	const dataHome = process.env.XDG_DATA_HOME
 		? path.resolve(expandHome(process.env.XDG_DATA_HOME))
 		: path.join(os.homedir(), ".local", "share");
-	return path.join(dataHome, "prime", "agent", "kernel-venv");
+	return path.join(dataHome, "prime", "agent", "kernel-venvs");
 }
 
-async function resolveWritableKernelVenvDir(): Promise<string> {
+async function ensureWritableDirectory(directory: string): Promise<void> {
+	await mkdir(directory, { recursive: true });
+	const probe = path.join(directory, `.write-test-${process.pid}-${randomUUID()}`);
+	await mkdir(probe);
+	await rm(probe, { recursive: true, force: true });
+}
+
+async function resolveWritableKernelVenvRoot(): Promise<string> {
 	const primary = getKernelVenvDir();
 	try {
-		await mkdir(path.dirname(primary), { recursive: true });
+		await ensureWritableDirectory(primary);
 		return primary;
 	} catch (primaryError) {
 		if (process.env.PRIME_AGENT_KERNEL_VENV) {
-			throw new Error(`couldn't create kernel venv parent directory for ${primary}: ${errorMessage(primaryError)}`);
+			throw new Error(`couldn't create kernel venv root ${primary}: ${errorMessage(primaryError)}`);
 		}
 
 		const fallback = getXdgKernelVenvDir();
 		try {
-			await mkdir(path.dirname(fallback), { recursive: true });
+			await ensureWritableDirectory(fallback);
 			return fallback;
 		} catch (fallbackError) {
 			throw new Error(
-				`couldn't create kernel venv directory at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with ipykernel installed. ${errorMessage(fallbackError)}`,
+				`couldn't create kernel venv root at ${primary} or ${fallback}; set PRIME_AGENT_KERNEL_PYTHON to a python with ipykernel installed. ${errorMessage(fallbackError)}`,
 			);
 		}
 	}
@@ -578,7 +657,8 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 						typeof v.importName === "string" &&
 						typeof v.packagePath === "string" &&
 						typeof v.pyprojectPath === "string" &&
-						typeof v.pyprojectHash === "string"
+						typeof v.pyprojectHash === "string" &&
+						typeof v.packageHash === "string"
 					);
 				})
 			) {
@@ -615,21 +695,10 @@ function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly Bo
 			skill.importName === expected.importName &&
 			skill.packagePath === expected.packagePath &&
 			skill.pyprojectPath === expected.pyprojectPath &&
-			skill.pyprojectHash === expected.pyprojectHash
+			skill.pyprojectHash === expected.pyprojectHash &&
+			skill.packageHash === expected.packageHash
 		);
 	});
-}
-
-function bootstrapVersionCurrent(
-	version: BootstrapVersion | null,
-	runtimeIdentity: string,
-	pythonSkills: readonly BootstrapPythonSkill[],
-): boolean {
-	return (
-		version !== null &&
-		bootstrapBaseVersionCurrent(version, runtimeIdentity) &&
-		pythonSkillsMatch(version.pythonSkills, pythonSkills)
-	);
 }
 
 function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeIdentity: string): boolean {
@@ -682,8 +751,8 @@ async function resolveRuntimeSourceDir(): Promise<string | null> {
 }
 
 // Identity of the runtime to be installed. For a local source checkout this is a
-// content hash of every rlm/*.py file plus pyproject.toml, so any runtime code or
-// dependency change invalidates an existing venv automatically. Falls back to the
+// content hash of the complete packaged source tree (excluding local caches), so any runtime
+// code or dependency change invalidates an existing venv automatically. Falls back to the
 // bare package name when the runtime resolves to a registry install (no local source).
 export async function resolveRuntimeIdentity(): Promise<string> {
 	const sourceDir = await resolveRuntimeSourceDir();
@@ -695,33 +764,14 @@ export async function resolveRuntimeIdentity(): Promise<string> {
 // fall back to RUNTIME_REQUIREMENT: that constant is the registry-install identity, and
 // recording it for a local checkout would permanently mask later source changes.
 async function hashRuntimeSource(sourceDir: string): Promise<string> {
-	const rlmDir = path.join(sourceDir, "src", "rlm");
-	const files: string[] = [path.join(sourceDir, "pyproject.toml")];
-	async function collect(dir: string): Promise<void> {
-		const entries = await readdir(dir, { withFileTypes: true });
-		for (const entry of entries) {
-			const full = path.join(dir, entry.name);
-			if (entry.isDirectory()) {
-				await collect(full);
-			} else if (entry.isFile() && entry.name.endsWith(".py")) {
-				files.push(full);
-			}
-		}
-	}
-	await collect(rlmDir);
-	files.sort();
-	const hash = createHash("sha256");
-	for (const file of files) {
-		hash.update(path.relative(sourceDir, file));
-		hash.update("\0");
-		hash.update(await readFile(file));
-		hash.update("\0");
-	}
-	return `sha256:${hash.digest("hex")}`;
+	const identity = pythonSkillPackageHash(sourceDir);
+	if (identity === "unreadable") throw new Error(`couldn't hash Python runtime source: ${sourceDir}`);
+	return identity;
 }
 
 async function bootstrapVenv(
 	venv: string,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
@@ -729,11 +779,23 @@ async function bootstrapVenv(
 	const uv = await ensureUv(options);
 	const python = path.join(venv, "bin", "python");
 	const sourceDir = await resolveRuntimeSourceDir();
-	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
-	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
 	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	let runtimeRequirement = RUNTIME_REQUIREMENT;
+	let runtimeSnapshot: string | undefined;
+	if (sourceDir) {
+		runtimeSnapshot = path.join(venv, ".runtime-source");
+		await cp(sourceDir, runtimeSnapshot, {
+			recursive: true,
+			dereference: true,
+			filter: packagedSourceCopyFilter(sourceDir),
+		});
+		if ((await hashRuntimeSource(runtimeSnapshot)) !== runtimeIdentity) {
+			throw new Error(`Python runtime source changed during bootstrap: ${sourceDir}`);
+		}
+		runtimeRequirement = runtimeSnapshot;
+	}
 	await run(uv, [
 		"pip",
 		"install",
@@ -744,7 +806,23 @@ async function bootstrapVenv(
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
-	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
+	if (runtimeSnapshot) await rm(runtimeSnapshot, { recursive: true, force: true });
+	const skillSourceRoot = path.join(venv, ".skill-sources");
+	const skillSourcePaths = new Map<string, string>();
+	for (const [index, skill] of pythonSkills.entries()) {
+		const snapshotPath = path.join(skillSourceRoot, String(index));
+		await cp(skill.packagePath, snapshotPath, {
+			recursive: true,
+			dereference: true,
+			filter: packagedSourceCopyFilter(skill.packagePath),
+		});
+		if (pythonSkillPackageHash(snapshotPath) !== skill.packageHash) {
+			throw new Error(`Python skill package changed during bootstrap: ${skill.packagePath}`);
+		}
+		skillSourcePaths.set(skill.packagePath, snapshotPath);
+	}
+	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, skillSourcePaths, options);
+	await rm(skillSourceRoot, { recursive: true, force: true });
 }
 
 async function syncPythonSkills(
@@ -753,10 +831,12 @@ async function syncPythonSkills(
 	python: string,
 	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
+	skillSourcePaths: ReadonlyMap<string, string>,
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
+	const installFailures: unknown[] = [];
 	const currentPythonSkills = new Map(
 		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
 	);
@@ -800,7 +880,9 @@ async function syncPythonSkills(
 						installedDependency.pyprojectHash === dependency.pyprojectHash)
 				);
 			})
-			.flatMap(formatPythonSkillInstallArgs);
+			.flatMap((dependency) =>
+				formatPythonSkillInstallArgs(dependency, skillSourcePaths.get(dependency.packagePath)),
+			);
 
 		try {
 			await run(uv, [
@@ -808,7 +890,7 @@ async function syncPythonSkills(
 				"install",
 				"--python",
 				python,
-				...formatPythonSkillInstallArgs(skill),
+				...formatPythonSkillInstallArgs(skill, skillSourcePaths.get(skill.packagePath)),
 				...localDependencyArgs,
 			]);
 			installedPythonSkills.push(
@@ -816,13 +898,14 @@ async function syncPythonSkills(
 				...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
 			);
 		} catch (error) {
-			reportProgress(
-				options,
-				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
-			);
+			installFailures.push(error);
+			reportProgress(options, `Warning: Python skill ${skill.importName} failed to install: ${errorMessage(error)}`);
 		}
 	}
 	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
+	if (installFailures.length > 0) {
+		throw new AggregateError(installFailures, "Python skill installation failed");
+	}
 }
 
 async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
@@ -839,11 +922,12 @@ async function kernelReady(
 	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<boolean> {
-	return (
-		(await hasIpykernel(python)) &&
-		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
-	);
+	if (!(await kernelBaseReady(python, venv, runtimeIdentity))) return false;
+	if (!pythonSkillsMatch((await readBootstrapVersion(venv))?.pythonSkills, pythonSkills)) return false;
+	for (const skill of pythonSkills) {
+		if (!(await pythonImports(python, skill.importName))) return false;
+	}
+	return true;
 }
 
 function formatBootstrapFailure(error: unknown): Error {
@@ -856,6 +940,7 @@ function formatBootstrapFailure(error: unknown): Error {
 
 async function ensureKernelPythonUncached(
 	options: EnsureKernelPythonOptions,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<string> {
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
@@ -887,28 +972,38 @@ async function ensureKernelPythonUncached(
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
-	const venv = await resolveWritableKernelVenvDir();
+	const root = await resolveWritableKernelVenvRoot();
+	const venv = path.join(root, `${kernelEnvironmentHash(runtimeIdentity, pythonSkills)}-py${PYTHON_VERSION}`);
 	const python = path.join(venv, "bin", "python");
-	const runtimeIdentity = await resolveRuntimeIdentity();
 	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 
 	const releaseLock = await acquireBootstrapLock(venv);
+	let stagingVenv: string | undefined;
 	try {
 		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
-			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
-			return python;
+		if (existsSync(venv)) {
+			throw new Error(`immutable kernel environment is incomplete or invalid: ${venv}`);
 		}
 
-		const hadVenv = existsSync(venv);
 		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-		if (hadVenv) {
-			reportProgress(options, "rebuilding kernel venv");
-			await rm(venv, { recursive: true, force: true });
+		stagingVenv = `${venv}.building-${process.pid}-${randomUUID()}`;
+		await bootstrapVenv(stagingVenv, runtimeIdentity, pythonSkills, options);
+		const stagingPython = path.join(stagingVenv, "bin", "python");
+		if (!(await kernelReady(stagingPython, stagingVenv, runtimeIdentity, pythonSkills))) {
+			throw new Error(`new kernel environment failed validation: ${stagingVenv}`);
 		}
-
-		await bootstrapVenv(venv, pythonSkills, options);
+		await rename(stagingVenv, venv);
+		stagingVenv = undefined;
 	} catch (error) {
+		if (stagingVenv) {
+			try {
+				await rm(stagingVenv, { recursive: true, force: true });
+			} catch (cleanupError) {
+				throw formatBootstrapFailure(
+					new AggregateError([error, cleanupError], `bootstrap failed and staging cleanup failed: ${stagingVenv}`),
+				);
+			}
+		}
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
@@ -920,12 +1015,15 @@ async function ensureKernelPythonUncached(
 
 export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
 	const pythonSkills = normalizePythonSkills(options.pythonSkills);
-	const key = ensureKernelPythonKey(pythonSkills);
-	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
+	return resolveRuntimeIdentity().then((runtimeIdentity) => {
+		const key = ensureKernelPythonKey(runtimeIdentity, pythonSkills);
+		const existing = inFlightEnsureKernelPython.get(key);
+		if (existing) return existing;
 
-	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {
-		if (inFlightEnsureKernelPython?.promise === promise) inFlightEnsureKernelPython = null;
+		const promise = ensureKernelPythonUncached(options, runtimeIdentity, pythonSkills).finally(() => {
+			if (inFlightEnsureKernelPython.get(key) === promise) inFlightEnsureKernelPython.delete(key);
+		});
+		inFlightEnsureKernelPython.set(key, promise);
+		return promise;
 	});
-	inFlightEnsureKernelPython = { key, promise };
-	return promise;
 }

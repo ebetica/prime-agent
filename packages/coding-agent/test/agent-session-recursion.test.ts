@@ -2592,8 +2592,15 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("lets a stale kernel depth cap defer to the live host gate", () => {
+		const kernelVenvRoot = join(homedir(), ".prime", "agent", "kernel-venvs");
+		const managedPython = existsSync(kernelVenvRoot)
+			? readdirSync(kernelVenvRoot, { withFileTypes: true }).find(
+					(entry) => entry.isDirectory() && !entry.name.includes(".building-"),
+				)?.name
+			: undefined;
 		const python =
-			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
+			process.env.PRIME_AGENT_KERNEL_PYTHON ??
+			(managedPython ? join(kernelVenvRoot, managedPython, "bin", "python") : "python");
 		const runtime = join(process.cwd(), "..", "..", "prime-agent-runtime", "src");
 		const probe = spawnSync(
 			python,

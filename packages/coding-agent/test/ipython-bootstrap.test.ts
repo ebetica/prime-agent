@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -42,10 +42,13 @@ describe("IPython RLM bootstrap", () => {
 
 /** Find a python that can launch an ipykernel, or null to skip. */
 function resolveKernelPython(): string | null {
-	const candidates = [
-		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
-	].filter((p): p is string => Boolean(p));
+	const root = join(homedir(), ".prime", "agent", "kernel-venvs");
+	const managed = existsSync(root)
+		? readdirSync(root, { withFileTypes: true })
+				.filter((entry) => entry.isDirectory() && !entry.name.includes(".building-"))
+				.map((entry) => join(root, entry.name, "bin", "python"))
+		: [];
+	const candidates = [process.env.PRIME_AGENT_KERNEL_PYTHON, ...managed].filter((p): p is string => Boolean(p));
 	for (const python of candidates) {
 		if (!existsSync(python)) continue;
 		const check = spawnSync(python, ["-c", "import ipykernel"], { encoding: "utf8" });
