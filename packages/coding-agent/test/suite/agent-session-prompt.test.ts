@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BashResult } from "../../src/core/bash-executor.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
+import { DefaultResourceLoader } from "../../src/core/resource-loader.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
@@ -89,6 +90,48 @@ describe("AgentSession prompt characterization", () => {
 
 		expect(getUserTexts(harness)).toEqual(["keep me"]);
 		expect(getAssistantTexts(harness)).toEqual(["owned"]);
+	});
+
+	it("refreshes configured context files before every model turn", async () => {
+		const tempDir = join(tmpdir(), `pi-context-turn-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		const project = join(tempDir, "project");
+		const agentDir = join(tempDir, "agent");
+		const contextDir = join(tempDir, "context");
+		mkdirSync(project, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(contextDir, { recursive: true });
+		const loader = new DefaultResourceLoader({
+			cwd: project,
+			agentDir,
+			additionalContextDirectories: [contextDir],
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+		});
+		await loader.reload();
+		const harness = await createHarness({ resourceLoader: loader });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("added"),
+			fauxAssistantMessage("changed"),
+			fauxAssistantMessage("removed"),
+		]);
+		const contextFile = join(contextDir, "OPERATOR.md");
+
+		writeFileSync(contextFile, "turn context: added");
+		await harness.session.prompt("first");
+		expect(harness.session.systemPrompt).toContain("turn context: added");
+
+		writeFileSync(contextFile, "turn context: changed");
+		await harness.session.prompt("second");
+		expect(harness.session.systemPrompt).toContain("turn context: changed");
+		expect(harness.session.systemPrompt).not.toContain("turn context: added");
+
+		rmSync(contextFile);
+		await harness.session.prompt("third");
+		expect(harness.session.systemPrompt).not.toContain("turn context: changed");
 	});
 
 	it("prompts while idle and records a single text response", async () => {

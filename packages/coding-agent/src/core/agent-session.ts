@@ -1618,7 +1618,10 @@ export class AgentSession {
 	}
 
 	private _installAgentTurnHook(): void {
-		this.agent.shouldStopBeforeTurn = () => this._shouldStopBeforeTurn();
+		this.agent.shouldStopBeforeTurn = () => {
+			this._refreshContextSystemPrompt();
+			return this._shouldStopBeforeTurn();
+		};
 		this.agent.shouldStopAfterTurn = (context) => this._shouldStopAfterTurn(context);
 	}
 
@@ -4502,6 +4505,14 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
+	private _refreshContextSystemPrompt(): void {
+		if (!this._resourceLoader.refreshContextFiles) return;
+		const oldBase = this._baseSystemPrompt;
+		this._resourceLoader.refreshContextFiles();
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(this.agent.state.systemPrompt, oldBase);
+	}
+
 	private _rebuildSystemPrompt(toolNames: string[]): string {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
@@ -4611,6 +4622,7 @@ export class AgentSession {
 		policy: CommitPreparationPolicy,
 		steps: CommitPreparationSteps<TPrepared, TCommitted>,
 	): Promise<TCommitted | undefined> {
+		this._refreshContextSystemPrompt();
 		if (
 			policy.initialRefineBarrier === "always" ||
 			(policy.initialRefineBarrier === "ifInFlight" && this._refineInFlight)
@@ -8123,6 +8135,7 @@ export class AgentSession {
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
+		this._refreshContextSystemPrompt();
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
