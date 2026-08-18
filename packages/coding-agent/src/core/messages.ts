@@ -546,7 +546,12 @@ export function inputProvenanceTime(timestamp: number | string = Date.now()): st
 }
 
 export function escapeInputProvenanceBody(body: string): string {
-	return body.replaceAll("\\", "\\\\").replace(/(^|\n)(Role|Time):/g, "$1$2\\:");
+	// Normalize every line boundary models commonly treat as a newline before
+	// escaping header-shaped body lines. The persisted/UI body remains untouched.
+	return body
+		.replace(/\r\n?|\u0085|\u2028|\u2029/g, "\n")
+		.replaceAll("\\", "\\\\")
+		.replace(/(^|\n)(Role|Time):/g, "$1$2\\:");
 }
 
 export function renderInputProvenance(body: string, provenance: InputProvenance): string {
