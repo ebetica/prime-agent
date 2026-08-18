@@ -1181,7 +1181,10 @@ describe("issue #4257 update restart resume", () => {
 					payload: expect.objectContaining({
 						kind: "turn",
 						text: "custom heartbeat",
-						customMessage: customFollowUp,
+						customMessage: expect.objectContaining({
+							...customFollowUp,
+							inputProvenance: expect.objectContaining({ role: "Platform" }),
+						}),
 					}),
 				}),
 				expect.objectContaining({
@@ -1261,7 +1264,14 @@ describe("issue #4257 update restart resume", () => {
 				text: "queued work",
 				content,
 				records: expect.arrayContaining([
-					expect.objectContaining({ role: "prefix", message: queuedContext, ownerActionId: recovered?.id }),
+					expect.objectContaining({
+						role: "prefix",
+						message: expect.objectContaining({
+							...queuedContext,
+							inputProvenance: expect.objectContaining({ role: "Platform" }),
+						}),
+						ownerActionId: recovered?.id,
+					}),
 					expect.objectContaining({ role: "primary", ownerActionId: recovered?.id }),
 				]),
 			},
@@ -1363,6 +1373,14 @@ describe("issue #4257 update restart resume", () => {
 		await source.session.restoreFollowUpMessage("follow-up one", undefined, { queueKey: "job-1" });
 
 		const snapshot = source.session.getSessionActionRecoverySnapshot();
+		const primary =
+			snapshot.actions[0]?.payload.kind === "turn"
+				? snapshot.actions[0].payload.records.find((record) => record.role === "primary")?.message
+				: undefined;
+		expect(primary).toMatchObject({
+			role: "user",
+			inputProvenance: { role: "Platform" },
+		});
 		await target.session.restoreSessionActions(snapshot);
 
 		expect(target.session.getSessionActionRecoverySnapshot()).toEqual(snapshot);

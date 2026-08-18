@@ -62,6 +62,7 @@ import type {
 	AgentConnectionQueuedMessageLane,
 	AgentConnectionQueuedMessageMutation,
 	AgentConnectionQueuedMessageMutationStatus,
+	AgentConnectionQueuedPromptOptions,
 	AgentConnectionQueuedUserAction,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
@@ -811,6 +812,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		message: string,
 		options?: AgentConnectionPromptOptions,
 	): Promise<void> {
+		if (options?.operatorInput && !this.client.supportsServerCapability("operator_input_provenance")) {
+			throw new AgentConnectionPromptAdmissionError(
+				"Daemon does not support authenticated operator-input provenance.",
+				"unsupported",
+			);
+		}
 		const signal = options?.signal;
 		if (signal?.aborted) {
 			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
@@ -825,6 +832,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					streamingBehavior: options?.streamingBehavior,
 					queueIfBusy: options?.queueIfBusy,
 					source: options?.source,
+					operatorInput: options?.operatorInput,
 				},
 				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
 			);
@@ -850,6 +858,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			streamingBehavior: options.streamingBehavior,
 			queueIfBusy: options.queueIfBusy,
 			source: options.source,
+			operatorInput: options.operatorInput,
 			admissionId,
 		} as Extract<DaemonCommandBody, { type: typeof type }>;
 		let promptError: unknown;
@@ -939,12 +948,40 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.aborted;
 	}
 
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.requestOk({ type: "steer", activeSessionId: this.activeSessionId, message, images });
+	async steer(message: string, imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
+		this.assertOperatorInputProvenance(options);
+		await this.requestOk({
+			type: "steer",
+			activeSessionId: this.activeSessionId,
+			message,
+			images: options?.images,
+			operatorInput: options?.operatorInput,
+		});
 	}
 
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.requestOk({ type: "follow_up", activeSessionId: this.activeSessionId, message, images });
+	async followUp(
+		message: string,
+		imagesOrOptions?: ImageContent[] | AgentConnectionQueuedPromptOptions,
+	): Promise<void> {
+		const options = Array.isArray(imagesOrOptions) ? { images: imagesOrOptions } : imagesOrOptions;
+		this.assertOperatorInputProvenance(options);
+		await this.requestOk({
+			type: "follow_up",
+			activeSessionId: this.activeSessionId,
+			message,
+			images: options?.images,
+			operatorInput: options?.operatorInput,
+		});
+	}
+
+	private assertOperatorInputProvenance(options?: AgentConnectionQueuedPromptOptions): void {
+		if (options?.operatorInput && !this.client.supportsServerCapability("operator_input_provenance")) {
+			throw new AgentConnectionPromptAdmissionError(
+				"Daemon does not support authenticated operator-input provenance.",
+				"unsupported",
+			);
+		}
 	}
 
 	async abort(): Promise<void> {

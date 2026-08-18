@@ -71,8 +71,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 25 adds durable idempotent agent-message send and acknowledgement commands.
 // Revision 26 adds ownership-fenced operation stop and ID-addressed queue withdrawal.
 // Revision 27 adds generation-checked, durable platform-wake admission.
-export const DAEMON_SCHEMA_REVISION = 27;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-be5df71f7730";
+// Revision 28 carries authenticated operator-input arrival time for canonical provenance.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-f583b2e0504f";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -120,7 +121,8 @@ export type DaemonServerCapability =
 	| "automatic_parent_report_mute"
 	| "atomic_stop_v2"
 	| "queued_withdrawal_v2"
-	| "conditional_platform_wake";
+	| "conditional_platform_wake"
+	| "operator_input_provenance";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -179,6 +181,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"atomic_stop_v2",
 	"queued_withdrawal_v2",
 	"conditional_platform_wake",
+	"operator_input_provenance",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -540,6 +543,7 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			operatorInput?: { receivedAt: string };
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
@@ -562,6 +566,7 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			operatorInput?: { receivedAt: string };
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
@@ -572,6 +577,7 @@ export type DaemonCommand =
 			message: string;
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
+			operatorInput?: { receivedAt: string };
 			queueKey?: string;
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;
@@ -585,6 +591,7 @@ export type DaemonCommand =
 			message: string;
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
+			operatorInput?: { receivedAt: string };
 			queueKey?: string;
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;

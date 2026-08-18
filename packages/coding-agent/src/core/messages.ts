@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
 
@@ -236,12 +236,28 @@ export interface BashExecutionMessage {
  * Message type for extension-injected messages via sendMessage().
  * These are custom messages that extensions can inject into the conversation.
  */
+export type InputProvenanceRole = "User" | "Parent agent" | "Sibling agent" | "Other agent" | "Scheduled" | "Platform";
+
+export interface InputProvenance {
+	role: InputProvenanceRole;
+	/** Trusted arrival time, normalized to UTC seconds. */
+	time: string;
+}
+
+export const TRUSTED_INPUT_CUSTOM_TYPE = "prime-agent.trusted_input";
+
+export type ProvenancedUserMessage = UserMessage & { inputProvenance: InputProvenance };
+
 export interface CustomMessage<T = unknown> {
 	role: "custom";
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+	/** Host-authenticated provenance applied only at the owning ingress boundary. */
+	inputProvenance?: InputProvenance;
+	/** Model-facing body when content includes a transport delivery wrapper. */
+	modelInputBody?: string;
 	timestamp: number;
 }
 
@@ -357,6 +373,8 @@ export function createCustomMessage(
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
+	inputProvenance?: InputProvenance,
+	modelInputBody?: string,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -364,6 +382,8 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
+		inputProvenance,
+		modelInputBody,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -498,6 +518,7 @@ export function createHeartbeatPromptMessage(
 		customType: HEARTBEAT_PROMPT_CUSTOM_TYPE,
 		content: job.prompt,
 		display: true,
+		inputProvenance: { role: "Scheduled", time: inputProvenanceTime(timestamp) },
 		details: {
 			jobId: job.id,
 			schedule: job.schedule.expression,
@@ -518,6 +539,70 @@ export function createHeartbeatPromptMessage(
  * - Compaction's generateSummary (for summarization)
  * - Custom extensions and tools
  */
+export function inputProvenanceTime(timestamp: number | string = Date.now()): string {
+	const time = new Date(timestamp);
+	if (!Number.isFinite(time.getTime())) throw new Error("Invalid operator input receivedAt timestamp");
+	return time.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+export function escapeInputProvenanceBody(body: string): string {
+	// Normalize every line boundary models commonly treat as a newline before
+	// escaping header-shaped body lines. The persisted/UI body remains untouched.
+	return body
+		.replace(/\r\n?|\u0085|\u2028|\u2029/g, "\n")
+		.replaceAll("\\", "\\\\")
+		.replace(/(^|\n)(Role|Time):/g, "$1$2\\:");
+}
+
+export function renderInputProvenance(body: string, provenance: InputProvenance): string {
+	return `Role: ${provenance.role}\nTime: ${provenance.time}\n${escapeInputProvenanceBody(body)}`;
+}
+
+export function createTrustedInputMessage(
+	body: string,
+	content: (TextContent | ImageContent)[] = [{ type: "text", text: body }],
+	provenance: InputProvenance = { role: "User", time: inputProvenanceTime() },
+	timestamp = Date.now(),
+): ProvenancedUserMessage {
+	return {
+		role: "user",
+		content,
+		inputProvenance: provenance,
+		timestamp,
+	};
+}
+
+function userProvenanceContent(message: ProvenancedUserMessage): (TextContent | ImageContent)[] {
+	const content =
+		typeof message.content === "string"
+			? [{ type: "text" as const, text: message.content }]
+			: message.content.map((block) => ({ ...block }));
+	const firstText = content.findIndex((block) => block.type === "text");
+	if (firstText < 0) return [{ type: "text", text: renderInputProvenance("", message.inputProvenance) }, ...content];
+	const block = content[firstText] as TextContent;
+	content[firstText] = { ...block, text: renderInputProvenance(block.text, message.inputProvenance) };
+	return content;
+}
+
+function provenanceContent(message: CustomMessage): (TextContent | ImageContent)[] {
+	const content =
+		typeof message.content === "string"
+			? [{ type: "text" as const, text: message.content }]
+			: message.content.map((block) => ({ ...block }));
+	const body = message.modelInputBody;
+	if (body !== undefined) {
+		return [
+			{ type: "text", text: renderInputProvenance(body, message.inputProvenance!) },
+			...content.filter((block): block is ImageContent => block.type === "image"),
+		];
+	}
+	const firstText = content.findIndex((block) => block.type === "text");
+	if (firstText < 0) return [{ type: "text", text: renderInputProvenance("", message.inputProvenance!) }, ...content];
+	const block = content[firstText] as TextContent;
+	content[firstText] = { ...block, text: renderInputProvenance(block.text, message.inputProvenance!) };
+	return content;
+}
+
 export function convertToLlm(messages: AgentMessage[]): Message[] {
 	return messages
 		.map((m): Message | undefined => {
@@ -542,7 +627,11 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					) {
 						return undefined;
 					}
-					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					const content = m.inputProvenance
+						? provenanceContent(m)
+						: typeof m.content === "string"
+							? [{ type: "text" as const, text: m.content }]
+							: m.content;
 					return {
 						role: "user",
 						content,
@@ -563,7 +652,10 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						],
 						timestamp: m.timestamp,
 					};
-				case "user":
+				case "user": {
+					const provenance = (m as Partial<ProvenancedUserMessage>).inputProvenance;
+					return provenance ? { ...m, content: userProvenanceContent(m as ProvenancedUserMessage) } : m;
+				}
 				case "assistant":
 				case "toolResult":
 					return m;

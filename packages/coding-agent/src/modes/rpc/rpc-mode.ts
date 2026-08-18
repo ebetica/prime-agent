@@ -226,10 +226,10 @@ async function runRpcModeWithConnectionInternal(
 				});
 				return success(id, command.type);
 			case "steer":
-				await connection.steer(command.message, command.images);
+				await connection.steer(command.message, { images: command.images });
 				return success(id, command.type);
 			case "follow_up":
-				await connection.followUp(command.message, command.images);
+				await connection.followUp(command.message, { images: command.images });
 				return success(id, command.type);
 			case "abort":
 				await connection.abort();

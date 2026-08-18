@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { HostRequestHandler } from "./kernel/index.js";
-import type { CustomMessage } from "./messages.js";
+import { type CustomMessage, type InputProvenanceRole, inputProvenanceTime } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
 export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
@@ -423,11 +423,21 @@ export function createAgentSessionMessage(
 	payload: AgentSessionMessagePayload,
 	timestamp = Date.now(),
 ): AgentSessionMessage {
+	const role: InputProvenanceRole =
+		payload.fromRelationship === "parent"
+			? "Parent agent"
+			: payload.fromRelationship === "sibling"
+				? "Sibling agent"
+				: "Other agent";
 	return {
 		role: "custom",
 		customType: AGENT_MESSAGE_CUSTOM_TYPE,
-		content: createAgentSessionMessagePrompt(payload),
+		// Keep the persisted/UI-facing body raw. convertToLlm adds the trusted
+		// provenance envelope without exposing transport wrappers to clients.
+		content: payload.message,
 		display: true,
+		inputProvenance: { role, time: inputProvenanceTime(timestamp) },
+		modelInputBody: payload.message,
 		details: {
 			id: payload.id,
 			message: payload.message,
