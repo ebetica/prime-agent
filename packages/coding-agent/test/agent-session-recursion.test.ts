@@ -26,6 +26,7 @@ import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, KernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { DefaultResourceLoader, type ResourceLoader } from "../src/core/resource-loader.js";
 import {
 	createDefaultRlmSubagentSessionName,
 	createRlmDeleteSubagentHostHandler,
@@ -281,6 +282,7 @@ describe("AgentSession rlm recursion", () => {
 			sessionManager?: SessionManager;
 			settingsManager?: SettingsManager;
 			extensionsResult?: LoadExtensionsResult;
+			resourceLoader?: ResourceLoader;
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -306,27 +308,29 @@ describe("AgentSession rlm recursion", () => {
 			settingsManager,
 			cwd: tempDir,
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
-			resourceLoader: createTestResourceLoader({
-				extensionsResult: options.extensionsResult,
-				skills: options.agentMessageController
-					? [
-							{
-								name: "agent-message",
-								description: "test",
-								filePath: join(tempDir, "SKILL.md"),
-								baseDir: tempDir,
-								sourceInfo: createSyntheticSourceInfo(join(tempDir, "SKILL.md"), { source: "test" }),
-								disableModelInvocation: false,
-								kind: "python",
-								python: {
-									importName: "agent_message",
-									packagePath: tempDir,
-									pyprojectPath: join(tempDir, "pyproject.toml"),
+			resourceLoader:
+				options.resourceLoader ??
+				createTestResourceLoader({
+					extensionsResult: options.extensionsResult,
+					skills: options.agentMessageController
+						? [
+								{
+									name: "agent-message",
+									description: "test",
+									filePath: join(tempDir, "SKILL.md"),
+									baseDir: tempDir,
+									sourceInfo: createSyntheticSourceInfo(join(tempDir, "SKILL.md"), { source: "test" }),
+									disableModelInvocation: false,
+									kind: "python",
+									python: {
+										importName: "agent_message",
+										packagePath: tempDir,
+										pyprojectPath: join(tempDir, "pyproject.toml"),
+									},
 								},
-							},
-						]
-					: undefined,
-			}),
+							]
+						: undefined,
+				}),
 			agentMessageController: options.agentMessageController,
 			subagentRuntimeHost: options.subagentRuntimeHost,
 			customTools: options.customTools,
@@ -499,6 +503,31 @@ describe("AgentSession rlm recursion", () => {
 		const spawned = await forked.runRlmChild("recursion remains available");
 		expect(spawned.rlm_child_id).toMatch(/^sub-/);
 		await waitFor(() => forked.getRlmChildSession(spawned.rlm_child_id)?.getLastAssistantText() !== undefined);
+	});
+
+	it("gives a newly spawned child the refreshed configured context", async () => {
+		const agentDir = join(tempDir, "agent");
+		const contextDir = join(tempDir, "configured-context");
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(contextDir, { recursive: true });
+		const loader = new DefaultResourceLoader({
+			cwd: tempDir,
+			agentDir,
+			additionalContextDirectories: [contextDir],
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+		});
+		await loader.reload();
+		writeFileSync(join(contextDir, "OPERATOR.md"), "fresh child context");
+		const root = createSession({ resourceLoader: loader });
+
+		await root.prompt("refresh before spawning");
+		const spawned = await root.runRlmChild("inspect refreshed context");
+		const child = root.getRlmChildSession(spawned.rlm_child_id);
+
+		expect(child?.systemPrompt).toContain("fresh child context");
 	});
 
 	it("creates readable collision-resistant default subagent session names", () => {

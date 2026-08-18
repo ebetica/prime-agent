@@ -315,7 +315,7 @@ Content`,
 			expect(agentsFiles.some((f) => f.path.includes("AGENTS.md"))).toBe(true);
 		});
 
-		it("rescans additional context directories on every reload", async () => {
+		it("refreshes added, changed, and removed files in configured context directories", async () => {
 			const contextDir = join(tempDir, "operator-context");
 			const loader = new DefaultResourceLoader({
 				cwd,
@@ -330,23 +330,49 @@ Content`,
 			writeFileSync(join(cwd, "AGENTS.md"), "project");
 			writeFileSync(join(contextDir, "AGENTS.md"), "first");
 			writeFileSync(join(contextDir, "notes.txt"), "not context");
-			await loader.reload();
+			loader.refreshContextFiles();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
 				{ path: join(contextDir, "AGENTS.md"), content: "first" },
 				{ path: join(cwd, "AGENTS.md"), content: "project" },
 			]);
 
+			writeFileSync(join(contextDir, "AGENTS.md"), "changed");
+			loader.refreshContextFiles();
+			expect(loader.getAgentsFiles().agentsFiles[0]?.content).toBe("changed");
+
 			rmSync(join(contextDir, "AGENTS.md"));
 			writeFileSync(join(contextDir, "RTK.md"), "replacement");
-			await loader.reload();
+			loader.refreshContextFiles();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([
 				{ path: join(contextDir, "RTK.md"), content: "replacement" },
 				{ path: join(cwd, "AGENTS.md"), content: "project" },
 			]);
 
 			rmSync(contextDir, { recursive: true });
-			await loader.reload();
+			loader.refreshContextFiles();
 			expect(loader.getAgentsFiles().agentsFiles).toEqual([{ path: join(cwd, "AGENTS.md"), content: "project" }]);
+		});
+
+		it("preserves global, configured, and project ordering while deduplicating paths", async () => {
+			const configured = join(tempDir, "configured-context");
+			mkdirSync(configured);
+			writeFileSync(join(agentDir, "AGENTS.md"), "global");
+			writeFileSync(join(configured, "A.md"), "configured");
+			writeFileSync(join(cwd, "CLAUDE.md"), "project");
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalContextDirectories: [agentDir, configured, configured],
+			});
+
+			await loader.reload();
+			loader.refreshContextFiles();
+
+			expect(loader.getAgentsFiles().agentsFiles).toEqual([
+				{ path: join(agentDir, "AGENTS.md"), content: "global" },
+				{ path: join(configured, "A.md"), content: "configured" },
+				{ path: join(cwd, "CLAUDE.md"), content: "project" },
+			]);
 		});
 
 		it("should skip AGENTS.md and CLAUDE.md discovery when noContextFiles is true", async () => {

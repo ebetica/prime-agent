@@ -52,6 +52,8 @@ export interface ResourceLoader {
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
+	/** Re-read only configured context files without reloading extensions, skills, or tools. */
+	refreshContextFiles?(): void;
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
@@ -403,6 +405,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return { agentsFiles: this.agentsFiles };
 	}
 
+	refreshContextFiles(): void {
+		const agentsFiles = {
+			agentsFiles: this.noContextFiles
+				? []
+				: loadProjectContextFiles({
+						cwd: this.cwd,
+						agentDir: this.agentDir,
+						additionalContextDirectories: this.additionalContextDirectories,
+					}),
+		};
+		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
+		this.agentsFiles = resolvedAgentsFiles.agentsFiles;
+	}
+
 	getSystemPrompt(): string | undefined {
 		return this.systemPrompt;
 	}
@@ -746,17 +762,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				}
 			}
 
-			const agentsFiles = {
-				agentsFiles: this.noContextFiles
-					? []
-					: loadProjectContextFiles({
-							cwd: this.cwd,
-							agentDir: this.agentDir,
-							additionalContextDirectories: this.additionalContextDirectories,
-						}),
-			};
-			const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
-			this.agentsFiles = resolvedAgentsFiles.agentsFiles;
+			this.refreshContextFiles();
 
 			const baseSystemPrompt = resolvePromptInput(
 				this.systemPromptSource ?? this.discoverSystemPromptFile(),

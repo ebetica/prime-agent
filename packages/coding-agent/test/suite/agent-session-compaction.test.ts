@@ -3,6 +3,7 @@ import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/p
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.js";
+import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
@@ -100,6 +101,38 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.summary).toBe("summary from extension");
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("refreshes context when compaction rebuilds model context", async () => {
+		let source = "context before compaction";
+		let loaded = source;
+		const baseLoader = createTestResourceLoader();
+		const resourceLoader = {
+			...baseLoader,
+			getAgentsFiles: () => ({ agentsFiles: [{ path: "/context/AGENTS.md", content: loaded }] }),
+			refreshContextFiles: () => {
+				loaded = source;
+			},
+		};
+		const harness = await createHarness({
+			resourceLoader,
+			settings: { compaction: { keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("refreshed summary"),
+			fauxAssistantMessage("refreshed turn summary"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		source = "context refreshed for compaction";
+		await harness.session.compact();
+
+		expect(harness.session.systemPrompt).toContain("context refreshed for compaction");
+		expect(harness.session.systemPrompt).not.toContain("context before compaction");
 	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
