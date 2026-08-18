@@ -44,7 +44,7 @@ except Exception as _prime_agent_rlm_error:
         def _raise_missing(self):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this IPython kernel. "
-                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
+                "Restart Prime Agent to select the current content-addressed kernel environment, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
